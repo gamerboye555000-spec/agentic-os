@@ -1,5 +1,5 @@
 """Human-facing IDs: T-0001 tasks, R-0001 runs, D-0001 decisions,
-E-0001 evidence, H-0001 handoffs, P-0001 packs.
+E-0001 evidence, H-0001 handoffs, P-0001 packs, M-0001 memory.
 
 Render: prefix + zero-padded integer, minimum width 4, growing naturally
 past 9999. Parse: strict — correct prefix for the command (case-insensitive),
@@ -19,6 +19,7 @@ PREFIXES = {
     "evidence": "E",
     "handoff": "H",
     "pack": "P",
+    "memory": "M",
 }
 
 _ID_RE = re.compile(r"^([A-Za-z]+)-([0-9]+)$", re.ASCII)

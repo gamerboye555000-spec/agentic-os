@@ -108,6 +108,16 @@ class TestInit(CliTestCase):
             ["log"],
             ["sync"],
             ["doctor"],
+            ["decision", "add", "X", "-p", "demo", "--decision", "d"],
+            ["handoff", "create", "T-0001", "--from", "a", "--to", "b",
+             "--state", "s"],
+            ["handoff", "accept", "H-0001"],
+            ["memory", "list"],
+            ["memory", "retire", "M-0001"],
+            ["search", "anything"],
+            ["review", "build"],
+            ["export", "events", "--jsonl"],
+            ["snapshot"],
         ):
             with self.subTest(argv=argv):
                 code, out, err = self.run_cli(*argv)
@@ -491,6 +501,46 @@ class TestEventPerMutatingCommand(CliTestCase):
                 ["done", "T-0002", "--no-evidence"],
                 [("task", "done"), ("task", "done_override")],
             ),
+            # Weekend mutating commands join the same sequence seal.
+            (
+                [
+                    "decision", "add", "Use SQLite", "-p", "demo",
+                    "--decision", "SQLite is the source of truth",
+                ],
+                [("decision", "add")],
+            ),
+            (
+                [
+                    "handoff", "create", "T-0001",
+                    "--from", "claude-code", "--to", "codex", "--state", "state",
+                ],
+                [("handoff", "create")],
+            ),
+            (["handoff", "accept", "H-0001"], [("handoff", "accept")]),
+            (
+                [
+                    "memory", "add", "--scope", "global", "--kind",
+                    "preference", "--key", "style", "--value", "tabs",
+                    "--source", "human", "--confidence", "confirmed",
+                ],
+                [("memory", "add")],
+            ),
+            (
+                [
+                    "memory", "add", "--scope", "global", "--kind",
+                    "preference", "--key", "style", "--value", "spaces",
+                    "--source", "human", "--confidence", "confirmed",
+                    "--supersedes", "M-0001",
+                ],
+                [("memory", "add")],
+            ),
+            (["memory", "retire", "M-0002"], [("memory", "retire")]),
+            (["snapshot"], [("system", "snapshot")]),
+            # Derived views stay eventless — the final seal proves it.
+            (["search", "auth"], []),
+            (["review", "build"], []),
+            (["export", "events", "--jsonl"], []),
+            (["sync"], []),
         ]
         seen = 0
         for argv, expected_events in steps:
@@ -712,7 +762,9 @@ class TestDoctor(CliTestCase):
         code, out, err = self.run_cli("doctor")
         self.assertEqual(code, 0, out + err)
         lines = [l for l in out.strip().splitlines() if l]
-        self.assertEqual(len(lines), 6)
+        # 6 Night-1 checks + 6 Weekend hardening checks (D-W8.1): the count
+        # moved UP with the mandated new checks; all must still pass.
+        self.assertEqual(len(lines), 12)
         for line in lines:
             self.assertTrue(line.startswith("[PASS]"), line)
 

@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+import re
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 AOS_DIR_NAME = ".agentic-os"
@@ -28,6 +29,20 @@ def utc_now_iso() -> str:
 def utc_today() -> str:
     """Current UTC date (YYYY-MM-DD), derived from the single clock."""
     return utc_now_iso()[:10]
+
+
+_DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$", re.ASCII)
+
+
+def validate_date(text: str, what: str) -> str:
+    """Strict YYYY-MM-DD; must be a real calendar date."""
+    if not _DATE_RE.match(text):
+        raise AosError(f"Invalid {what} {text!r}. Expected format: YYYY-MM-DD")
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        raise AosError(f"Invalid {what} {text!r}: not a real calendar date.")
+    return text
 
 
 def json_dumps(obj) -> str:
@@ -112,4 +127,15 @@ def require_aos_dir(start: Path | None = None) -> Path:
     aos_dir = find_aos_dir(start)
     if aos_dir is None:
         raise AosError("Not initialized. Run: python aos.py init")
+    return aos_dir
+
+
+def aos_dir_for_root(root: Path) -> Path:
+    """Explicit --root PATH: the workspace is PATH/.agentic-os exactly —
+    no upward search. Explicit always beats discovery."""
+    aos_dir = root / AOS_DIR_NAME
+    if not (aos_dir / DB_FILENAME).is_file():
+        raise AosError(
+            f"Not initialized at {root}. Run: python aos.py --root {root} init"
+        )
     return aos_dir

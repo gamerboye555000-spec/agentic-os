@@ -94,7 +94,7 @@ Read this before editing anything here.
 - Every mutation is journaled in an append-only events table.
 
 Tag namespace: `aos/task`, `aos/run`, `aos/decision`, `aos/evidence`,
-`aos/handoff`, `aos/project`.
+`aos/handoff`, `aos/project`, `aos/memory`.
 """
 
 
@@ -323,6 +323,46 @@ def handoff_note(handoff) -> str:
         f"- accepted: {handoff.accepted_at or 'not yet'}",
     ]
     lines += _section("State", handoff.state_md)
+    return "\n".join(lines) + "\n"
+
+
+def memory_note(item, project_slug: str | None) -> str:
+    memory_hid = ids.render_id("memory", item.id)
+    head = frontmatter(
+        [
+            ("type", "memory"),
+            ("aos_id", memory_hid),
+            ("scope", item.scope),
+            ("project", project_slug),
+            ("kind", item.kind),
+            ("key", item.key),
+            ("confidence", item.confidence),
+            ("source", item.source),
+            ("valid_from", item.valid_from),
+            ("valid_until", item.valid_until),
+            (
+                "superseded_by",
+                ids.render_id("memory", item.superseded_by)
+                if item.superseded_by
+                else None,
+            ),
+            ("updated", item.updated_at),
+        ],
+        ["aos/memory"],
+    )
+    lines = [head, "", f"# {memory_hid} {_one_line(item.key)}", ""]
+    lines += [f"- scope: {item.scope}"]
+    if project_slug:
+        lines += [f"- project: [[{project_slug}]]"]
+    lines += [f"- kind: {item.kind}"]
+    lines += [f"- confidence: {item.confidence}"]
+    lines += [f"- source: {_one_line(item.source)}"]
+    lines += [f"- valid: {item.valid_from} → {item.valid_until or '-'}"]
+    if item.superseded_by:
+        lines += [
+            f"- superseded by: [[{ids.render_id('memory', item.superseded_by)}]]"
+        ]
+    lines += _section("Value", item.value_md)
     return "\n".join(lines) + "\n"
 
 

@@ -15,12 +15,16 @@ from pathlib import Path
 from . import db, events, ids, obsidian, utils
 from .models import (
     EVIDENCE_KINDS,
+    MEMORY_CONFIDENCES,
+    MEMORY_KINDS,
+    MEMORY_SCOPES,
     RUN_OUTCOMES,
     TASK_KINDS,
     TASK_STATUSES,
     Decision,
     Evidence,
     Handoff,
+    MemoryItem,
     Pack,
     Project,
     Run,
@@ -84,17 +88,26 @@ def related_decisions(conn: sqlite3.Connection, task: Task) -> list[Decision]:
     return [Decision.from_row(r) for r in rows]
 
 
-def memory_for_project(conn: sqlite3.Connection, project_id: int | None) -> list:
-    """Active memory: global scope plus the task's project scope."""
+def memory_for_project(
+    conn: sqlite3.Connection, project_id: int | None
+) -> list[MemoryItem]:
+    """Pack MEMORY inclusion rule: live memory only — scope=global plus the
+    pinned project's scope; live means valid_until is NULL or in the future
+    AND superseded_by is NULL; the latest row (highest id) per
+    (scope, project, key) wins; ordered by scope then key."""
+    now = utils.utc_now_iso()
     rows = conn.execute(
         "SELECT * FROM memory WHERE superseded_by IS NULL "
+        "AND (valid_until IS NULL OR valid_until > ?) "
         "AND (scope = 'global' OR (project_id IS NOT NULL AND project_id = ?)) "
         "ORDER BY id",
-        (project_id,),
+        (now, project_id),
     ).fetchall()
-    from .models import MemoryItem
-
-    return [MemoryItem.from_row(r) for r in rows]
+    latest: dict[tuple, MemoryItem] = {}
+    for row in rows:
+        item = MemoryItem.from_row(row)
+        latest[(item.scope, item.project_id, item.key)] = item
+    return sorted(latest.values(), key=lambda m: (m.scope, m.key, m.id))
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +183,36 @@ def handoff_public(item: Handoff) -> dict:
         "to_agent": item.to_agent,
         "created_at": item.created_at,
         "accepted_at": item.accepted_at,
+    }
+
+
+def memory_public(
+    conn: sqlite3.Connection, item: MemoryItem, project_slug: str | None = None
+) -> dict:
+    if project_slug is None and item.project_id is not None:
+        project = get_project(conn, item.project_id)
+        project_slug = project.slug if project else None
+    live = item.superseded_by is None and (
+        item.valid_until is None or item.valid_until > utils.utc_now_iso()
+    )
+    return {
+        "id": ids.render_id("memory", item.id),
+        "scope": item.scope,
+        "project": project_slug,
+        "kind": item.kind,
+        "key": item.key,
+        "value_md": item.value_md,
+        "source": item.source,
+        "confidence": item.confidence,
+        "valid_from": item.valid_from,
+        "valid_until": item.valid_until,
+        "superseded_by": (
+            ids.render_id("memory", item.superseded_by)
+            if item.superseded_by
+            else None
+        ),
+        "updated_at": item.updated_at,
+        "live": live,
     }
 
 
@@ -298,6 +341,314 @@ def add_task(
             },
         )
     return get_task(conn, task_id)
+
+
+def add_decision(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    project_slug: str,
+    decision: str,
+    alternatives: str | None = None,
+    task_id: int | None = None,
+) -> Decision:
+    title = title.strip()
+    if not title:
+        raise AosError("Decision title must not be empty.")
+    if not decision or not decision.strip():
+        raise AosError("Decision text (--decision) must not be empty.")
+    project = get_project_by_slug(conn, project_slug)
+    if project is None:
+        raise AosError(
+            f"No project '{project_slug}'. "
+            f"Run: python aos.py project add {project_slug} --name NAME --repo PATH"
+        )
+    task = None
+    if task_id is not None:
+        task = get_task(conn, task_id)
+        if task.project_id != project.id:
+            raise AosError(
+                f"Task {ids.render_id('task', task.id)} does not belong to "
+                f"project '{project.slug}'; a decision's task and project "
+                "must match."
+            )
+    now = utils.utc_now_iso()
+    with db.transaction(conn):
+        cursor = conn.execute(
+            "INSERT INTO decisions (project_id, task_id, title, decision_md, "
+            "alternatives_md, status, decided_at) "
+            "VALUES (?, ?, ?, ?, ?, 'accepted', ?)",
+            (
+                project.id,
+                task.id if task else None,
+                title,
+                decision,
+                alternatives,
+                now,
+            ),
+        )
+        decision_id = cursor.lastrowid
+        events.emit(
+            conn,
+            actor=ACTOR_HUMAN,
+            entity="decision",
+            entity_id=decision_id,
+            action="add",
+            payload={
+                "decision": ids.render_id("decision", decision_id),
+                "title": title,
+                "project": project.slug,
+                "task": ids.render_id("task", task.id) if task else None,
+                "status": "accepted",
+            },
+        )
+    row = conn.execute(
+        "SELECT * FROM decisions WHERE id = ?", (decision_id,)
+    ).fetchone()
+    return Decision.from_row(row)
+
+
+def get_handoff(conn: sqlite3.Connection, handoff_id: int) -> Handoff:
+    row = conn.execute(
+        "SELECT * FROM handoffs WHERE id = ?", (handoff_id,)
+    ).fetchone()
+    if row is None:
+        raise AosError(
+            f"No handoff {ids.render_id('handoff', handoff_id)}. "
+            "Run: python aos.py log"
+        )
+    return Handoff.from_row(row)
+
+
+def create_handoff(
+    conn: sqlite3.Connection,
+    *,
+    task_id: int,
+    from_agent: str,
+    to_agent: str,
+    state: str,
+) -> Handoff:
+    from_agent = from_agent.strip()
+    to_agent = to_agent.strip()
+    if not from_agent or not to_agent:
+        raise AosError("Handoff --from and --to agent names must not be empty.")
+    if not state or not state.strip():
+        raise AosError("Handoff state (--state) must not be empty.")
+    task = get_task(conn, task_id)
+    now = utils.utc_now_iso()
+    with db.transaction(conn):
+        cursor = conn.execute(
+            "INSERT INTO handoffs (task_id, from_agent, to_agent, state_md, "
+            "created_at) VALUES (?, ?, ?, ?, ?)",
+            (task.id, from_agent, to_agent, state, now),
+        )
+        handoff_id = cursor.lastrowid
+        events.emit(
+            conn,
+            actor=ACTOR_HUMAN,
+            entity="handoff",
+            entity_id=handoff_id,
+            action="create",
+            payload={
+                "handoff": ids.render_id("handoff", handoff_id),
+                "task": ids.render_id("task", task.id),
+                "from_agent": from_agent,
+                "to_agent": to_agent,
+            },
+        )
+    return get_handoff(conn, handoff_id)
+
+
+def accept_handoff(conn: sqlite3.Connection, *, handoff_id: int) -> Handoff:
+    handoff = get_handoff(conn, handoff_id)
+    handoff_hid = ids.render_id("handoff", handoff.id)
+    if handoff.accepted_at is not None:
+        raise AosError(
+            f"Handoff {handoff_hid} was already accepted at {handoff.accepted_at}."
+        )
+    now = utils.utc_now_iso()
+    with db.transaction(conn):
+        conn.execute(
+            "UPDATE handoffs SET accepted_at = ? WHERE id = ?", (now, handoff.id)
+        )
+        events.emit(
+            conn,
+            actor=ACTOR_HUMAN,
+            entity="handoff",
+            entity_id=handoff.id,
+            action="accept",
+            payload={
+                "handoff": handoff_hid,
+                "task": ids.render_id("task", handoff.task_id),
+                "accepted_at": now,
+            },
+        )
+    return get_handoff(conn, handoff.id)
+
+
+def get_memory(conn: sqlite3.Connection, memory_id: int) -> MemoryItem:
+    row = conn.execute(
+        "SELECT * FROM memory WHERE id = ?", (memory_id,)
+    ).fetchone()
+    if row is None:
+        raise AosError(
+            f"No memory {ids.render_id('memory', memory_id)}. "
+            "Run: python aos.py memory list"
+        )
+    return MemoryItem.from_row(row)
+
+
+def add_memory(
+    conn: sqlite3.Connection,
+    *,
+    scope: str,
+    project_slug: str | None = None,
+    kind: str,
+    key: str,
+    value: str,
+    source: str,
+    confidence: str,
+    valid_until: str | None = None,
+    supersedes_id: int | None = None,
+) -> MemoryItem:
+    validate_enum(scope, MEMORY_SCOPES, "memory scope")
+    validate_enum(kind, MEMORY_KINDS, "memory kind")
+    validate_enum(confidence, MEMORY_CONFIDENCES, "memory confidence")
+    key = key.strip()
+    if not key:
+        raise AosError("Memory --key must not be empty.")
+    if not value or not value.strip():
+        raise AosError("Memory --value must not be empty.")
+    source = source.strip()
+    if not source:
+        raise AosError("Memory --source must not be empty.")
+    project = None
+    if scope == "project":
+        if not project_slug:
+            raise AosError("--project is required when --scope is 'project'.")
+        project = get_project_by_slug(conn, project_slug)
+        if project is None:
+            raise AosError(
+                f"No project '{project_slug}'. Run: python aos.py project add "
+                f"{project_slug} --name NAME --repo PATH"
+            )
+    elif project_slug is not None:
+        raise AosError("--project only applies when --scope is 'project'.")
+    if valid_until is not None:
+        utils.validate_date(valid_until, "--valid-until")
+    old = None
+    if supersedes_id is not None:
+        old = get_memory(conn, supersedes_id)
+        if old.superseded_by is not None:
+            raise AosError(
+                f"Memory {ids.render_id('memory', old.id)} is already "
+                f"superseded by {ids.render_id('memory', old.superseded_by)}."
+            )
+    now = utils.utc_now_iso()
+    with db.transaction(conn):
+        cursor = conn.execute(
+            "INSERT INTO memory (scope, project_id, kind, key, value_md, "
+            "source, confidence, valid_from, valid_until, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                scope,
+                project.id if project else None,
+                kind,
+                key,
+                value,
+                source,
+                confidence,
+                now,
+                valid_until,
+                now,
+            ),
+        )
+        memory_id = cursor.lastrowid
+        if old is not None:
+            conn.execute(
+                "UPDATE memory SET superseded_by = ?, updated_at = ? "
+                "WHERE id = ?",
+                (memory_id, now, old.id),
+            )
+        events.emit(
+            conn,
+            actor=ACTOR_HUMAN,
+            entity="memory",
+            entity_id=memory_id,
+            action="add",
+            payload={
+                "memory": ids.render_id("memory", memory_id),
+                "scope": scope,
+                "project": project.slug if project else None,
+                "kind": kind,
+                "key": key,
+                "confidence": confidence,
+                "valid_until": valid_until,
+                "supersedes": (
+                    ids.render_id("memory", old.id) if old else None
+                ),
+            },
+        )
+    return get_memory(conn, memory_id)
+
+
+def list_memory(
+    conn: sqlite3.Connection,
+    *,
+    scope: str | None = None,
+    project_slug: str | None = None,
+) -> list[dict]:
+    """Every row, including retired and superseded ones — memory never
+    silently disappears; retired rows carry their valid_until."""
+    clauses, params = [], []
+    if scope is not None:
+        validate_enum(scope, MEMORY_SCOPES, "memory scope")
+        clauses.append("m.scope = ?")
+        params.append(scope)
+    if project_slug is not None:
+        project = get_project_by_slug(conn, project_slug)
+        if project is None:
+            raise AosError(
+                f"No project '{project_slug}'. Run: python aos.py project add "
+                f"{project_slug} --name NAME --repo PATH"
+            )
+        clauses.append("m.project_id = ?")
+        params.append(project.id)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = conn.execute(
+        f"SELECT m.*, p.slug AS project_slug FROM memory m "
+        f"LEFT JOIN projects p ON p.id = m.project_id {where} ORDER BY m.id",
+        params,
+    ).fetchall()
+    return [
+        memory_public(conn, MemoryItem.from_row(row), row["project_slug"])
+        for row in rows
+    ]
+
+
+def retire_memory(conn: sqlite3.Connection, *, memory_id: int) -> MemoryItem:
+    item = get_memory(conn, memory_id)
+    memory_hid = ids.render_id("memory", item.id)
+    now = utils.utc_now_iso()
+    if item.valid_until is not None and item.valid_until <= now:
+        raise AosError(
+            f"Memory {memory_hid} is already retired "
+            f"(valid_until {item.valid_until})."
+        )
+    with db.transaction(conn):
+        conn.execute(
+            "UPDATE memory SET valid_until = ?, updated_at = ? WHERE id = ?",
+            (now, now, item.id),
+        )
+        events.emit(
+            conn,
+            actor=ACTOR_HUMAN,
+            entity="memory",
+            entity_id=item.id,
+            action="retire",
+            payload={"memory": memory_hid, "valid_until": now},
+        )
+    return get_memory(conn, item.id)
 
 
 def capture_inbox(conn: sqlite3.Connection, text: str) -> Task:

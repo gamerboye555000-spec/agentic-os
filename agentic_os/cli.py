@@ -25,9 +25,18 @@ class _Parser(argparse.ArgumentParser):
         raise AosError(f"{message}. See: python aos.py --help")
 
 
+def _resolve_aos_dir(args) -> Path:
+    """Global --root (PATH/.agentic-os, no search) wins over cwd-upward
+    discovery; without it, Night-1 discovery behavior is preserved exactly."""
+    root = getattr(args, "global_root", None)
+    if root is not None:
+        return utils.aos_dir_for_root(Path(root).expanduser().resolve())
+    return utils.require_aos_dir()
+
+
 @contextlib.contextmanager
-def _ledger():
-    aos_dir = utils.require_aos_dir()
+def _ledger(args):
+    aos_dir = _resolve_aos_dir(args)
     conn = db.open_db(aos_dir)
     try:
         yield aos_dir, conn
@@ -47,7 +56,17 @@ def _dash(value) -> str:
 # Command handlers
 
 def cmd_init(args) -> int:
-    root = Path(args.root).expanduser().resolve() if args.root else Path.cwd()
+    global_root = getattr(args, "global_root", None)
+    if global_root is not None and args.root is not None:
+        resolved_global = Path(global_root).expanduser().resolve()
+        resolved_local = Path(args.root).expanduser().resolve()
+        if resolved_global != resolved_local:
+            raise AosError(
+                f"Conflicting workspace roots: global --root {resolved_global} "
+                f"vs init --root {resolved_local}. Pass one (or the same path)."
+            )
+    chosen = global_root if global_root is not None else args.root
+    root = Path(chosen).expanduser().resolve() if chosen else Path.cwd()
     if not root.is_dir():
         raise AosError(f"Root is not an existing directory: {root}")
     aos_dir, created = ops.init_workspace(root)
@@ -62,7 +81,7 @@ def cmd_init(args) -> int:
 
 
 def cmd_project_add(args) -> int:
-    with _ledger() as (aos_dir, conn):
+    with _ledger(args) as (aos_dir, conn):
         project, created = ops.add_project(
             conn, slug=args.slug, name=args.name, repo=args.repo
         )
@@ -74,7 +93,7 @@ def cmd_project_add(args) -> int:
 
 
 def cmd_task_add(args) -> int:
-    with _ledger() as (aos_dir, conn):
+    with _ledger(args) as (aos_dir, conn):
         task = ops.add_task(
             conn,
             title=args.title,
@@ -88,7 +107,7 @@ def cmd_task_add(args) -> int:
 
 
 def cmd_task_list(args) -> int:
-    with _ledger() as (aos_dir, conn):
+    with _ledger(args) as (aos_dir, conn):
         tasks = ops.list_tasks(
             conn, project_slug=args.project, status=args.status
         )
@@ -109,7 +128,7 @@ def cmd_task_list(args) -> int:
 
 def cmd_task_show(args) -> int:
     task_id = ids.parse_id(args.id, "task")
-    with _ledger() as (aos_dir, conn):
+    with _ledger(args) as (aos_dir, conn):
         detail = ops.show_task(conn, task_id)
         if args.json:
             _print_json(detail)
@@ -168,7 +187,7 @@ def cmd_task_show(args) -> int:
 
 
 def cmd_status(args) -> int:
-    with _ledger() as (aos_dir, conn):
+    with _ledger(args) as (aos_dir, conn):
         summary = ops.status_summary(conn)
         if args.json:
             _print_json(summary)
@@ -204,7 +223,7 @@ def cmd_status(args) -> int:
 
 
 def cmd_in(args) -> int:
-    with _ledger() as (aos_dir, conn):
+    with _ledger(args) as (aos_dir, conn):
         task = ops.capture_inbox(conn, args.text)
         print(ids.render_id("task", task.id))
     return 0
@@ -214,7 +233,7 @@ def cmd_log(args) -> int:
     if args.task_id is not None and args.today:
         raise AosError("Use either a task id or --today, not both.")
     task_id = ids.parse_id(args.task_id, "task") if args.task_id is not None else None
-    with _ledger() as (aos_dir, conn):
+    with _ledger(args) as (aos_dir, conn):
         entries = ops.log_events(conn, task_id=task_id, today=args.today)
         if args.json:
             _print_json({"events": entries})
@@ -235,7 +254,7 @@ def cmd_log(args) -> int:
 
 def cmd_pack_build(args) -> int:
     task_id = ids.parse_id(args.id, "task")
-    with _ledger() as (aos_dir, conn):
+    with _ledger(args) as (aos_dir, conn):
         from . import pack
 
         result = pack.build_pack(
@@ -253,7 +272,7 @@ def cmd_pack_build(args) -> int:
 
 def cmd_run_start(args) -> int:
     task_id = ids.parse_id(args.id, "task")
-    with _ledger() as (aos_dir, conn):
+    with _ledger(args) as (aos_dir, conn):
         run = ops.start_run(conn, task_id=task_id, agent=args.agent)
         print(ids.render_id("run", run.id))
     return 0
@@ -261,7 +280,7 @@ def cmd_run_start(args) -> int:
 
 def cmd_run_end(args) -> int:
     run_id = ids.parse_id(args.id, "run")
-    with _ledger() as (aos_dir, conn):
+    with _ledger(args) as (aos_dir, conn):
         run = ops.end_run(
             conn, run_id=run_id, outcome=args.outcome, summary=args.summary
         )
@@ -271,7 +290,7 @@ def cmd_run_end(args) -> int:
 
 def cmd_evidence_add(args) -> int:
     task_id = ids.parse_id(args.id, "task")
-    with _ledger() as (aos_dir, conn):
+    with _ledger(args) as (aos_dir, conn):
         item = ops.add_evidence(
             conn,
             task_id=task_id,
@@ -286,22 +305,174 @@ def cmd_evidence_add(args) -> int:
 
 def cmd_done(args) -> int:
     task_id = ids.parse_id(args.id, "task")
-    with _ledger() as (aos_dir, conn):
+    with _ledger(args) as (aos_dir, conn):
         task = ops.mark_done(conn, task_id=task_id, no_evidence=args.no_evidence)
         count = ops.evidence_count(conn, task.id)
         print(f"{ids.render_id('task', task.id)} done (evidence: {count})")
     return 0
 
 
+def cmd_decision_add(args) -> int:
+    task_id = ids.parse_id(args.task, "task") if args.task is not None else None
+    with _ledger(args) as (aos_dir, conn):
+        decision = ops.add_decision(
+            conn,
+            title=args.title,
+            project_slug=args.project,
+            decision=args.decision,
+            alternatives=args.alternatives,
+            task_id=task_id,
+        )
+        print(ids.render_id("decision", decision.id))
+    return 0
+
+
+def cmd_handoff_create(args) -> int:
+    task_id = ids.parse_id(args.id, "task")
+    with _ledger(args) as (aos_dir, conn):
+        handoff = ops.create_handoff(
+            conn,
+            task_id=task_id,
+            from_agent=args.from_agent,
+            to_agent=args.to,
+            state=args.state,
+        )
+        print(ids.render_id("handoff", handoff.id))
+    return 0
+
+
+def cmd_handoff_accept(args) -> int:
+    handoff_id = ids.parse_id(args.id, "handoff")
+    with _ledger(args) as (aos_dir, conn):
+        handoff = ops.accept_handoff(conn, handoff_id=handoff_id)
+        print(
+            f"{ids.render_id('handoff', handoff.id)} accepted at "
+            f"{handoff.accepted_at}"
+        )
+    return 0
+
+
+def cmd_memory_add(args) -> int:
+    supersedes_id = (
+        ids.parse_id(args.supersedes, "memory")
+        if args.supersedes is not None
+        else None
+    )
+    with _ledger(args) as (aos_dir, conn):
+        item = ops.add_memory(
+            conn,
+            scope=args.scope,
+            project_slug=args.project,
+            kind=args.kind,
+            key=args.key,
+            value=args.value,
+            source=args.source,
+            confidence=args.confidence,
+            valid_until=args.valid_until,
+            supersedes_id=supersedes_id,
+        )
+        print(ids.render_id("memory", item.id))
+    return 0
+
+
+def cmd_memory_list(args) -> int:
+    with _ledger(args) as (aos_dir, conn):
+        items = ops.list_memory(
+            conn, scope=args.scope, project_slug=args.project
+        )
+        if args.json:
+            _print_json({"memories": items})
+            return 0
+        if not items:
+            print("(no memory)")
+            return 0
+        for item in items:
+            if item["superseded_by"]:
+                state = f"superseded→{item['superseded_by']}"
+            elif not item["live"]:
+                state = f"retired {item['valid_until']}"
+            else:
+                state = "live"
+            value_one_line = " ".join(item["value_md"].split())
+            print(
+                f"{item['id']:<8} {item['scope']:<8} "
+                f"{_dash(item['project']):<16} {item['kind']:<11} "
+                f"[{item['confidence']}] {state:<26} "
+                f"{item['key']}: {value_one_line}"
+            )
+    return 0
+
+
+def cmd_memory_retire(args) -> int:
+    memory_id = ids.parse_id(args.id, "memory")
+    with _ledger(args) as (aos_dir, conn):
+        item = ops.retire_memory(conn, memory_id=memory_id)
+        print(
+            f"{ids.render_id('memory', item.id)} retired "
+            f"(valid_until {item.valid_until})"
+        )
+    return 0
+
+
+def cmd_search(args) -> int:
+    with _ledger(args) as (aos_dir, conn):
+        from . import search
+
+        doc = search.search(conn, args.query)
+        if args.json:
+            _print_json(doc)
+            return 0
+        print(f"backend: {doc['backend']}")
+        if not doc["results"]:
+            print("(no results)")
+            return 0
+        for result in doc["results"]:
+            print(
+                f"{result['type']:<9} {result['id']:<8} {result['snippet']}"
+            )
+    return 0
+
+
+def cmd_review_build(args) -> int:
+    date_str = args.date if args.date is not None else utils.utc_today()
+    utils.validate_date(date_str, "--date")
+    with _ledger(args) as (aos_dir, conn):
+        from . import review
+
+        path = review.build_review(conn, aos_dir, date_str)
+        print(str(path))
+    return 0
+
+
+def cmd_export_events(args) -> int:
+    if not args.jsonl:
+        raise AosError("Only JSONL export is supported. Pass --jsonl.")
+    with _ledger(args) as (aos_dir, conn):
+        from . import export
+
+        path, _count = export.export_events(conn, aos_dir, output=args.output)
+        print(str(path))
+    return 0
+
+
+def cmd_snapshot(args) -> int:
+    with _ledger(args) as (aos_dir, conn):
+        from . import export
+
+        path = export.snapshot(conn, aos_dir)
+        print(str(path))
+    return 0
+
+
 def cmd_sync(args) -> int:
-    with _ledger() as (aos_dir, conn):
+    with _ledger(args) as (aos_dir, conn):
         total, written = obsidian.sync_vault(conn, aos_dir)
         print(f"Synced {total} notes ({written} written, {total - written} unchanged).")
     return 0
 
 
 def cmd_doctor(args) -> int:
-    with _ledger() as (aos_dir, conn):
+    with _ledger(args) as (aos_dir, conn):
         from . import doctor
 
         checks = doctor.run_checks(conn, aos_dir)
@@ -324,6 +495,14 @@ def build_parser() -> _Parser:
         prog="aos",
         description="Agentic OS — local-first ledger + Obsidian mirror "
         "for coordinating AI agents.",
+    )
+    parser.add_argument(
+        "--root",
+        dest="global_root",
+        metavar="PATH",
+        default=None,
+        help="workspace root: use PATH/.agentic-os instead of cwd-upward "
+        "discovery (place before the command)",
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
 
@@ -406,10 +585,102 @@ def build_parser() -> _Parser:
     p_evidence_add.add_argument("--provenance", default="human")
     p_evidence_add.set_defaults(func=cmd_evidence_add)
 
+    p_decision = sub.add_parser("decision", help="decision records")
+    decision_sub = p_decision.add_subparsers(
+        dest="subcommand", metavar="SUBCOMMAND", required=True
+    )
+    p_decision_add = decision_sub.add_parser(
+        "add", help="record an accepted decision"
+    )
+    p_decision_add.add_argument("title")
+    p_decision_add.add_argument("-p", "--project", required=True)
+    p_decision_add.add_argument("--decision", required=True)
+    p_decision_add.add_argument("--alternatives", default=None)
+    p_decision_add.add_argument("--task", default=None)
+    p_decision_add.set_defaults(func=cmd_decision_add)
+
+    p_handoff = sub.add_parser("handoff", help="structured agent handoffs")
+    handoff_sub = p_handoff.add_subparsers(
+        dest="subcommand", metavar="SUBCOMMAND", required=True
+    )
+    p_handoff_create = handoff_sub.add_parser(
+        "create", help="hand a task from one agent to another"
+    )
+    p_handoff_create.add_argument("id")
+    p_handoff_create.add_argument("--from", dest="from_agent", required=True)
+    p_handoff_create.add_argument("--to", required=True)
+    p_handoff_create.add_argument("--state", required=True)
+    p_handoff_create.set_defaults(func=cmd_handoff_create)
+    p_handoff_accept = handoff_sub.add_parser("accept", help="accept a handoff")
+    p_handoff_accept.add_argument("id")
+    p_handoff_accept.set_defaults(func=cmd_handoff_accept)
+
+    p_memory = sub.add_parser("memory", help="scoped memory rows")
+    memory_sub = p_memory.add_subparsers(
+        dest="subcommand", metavar="SUBCOMMAND", required=True
+    )
+    p_memory_add = memory_sub.add_parser("add", help="record a memory row")
+    p_memory_add.add_argument("--scope", required=True)
+    p_memory_add.add_argument("-p", "--project", default=None)
+    p_memory_add.add_argument("--kind", required=True)
+    p_memory_add.add_argument("--key", required=True)
+    p_memory_add.add_argument("--value", required=True)
+    p_memory_add.add_argument("--source", required=True)
+    p_memory_add.add_argument("--confidence", required=True)
+    p_memory_add.add_argument("--valid-until", dest="valid_until", default=None)
+    p_memory_add.add_argument("--supersedes", default=None)
+    p_memory_add.set_defaults(func=cmd_memory_add)
+    p_memory_list = memory_sub.add_parser("list", help="list memory rows")
+    p_memory_list.add_argument("--scope", default=None)
+    p_memory_list.add_argument("-p", "--project", default=None)
+    p_memory_list.add_argument("--json", action="store_true")
+    p_memory_list.set_defaults(func=cmd_memory_list)
+    p_memory_retire = memory_sub.add_parser(
+        "retire", help="retire a memory row (sets valid_until to now)"
+    )
+    p_memory_retire.add_argument("id")
+    p_memory_retire.set_defaults(func=cmd_memory_retire)
+
     p_done = sub.add_parser("done", help="close a task (requires evidence)")
     p_done.add_argument("id")
     p_done.add_argument("--no-evidence", action="store_true")
     p_done.set_defaults(func=cmd_done)
+
+    p_search = sub.add_parser(
+        "search", help="search tasks, decisions, evidence, handoffs, memory"
+    )
+    p_search.add_argument("query")
+    p_search.add_argument("--json", action="store_true")
+    p_search.set_defaults(func=cmd_search)
+
+    p_review = sub.add_parser("review", help="review notes")
+    review_sub = p_review.add_subparsers(
+        dest="subcommand", metavar="SUBCOMMAND", required=True
+    )
+    p_review_build = review_sub.add_parser(
+        "build", help="build (or refresh) the review note for a date"
+    )
+    p_review_build.add_argument(
+        "--date", default=None, metavar="YYYY-MM-DD",
+        help="review date (default: today, UTC)",
+    )
+    p_review_build.set_defaults(func=cmd_review_build)
+
+    p_export = sub.add_parser("export", help="export ledger data")
+    export_sub = p_export.add_subparsers(
+        dest="subcommand", metavar="SUBCOMMAND", required=True
+    )
+    p_export_events = export_sub.add_parser(
+        "events", help="export the event journal as JSONL"
+    )
+    p_export_events.add_argument("--jsonl", action="store_true")
+    p_export_events.add_argument("--output", default=None, metavar="PATH")
+    p_export_events.set_defaults(func=cmd_export_events)
+
+    p_snapshot = sub.add_parser(
+        "snapshot", help="snapshot aos.db via the SQLite backup API"
+    )
+    p_snapshot.set_defaults(func=cmd_snapshot)
 
     p_sync = sub.add_parser("sync", help="regenerate the Obsidian mirror")
     p_sync.set_defaults(func=cmd_sync)

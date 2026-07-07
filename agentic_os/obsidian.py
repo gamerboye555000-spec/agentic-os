@@ -11,7 +11,7 @@ import sqlite3
 from pathlib import Path
 
 from . import ids, render, utils
-from .models import Decision, Evidence, Handoff, Project, Run, Task
+from .models import Decision, Evidence, Handoff, MemoryItem, Project, Run, Task
 
 VAULT_DIRNAME = "obsidian-vault"
 AOS_SUBDIR = "AOS"
@@ -222,6 +222,13 @@ def sync_vault(conn: sqlite3.Connection, aos_dir: Path) -> tuple[int, int]:
         emit_note(
             aos_root / "Handoffs" / f"{ids.render_id('handoff', handoff.id)}.md",
             render.handoff_note(handoff),
+        )
+
+    for row in _rows(conn, "SELECT * FROM memory ORDER BY id"):
+        item = MemoryItem.from_row(row)
+        emit_note(
+            aos_root / "Memory" / f"{ids.render_id('memory', item.id)}.md",
+            render.memory_note(item, slug_by_project_id.get(item.project_id)),
         )
 
     written += write_home_and_conventions(conn, aos_dir)
