@@ -1,3 +1,78 @@
+# DECISIONS — Agentic OS two-week scope PLANNING run
+
+This section (`D-2W-P.*`) journals the planning pass executed per
+`agentic-os-two-week-scope-prompt.md` on branch `two-week-scope` (2026-07-07).
+It is a planning journal only — no source or tests were touched; the build
+journal for the implementation phase (`D-2W-A.*` etc.) comes later, under its
+own contract. Prepended above the Weekend section per that section's own
+precedent (D-W0.4); everything below stays byte-identical.
+
+## D-2W-P decisions
+
+- **D-2W-P.1 — Baseline gate results.** Branch `two-week-scope`; HEAD `01ee04a`
+  ("docs: add two-week scope planning contract"), a descendant of `85d3793`
+  (= tag `milestone/weekend-mvp`; `milestone/night-1` = `59da161`, both
+  verified via `git show-ref`). Working tree clean, nothing staged, no
+  untracked files (the contract was pre-committed). No `*Zone.Identifier`
+  junk files existed (nothing to delete). Python 3.12.3. Baseline suite:
+  **162 tests, OK** (expected 162). `.agentic-os/` did not exist at start;
+  it was created during this run exclusively via the aos CLI (dogfood
+  bootstrap mandated by the contract).
+- **D-2W-P.2 — Weekend final report handled as absent.** No
+  `docs/reports/weekend-final-report.md` (or any report file) exists in the
+  repo. Per the contract, the Weekend "Known limitations" and "Deferred
+  features" lists were reconstructed ONLY from README.md ("Status" section)
+  and this file's D-W/D-P entries; no conversation record was assumed. The
+  plan states this explicitly (plan §2.1).
+- **D-2W-P.3 — Reconciliation verdicts.** The two-week phase is re-anchored
+  to Weekend debt (§11 MVP-stage items the Weekend build deferred: dropfile
+  ingest F-C7, git evidence ingest F-G1, agent registry F-C8) plus task
+  lifecycle UX (D-P0.21), instead of research §11's 2-week list (ledger
+  decision D-0001). All ten §12 un-defer triggers were checked: none has
+  fired; all ten deferrals stand. The §11-vs-§12 conflict on F-B10 (listed in
+  the 2-week stage AND deferred with a trigger) is resolved in §12's favor —
+  the trigger ("one-way mirror proven idempotent for 2+ weeks of daily use")
+  is unfired. Counts: 13 planned items, all traced; of the 11 §11 2-week
+  items, 9 dropped with reasons + triggers, 2 adapted (F-E10 → goldens,
+  F-G5 → soft warning + review section, because a hard refusal would break
+  the Night-1 back-compat fixture).
+- **D-2W-P.4 — Capacity model.** 17.5 h of core items + 1 h final gate =
+  18.5 h planned against the contract's 20–25 h budget; slack stated per
+  endpoint (7.5% / 18% / 26%); ordered 9 h stretch pool intentionally exceeds
+  maximum slack (tail lands only on under-run). Cut line if capacity halves:
+  task assign/edit/status + dropfile ingest (10.5 h); everything else falls
+  out, D first, then C, then B2.
+- **D-2W-P.5 — Dogfood loop record and friction.** Fresh workspace: `init`,
+  `project add agentic-os`, task **T-0001** ("Two-week scope plan", kind
+  research), pack `packs/T-0001-claude-code.md`, run **R-0001**, scoping
+  decisions **D-0001..D-0003** via `decision add`, evidence **E-0001** (this
+  plan file, kind file) attached at close, run ended success, T-0001 done,
+  sync + doctor clean. **T-0002** (`in` capture noting the dropfile dead-end)
+  is deliberately left open and projectless: it is live evidence for Phase A
+  (no command can assign or triage it — D-P0.21 verified against the current
+  CLI). Friction harvested into the plan (§2.6): stranded inbox capture; no
+  `--spec` flag anywhere; dropfile fallback advertised by every pack with no
+  reader; research-kind pack suggesting `--kind test` evidence and a branch
+  convention; `in` defaulting captures to kind=code.
+- **D-2W-P.6 — Adversarial verification of the plan.** Four independent
+  reviewers (contract compliance · fact-check against evidence files and
+  code · implementation feasibility against the mapped tests/pins · internal
+  consistency), each instructed to refute the draft. 19 findings; all
+  addressed. The two blockers were sequencing gaps this journal and the
+  closed dogfood loop now resolve (D-2W-P entries cited before being written;
+  evidence cited before being attached). Substantive fixes adopted: A1 gains
+  a done-guard (assign could otherwise reopen a closed projectless task); the
+  A1/A3 projectless-ready ordering trap is pinned; B2's acceptance criterion
+  was untestable as written (D-P4.1 forbids git repos in tests) → mocked-
+  boundary strategy with manual final-gate verification (D-P7.2b pattern);
+  dropfile dedupe meta-key distinguished from the D-W5.1 eventless precedent
+  (written in-transaction); dropfile event payload carries outcome/one-lined
+  summary; agent names validated against the provenance charset; D1 sections
+  placed after `## Recent runs` to respect a pinned content slice; stretch
+  arithmetic, trigger-wording ("in substance", not verbatim), F-C7 scope
+  ("ingest half"), and test-count projections corrected. Final self-scores
+  all ≥ 8 (plan, end).
+
 # DECISIONS — Agentic OS Weekend MVP build
 
 This section (`D-W*`) records every simplification, interpretation, and

@@ -157,3 +157,13 @@ Night-1 build works with Weekend code unmodified (no schema change, no
 migration). Deliberately deferred: agent CLI commands, dropfile ingest, git
 evidence ingest, MCP server, Obsidian plugin, vector search, any autonomous
 execution.
+
+## Roadmap
+
+The next phase is planned in `agentic-os-two-week-plan.md` (pending approval):
+task lifecycle repair (`task assign` / `task edit` / `task status`), dropfile
+ingest, commit-evidence validation via read-only git, a minimal agent registry
+(no execution), and richer review notes — zero schema changes, no new
+dependencies. Longer-horizon items (MCP server, Obsidian plugin, background
+runs, vector search, two-way review ingest) stay deferred behind the explicit
+un-defer triggers listed in that plan.
