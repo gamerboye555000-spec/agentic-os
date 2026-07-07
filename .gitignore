@@ -1,0 +1,21 @@
+# Agentic OS runtime state
+.agentic-os/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local environments / caches
+.venv/
+venv/
+.env
+.env.*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Windows metadata from copied files
+*:Zone.Identifier
