@@ -1,3 +1,175 @@
+# DECISIONS — Agentic OS complete-today BUILD run
+
+This section (`D-C.*`) journals the build pass executed per
+`agentic-os-complete-today-build-prompt.md` on branch `two-week-scope`
+(2026-07-07). That contract WINS over the two-week plan where they differ;
+the plan stays detail authority elsewhere. Prepended above the planning
+section per the established precedent (D-W0.4); everything below stays
+byte-identical.
+
+## D-C decisions
+
+- **D-C.1 — P0 baseline gate results.** Branch `two-week-scope`; HEAD
+  `114c882` ("docs: add complete-today build contract"), a descendant of
+  `85d3793`. Working tree clean; the only ignored entry is `.agentic-os/`
+  (runtime state). No `*Zone.Identifier` junk existed (nothing to delete).
+  Python 3.12.3. Baseline suite: **162 tests, OK** (matches the expected
+  162+). Dogfood loop opened in this repo's ledger before any edit:
+  task **T-0003** ("Complete-today build", kind code, project agentic-os),
+  run **R-0002** (agent claude-code) — actual IDs, not assumed.
+- **D-C.2 — Contract-over-plan reconciliations (the contract wins).**
+  (1) `task assign` may MOVE a non-done task between projects (plan §3.1
+  refused moves). (2) `task assign` does NOT auto-promote `inbox→ready`
+  (plan A1 promoted): the contract's own smoke test runs `task status
+  T-0001 ready` immediately after assign — auto-promotion would make that
+  a `ready→ready` illegal transition and fail the smoke. Status changes
+  belong exclusively to `task status`. (3) `task edit` priority range is
+  1–5 (plan said 0–9). (4) Dropfile dedupe: sha256 recorded in the ingest
+  EVENT payload and duplicates REFUSED with exit 1 (plan: meta-key +
+  no-op exit 0). (5) Dropfile runs ladder: exactly one open run for the
+  task+agent is ended with the dropfile outcome (plan/D-0003: never
+  auto-end — superseded by this contract's pinned ladder). (6) P3 is a NEW
+  command `evidence git T-# COMMIT [--repo] [--claim]`; `evidence add
+  --kind commit` keeps its Night-1 store-as-is behavior (plan B2 wanted
+  validation inside `evidence add`). (7) Agent kinds are
+  `local|cloud|human|generic` with repeatable `--capability` and generated
+  `AOS/Agents/<name>.md` notes (plan C1: `cli|api|ide|other`, CSV flag, no
+  vault notes). (8) `review weekly` ships (the plan deferred it).
+- **D-C.3 — `task assign` semantics.** Same-project re-assign is a no-op:
+  exit 0, prints a note, no event (mirrors `project add` idempotency,
+  D-P0.12). Done tasks refuse (terminal). Event `(task, assign)` payload:
+  {task, project, from_project} — from_project is null for a first assign.
+- **D-C.4 — `task edit` details.** Editable set is closed: title, kind,
+  priority, accept, spec. `task add --spec` included (plan A2 bundles it
+  into the same item; no contract conflict — the `add` event payload is
+  unchanged). Event payload lists the changed field NAMES only, in the
+  fixed order title/kind/priority/accept/spec; "changed" means "provided"
+  (values are not compared — the ledger journals intent, values live in
+  the row). Empty values refuse: clearing a field is out of scope.
+- **D-C.5 — `task status` refusal precedence.** (1) target `done` → points
+  at `python aos.py done X` (the evidence gate is sacred), (2) source is
+  done → frozen, (3) transition legality (legal set named), (4) projectless
+  `inbox→ready` → "assign a project first" naming `task assign`.
+- **D-C.6 — `task list` filters.** `--kind` (validated) and
+  `--missing-evidence` (zero evidence rows, any status, composable with
+  `--status`/`--project`). `--assignee` skipped per the contract's "unless
+  trivially supported": `tasks.assignee` is write-never, so the filter
+  would be dead surface over an always-NULL column.
+- **D-C.7 — Dropfile parser strictness.** Exact `# AOS DROPFILE` header;
+  `task:`/`agent:`/`outcome:`/`summary:` in that order; both `## evidence`
+  and `## open questions` headings required (each may have zero bullets);
+  blank lines are skipped between elements; CRLF files are normalized for
+  parsing (the dedupe hash is over the RAW bytes); a bare CR inside a value
+  splits the line and is refused (injection defense, D-W9.1 lineage); every
+  stored value is one-line-collapsed. Malformed errors name the line
+  NUMBER, never the content — a bad line could be exactly the secret-shaped
+  text the scanner keeps off stderr.
+- **D-C.8 — Dropfile evidence never touches the filesystem.** `kind: file`
+  rows from a dropfile store sha256 NULL: an untrusted path is never
+  opened, unlike CLI `evidence add --kind file` which hashes a file the
+  human named. Deliberate asymmetry, journaled here.
+- **D-C.9 — Dropfile event grain.** All rows in ONE transaction: per-row
+  `(evidence, add)` events, the ladder's `(run, end)` when it fires, the
+  open-questions `(handoff, create)`, then one `(system, dropfile_ingest)`
+  sealing event carrying {file, sha256, task, agent, outcome, one-lined
+  truncated summary, evidence ids, run_ended, open_runs, handoff}. Actor
+  for every one of them is `agent:<name>` (the provenance-actor rule
+  extended). An empty open-questions list creates no handoff. Ingest is
+  allowed on done tasks — evidence-after-close matches `evidence add`.
+- **D-C.10 — `evidence git` details.** Repo defaults to the task's project
+  repo; `--repo` overrides; projectless without `--repo` refuses. Refs
+  starting with '-' refuse before git runs (option-smuggling guard).
+  Read-only queries only (`rev-parse --is-inside-work-tree`, `rev-parse
+  --verify <ref>^{commit}`, `show -s --format=%s`, `show --stat
+  --format=`), list-form args, 5 s timeout, graceful exit 1 on missing
+  git/non-repo/unknown commit/timeout. Full sha stored as ref; claim
+  defaults to the commit subject; subject/diffstat captured best-effort
+  (truncated to 200 chars) into the event payload via the existing
+  `add_evidence` path (optional extra_payload). Tests use temp git repos —
+  the contract's P3 gate explicitly authorizes this, superseding D-P4.1
+  for this command only. `evidence git` is NOT in the central event-sweep
+  seal (keeping that test git-independent); its event is proven in its own
+  test class.
+- **D-C.11 — Agent registry semantics.** Default kind `generic`. Names
+  validated against `^[A-Za-z0-9][A-Za-z0-9._-]*$` — the `agent:<name>`
+  provenance charset plus a leading alnum so names are safe, stable note
+  filenames (no hidden files, no path tricks). Capabilities stored as a
+  JSON array in the existing `capabilities_json` column (`[]` when none);
+  `agent update --capability` REPLACES the whole list. No `--trust-level`
+  and no `--invoke-hint` surface anywhere: trust stays 0 (autonomy is
+  earned via the ladder, never set by hand).
+- **D-C.12 — Review engine decisions.** The four new sections land AFTER
+  `## Recent runs` (the plan's D1 placement — an existing test pins the
+  earlier content slices). "Stale in-progress" = `in_progress` AND (no
+  open run OR no run started/ended inside the recent window), reasons
+  joined. "Memory needing refresh" = LIVE rows (not superseded, not
+  retired at the review date) not updated for 30 days — the D-W6.2 quirk
+  (superseded rows in "Stale memory") is deliberately preserved there
+  under its regression pin and fixed only in the new section. `review
+  weekly` = ISO week Mon–Sun containing `--date`, filename `YYYY-Www.md`,
+  windows span the week, point-in-time sections as of the week's end.
+  `review project` = `Reviews/project-<slug>.md`, every section filtered
+  to the project (global-scope memory excluded — not project-tied); takes
+  the same optional `--date` as `build` (determinism for tests; the
+  contract names `--date` only for weekly, adding it to project is a
+  strict superset). All three builds share one engine and the byte-exact
+  `## Notes` splice; all are eventless (D-P0.6/D-W6.1 lineage).
+- **D-C.13 — Index notes.** Exactly the seven the contract lists (Tasks,
+  Decisions, Evidence, Handoffs, Memory, Agents, Reviews) as top-level
+  `AOS/<Name>.md` notes — stable wikilink stems, no frontmatter (like
+  Home). Projects/Runs have no index (not in the contract's list). The
+  Reviews index derives from the `Reviews/` directory listing — reviews
+  live on disk, not in the DB — which keeps sync deterministic and
+  idempotent for a given workspace state. Memory index shows superseded/
+  valid_until as stored facts, never computed liveness (no clock in the
+  mirror). Doctor's containment allowlist gains the seven filenames.
+- **D-C.14 — Doctor pins moved 12 → 17 (D-W8.1 pattern, both sites).**
+  Four new checks (agent rows well-formed · dropfile ingest events carry
+  their sha256 · entity-note frontmatter parses · PRAGMA integrity_check)
+  plus one WARN-ONLY line (code tasks done without commit evidence) that
+  prints `[WARN]` and never affects the exit code. The weekend pin test
+  was renamed `..._passes_all_checks` with the move documented inline; no
+  assertion was weakened — the all-green requirement now also accepts the
+  expected `[WARN]` line, which the Night-1 fixture legitimately triggers
+  (its code task closed with note evidence). The frontmatter check covers
+  the eight entity folders only (Reviews/Home/CONVENTIONS/index notes have
+  no frontmatter by design); non-UTF-8 stays check 5's finding. No
+  deliberate-corruption test for integrity_check: flipping page bytes
+  deterministically without also breaking `open_db`'s meta read is not
+  reliable across SQLite builds — the check's clean pass is pinned and its
+  failure path is a one-line comparison. Every other new check has a
+  corruption test asserting exactly one failure.
+- **D-C.15 — Adversarial review pass (D-P7.3/D-W9.1 practice continued).**
+  Seven independent dimension reviewers (hard constraints · P1 lifecycle ·
+  P2 dropfile-as-adversary · P3+P4 · P5+P6 · P7+weakened-test scan · deep
+  correctness) reviewed the full working diff; every finding was then
+  attacked by three separate refutation agents (correctness / reproduce-it
+  / spec-reading lenses, majority rules). Result: 3 findings, 3 confirmed
+  (each reproduced live by all three verifiers), 0 refuted. Fixed with
+  regression tests: (1) `AGENT_NAME_RE` anchored with `$`, which matches
+  before a string-final newline — `agent add $'codex\n'` passed validation
+  and wrote an unrecoverable `Agents/codex\n.md` mirror note; fixed with
+  `\Z` (doctor check 13 shares the regex and is fixed with it), test pins
+  the trailing-newline refusal. (2) `_run_git` decoded git output as
+  strict UTF-8, so a commit subject re-encoded via i18n.logOutputEncoding
+  crashed `evidence git` with exit 2 on a perfectly valid commit; fixed
+  with errors='replace' (graceful degradation), test commits a non-ASCII
+  subject under latin1 output encoding. (3) a dropfile task id above
+  SQLite's INTEGER bound slipped past `_TASK_RE` into an OverflowError
+  exit 2 — untrusted input reaching the internal-error path; fixed with a
+  range check in the parser ("task id out of range", exit 1), test pins
+  it. The same overflow via CLI-typed ids (e.g. `task show T-<25 nines>`)
+  predates this build and is recorded as a known limitation, not churned
+  here.
+- **D-C.16 — Final gate results.** Recorded after the FINAL VERIFICATION
+  GATE: suite 162 → 256 (all green; 254 at the P7 gate + 2 new regression
+  tests and 1 extended refusal matrix from the adversarial review pass),
+  smoke green including the deliberate duplicate
+  refusal, repo doctor clean, nothing staged/committed/pushed. Dogfood
+  loop closed: evidence attached to T-0003, run R-0002 ended success,
+  T-0003 done, sync + doctor clean. Exact outputs live in the FINAL
+  REPORT.
+
 # DECISIONS — Agentic OS two-week scope PLANNING run
 
 This section (`D-2W-P.*`) journals the planning pass executed per

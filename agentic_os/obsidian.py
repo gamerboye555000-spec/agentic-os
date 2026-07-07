@@ -11,7 +11,16 @@ import sqlite3
 from pathlib import Path
 
 from . import ids, render, utils
-from .models import Decision, Evidence, Handoff, MemoryItem, Project, Run, Task
+from .models import (
+    Agent,
+    Decision,
+    Evidence,
+    Handoff,
+    MemoryItem,
+    Project,
+    Run,
+    Task,
+)
 
 VAULT_DIRNAME = "obsidian-vault"
 AOS_SUBDIR = "AOS"
@@ -24,6 +33,7 @@ ENTITY_DIRS = (
     "Handoffs",
     "Reviews",
     "Memory",
+    "Agents",
 )
 WORKSPACE_DIRS = ("packs", "exports", "adapters")
 
@@ -67,19 +77,151 @@ def _home_inputs(conn: sqlite3.Connection) -> tuple[list[dict], list[dict], list
     return projects, open_tasks, recent_tasks
 
 
+def _home_counts(conn: sqlite3.Connection) -> dict:
+    def count(sql: str) -> int:
+        return conn.execute(sql).fetchone()[0]
+
+    return {
+        "projects": count("SELECT COUNT(*) FROM projects"),
+        "open_tasks": count("SELECT COUNT(*) FROM tasks WHERE status != 'done'"),
+        "inbox_tasks": count("SELECT COUNT(*) FROM tasks WHERE status = 'inbox'"),
+        "ready_tasks": count("SELECT COUNT(*) FROM tasks WHERE status = 'ready'"),
+        "in_progress_tasks": count(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'in_progress'"
+        ),
+        "done_tasks": count("SELECT COUNT(*) FROM tasks WHERE status = 'done'"),
+        "open_runs": count("SELECT COUNT(*) FROM runs WHERE ended_at IS NULL"),
+        "open_handoffs": count(
+            "SELECT COUNT(*) FROM handoffs WHERE accepted_at IS NULL"
+        ),
+        "decisions": count("SELECT COUNT(*) FROM decisions"),
+        "evidence": count("SELECT COUNT(*) FROM evidence"),
+        "memory": count("SELECT COUNT(*) FROM memory"),
+        "agents": count("SELECT COUNT(*) FROM agents"),
+    }
+
+
+#: Top-level generated index notes (filename stems double as wikilinks).
+INDEX_NOTES = tuple(name for name, _ in render.INDEX_NOTE_DESCRIPTIONS)
+
+
+def _index_note_contents(conn: sqlite3.Connection, aos_root: Path) -> dict[str, str]:
+    slug_by_project_id = {
+        row["id"]: row["slug"]
+        for row in conn.execute("SELECT id, slug FROM projects")
+    }
+
+    def task_bullet(row) -> str:
+        project = slug_by_project_id.get(row["project_id"]) or "-"
+        title = " ".join(row["title"].split())
+        return (
+            f"- [[{ids.render_id('task', row['id'])}]] {title} "
+            f"· {row['status']} · {project}"
+        )
+
+    open_tasks = [
+        task_bullet(row)
+        for row in conn.execute(
+            "SELECT id, title, status, project_id FROM tasks "
+            "WHERE status != 'done' ORDER BY id"
+        )
+    ]
+    done_tasks = [
+        task_bullet(row)
+        for row in conn.execute(
+            "SELECT id, title, status, project_id FROM tasks "
+            "WHERE status = 'done' ORDER BY id"
+        )
+    ]
+
+    def one(text: str | None) -> str:
+        return " ".join(text.split()) if text else "-"
+
+    decisions = [
+        f"- [[{ids.render_id('decision', row['id'])}]] [{row['status']}] "
+        f"{one(row['title'])}"
+        for row in conn.execute(
+            "SELECT id, title, status FROM decisions ORDER BY id"
+        )
+    ]
+    evidence = [
+        f"- [[{ids.render_id('evidence', row['id'])}]] {row['kind']} · "
+        f"{one(row['ref'])} · [[{ids.render_id('task', row['task_id'])}]]"
+        for row in conn.execute(
+            "SELECT id, task_id, kind, ref FROM evidence ORDER BY id"
+        )
+    ]
+    handoffs = [
+        f"- [[{ids.render_id('handoff', row['id'])}]] {one(row['from_agent'])} "
+        f"→ {one(row['to_agent'])} · [[{ids.render_id('task', row['task_id'])}]] "
+        f"· {'accepted' if row['accepted_at'] else 'open'}"
+        for row in conn.execute(
+            "SELECT id, task_id, from_agent, to_agent, accepted_at "
+            "FROM handoffs ORDER BY id"
+        )
+    ]
+    memory = []
+    for row in conn.execute(
+        "SELECT id, key, scope, confidence, valid_until, superseded_by "
+        "FROM memory ORDER BY id"
+    ):
+        bullet = (
+            f"- [[{ids.render_id('memory', row['id'])}]] {one(row['key'])} "
+            f"· {row['scope']} · [{row['confidence']}]"
+        )
+        if row["superseded_by"]:
+            bullet += (
+                f" · superseded by "
+                f"[[{ids.render_id('memory', row['superseded_by'])}]]"
+            )
+        if row["valid_until"]:
+            bullet += f" · valid until {row['valid_until']}"
+        memory.append(bullet)
+    agents = [
+        f"- [[{row['name']}]] {row['kind']}"
+        for row in conn.execute("SELECT name, kind FROM agents ORDER BY name")
+    ]
+    reviews_dir = aos_root / "Reviews"
+    reviews = [
+        f"- [[{path.stem}]]"
+        for path in sorted(reviews_dir.glob("*.md"))
+        if reviews_dir.is_dir() and not path.name.startswith(".")
+    ]
+
+    return {
+        "Tasks": render.index_note(
+            "Tasks index",
+            [("Open", open_tasks), ("Done", done_tasks)],
+        ),
+        "Decisions": render.index_note("Decisions index", [("All", decisions)]),
+        "Evidence": render.index_note("Evidence index", [("All", evidence)]),
+        "Handoffs": render.index_note("Handoffs index", [("All", handoffs)]),
+        "Memory": render.index_note("Memory index", [("All", memory)]),
+        "Agents": render.index_note("Agents index", [("All", agents)]),
+        "Reviews": render.index_note("Reviews index", [("All", reviews)]),
+    }
+
+
 def write_home_and_conventions(conn: sqlite3.Connection, aos_dir: Path) -> int:
-    """Write AOS/Home.md and AOS/CONVENTIONS.md; returns files (re)written."""
+    """Write AOS/Home.md, AOS/CONVENTIONS.md, and the top-level index notes;
+    returns files (re)written."""
     aos_root = vault_aos_dir(aos_dir)
     written = 0
     projects, open_tasks, recent_tasks = _home_inputs(conn)
     if utils.write_text_lf_if_changed(
-        aos_root / "Home.md", render.home_md(projects, open_tasks, recent_tasks)
+        aos_root / "Home.md",
+        render.home_md(
+            projects, open_tasks, recent_tasks, _home_counts(conn)
+        ),
     ):
         written += 1
     if utils.write_text_lf_if_changed(
         aos_root / "CONVENTIONS.md", render.CONVENTIONS_MD
     ):
         written += 1
+    for name, content in _index_note_contents(conn, aos_root).items():
+        if utils.write_text_lf_if_changed(aos_root / f"{name}.md", content):
+            written += 1
     return written
 
 
@@ -231,6 +373,13 @@ def sync_vault(conn: sqlite3.Connection, aos_dir: Path) -> tuple[int, int]:
             render.memory_note(item, slug_by_project_id.get(item.project_id)),
         )
 
+    for row in _rows(conn, "SELECT * FROM agents ORDER BY name"):
+        agent = Agent.from_row(row)
+        emit_note(
+            aos_root / "Agents" / f"{agent.name}.md",
+            render.agent_note(agent, agent.capabilities()),
+        )
+
     written += write_home_and_conventions(conn, aos_dir)
-    total += 2  # Home.md + CONVENTIONS.md
+    total += 2 + len(INDEX_NOTES)  # Home.md + CONVENTIONS.md + index notes
     return total, written

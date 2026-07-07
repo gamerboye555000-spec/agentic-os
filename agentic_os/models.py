@@ -16,9 +16,14 @@ PACK_TARGETS = ("claude-code", "codex", "gemini", "generic")
 MEMORY_SCOPES = ("global", "project")
 MEMORY_KINDS = ("preference", "fact", "constraint", "summary")
 MEMORY_CONFIDENCES = ("confirmed", "single", "inferred", "assumed")
+AGENT_KINDS = ("local", "cloud", "human", "generic")
 
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$", re.ASCII)
 PROVENANCE_RE = re.compile(r"^(human|agent:[A-Za-z0-9._-]+)$", re.ASCII)
+#: Registry names must be referenceable as `agent:<name>` provenance AND be
+#: safe stable note filenames — so: provenance charset, leading alnum.
+#: \Z, not $ — '$' would admit a trailing newline straight into a filename.
+AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z", re.ASCII)
 
 
 def validate_enum(value: str, allowed: tuple[str, ...], what: str) -> str:
@@ -42,6 +47,15 @@ def validate_provenance(value: str) -> str:
             f"Invalid provenance {value!r}. Use 'human' or 'agent:<name>'."
         )
     return value
+
+
+def validate_agent_name(name: str) -> str:
+    if not AGENT_NAME_RE.match(name):
+        raise AosError(
+            f"Invalid agent name {name!r}. Use letters, digits, '.', '_' "
+            "or '-' (must start with a letter or digit)."
+        )
+    return name
 
 
 class _Row:
@@ -162,6 +176,31 @@ class Pack(_Row):
     token_estimate: int
     inputs_hash: str
     created_at: str
+
+
+@dataclass
+class Agent(_Row):
+    id: int
+    name: str
+    kind: str
+    invoke_hint: str | None
+    capabilities_json: str | None
+    trust_level: int
+    notes: str | None
+
+    def capabilities(self) -> list[str]:
+        """capabilities_json as a list of strings; malformed/absent → []."""
+        import json
+
+        if not self.capabilities_json:
+            return []
+        try:
+            value = json.loads(self.capabilities_json)
+        except ValueError:
+            return []
+        if not isinstance(value, list):
+            return []
+        return [str(item) for item in value]
 
 
 @dataclass

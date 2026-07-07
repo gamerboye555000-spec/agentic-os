@@ -10,17 +10,23 @@ Weekend hardening adds: schema_version supported · task statuses inside the
 vocabulary · handoffs reference existing tasks · task-linked decisions
 reference existing tasks · memory supersede pointers resolve · packs
 reference existing tasks and their files exist on disk.
+
+Complete-today hardening adds: agent registry rows well-formed · dropfile
+ingest events carry their dedupe hash · generated entity notes have
+well-formed frontmatter · PRAGMA integrity_check — plus one WARN-ONLY line
+(code tasks done without commit evidence) that never fails the run.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import db, ids, obsidian, utils
-from .models import TASK_STATUSES
+from .models import AGENT_KINDS, AGENT_NAME_RE, TASK_STATUSES
 
 _WIKILINK = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
 
@@ -32,7 +38,14 @@ _NOTE_PATTERNS = {
     "Handoffs": re.compile(r"^H-[0-9]{4,}$"),
     "Memory": re.compile(r"^M-[0-9]{4,}$"),
     "Projects": re.compile(r"^[a-z0-9][a-z0-9._-]*$", re.ASCII),
-    "Reviews": re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"),
+    # Daily YYYY-MM-DD · weekly YYYY-Www · per-project project-<slug>.
+    "Reviews": re.compile(
+        r"^([0-9]{4}-[0-9]{2}-[0-9]{2}"
+        r"|[0-9]{4}-W[0-9]{2}"
+        r"|project-[a-z0-9][a-z0-9._-]*)$",
+        re.ASCII,
+    ),
+    "Agents": re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", re.ASCII),
 }
 
 
@@ -41,6 +54,37 @@ class Check:
     name: str
     ok: bool
     detail: str = ""
+    #: A warn-only check prints [WARN] instead of [FAIL] and never affects
+    #: the exit code.
+    warn_only: bool = False
+
+
+#: Entity folders whose notes carry frontmatter (Reviews and the top-level
+#: Home/CONVENTIONS/index notes deliberately have none).
+FRONTMATTER_DIRS = (
+    "Projects",
+    "Tasks",
+    "Runs",
+    "Decisions",
+    "Evidence",
+    "Handoffs",
+    "Memory",
+    "Agents",
+)
+
+_FRONTMATTER_LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*:( .*)?|  - .+)$")
+
+
+def _frontmatter_problem(text: str) -> str | None:
+    lines = text.split("\n")
+    if not lines or lines[0] != "---":
+        return "missing opening '---'"
+    for index in range(1, len(lines)):
+        if lines[index] == "---":
+            return "empty frontmatter" if index == 1 else None
+        if not _FRONTMATTER_LINE.match(lines[index]):
+            return f"bad frontmatter line {index + 1}"
+    return "missing closing '---'"
 
 
 def _is_hidden(path: Path, base: Path) -> bool:
@@ -141,7 +185,10 @@ def run_checks(conn: sqlite3.Connection, aos_dir: Path) -> list[Check]:
                 strays.append(path.relative_to(vault).as_posix())
                 continue
             rel = path.relative_to(aos_root)
-            if rel.as_posix() in ("Home.md", "CONVENTIONS.md"):
+            allowed_top_level = ("Home.md", "CONVENTIONS.md") + tuple(
+                f"{name}.md" for name in obsidian.INDEX_NOTES
+            )
+            if rel.as_posix() in allowed_top_level:
                 continue
             pattern = (
                 _NOTE_PATTERNS.get(rel.parts[0]) if len(rel.parts) == 2 else None
@@ -256,6 +303,114 @@ def run_checks(conn: sqlite3.Connection, aos_dir: Path) -> list[Check]:
             "packs reference existing tasks and files",
             not pack_problems,
             "; ".join(pack_problems[:10]),
+        )
+    )
+
+    # 13. Agent registry rows are well-formed (name charset, kind
+    #     vocabulary, capabilities_json a JSON array).
+    bad_agents = []
+    for row in conn.execute(
+        "SELECT name, kind, capabilities_json FROM agents ORDER BY name"
+    ).fetchall():
+        problems = []
+        name = row["name"] or ""
+        if not AGENT_NAME_RE.match(name):
+            problems.append("invalid name")
+        if row["kind"] not in AGENT_KINDS:
+            problems.append(f"unknown kind {row['kind']!r}")
+        if row["capabilities_json"] is not None:
+            try:
+                value = json.loads(row["capabilities_json"])
+                if not isinstance(value, list):
+                    problems.append("capabilities_json is not a JSON array")
+            except ValueError:
+                problems.append("capabilities_json does not parse")
+        if problems:
+            bad_agents.append(f"{name or '(unnamed)'}: " + ", ".join(problems))
+    checks.append(
+        Check(
+            "agent registry rows are well-formed",
+            not bad_agents,
+            "; ".join(bad_agents[:10]),
+        )
+    )
+
+    # 14. Duplicate-dropfile protection intact: every ingest event carries
+    #     the sha256 the dedupe scan relies on.
+    bad_ingests = []
+    for row in conn.execute(
+        "SELECT id, payload_json FROM events "
+        "WHERE entity = 'system' AND action = 'dropfile_ingest' ORDER BY id"
+    ).fetchall():
+        try:
+            payload = json.loads(row["payload_json"])
+        except ValueError:
+            bad_ingests.append(f"event #{row['id']}: payload does not parse")
+            continue
+        sha = payload.get("sha256")
+        if not isinstance(sha, str) or len(sha) != 64:
+            bad_ingests.append(f"event #{row['id']}: missing sha256")
+    checks.append(
+        Check(
+            "dropfile ingest events carry their dedupe hash",
+            not bad_ingests,
+            "; ".join(bad_ingests[:10]),
+        )
+    )
+
+    # 15. Generated entity notes have well-formed frontmatter.
+    bad_frontmatter = []
+    for dirname in FRONTMATTER_DIRS:
+        folder = aos_root / dirname
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.glob("*.md")):
+            if _is_hidden(path, aos_root):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue  # check 5 already reports the encoding failure
+            problem = _frontmatter_problem(text)
+            if problem:
+                bad_frontmatter.append(f"{dirname}/{path.name}: {problem}")
+    checks.append(
+        Check(
+            "generated notes have well-formed frontmatter",
+            not bad_frontmatter,
+            "; ".join(bad_frontmatter[:10]),
+        )
+    )
+
+    # 16. SQLite structural integrity.
+    try:
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    except sqlite3.DatabaseError as exc:
+        integrity = f"error: {exc}"
+    checks.append(
+        Check(
+            "database integrity_check passes",
+            integrity == "ok",
+            "" if integrity == "ok" else str(integrity)[:200],
+        )
+    )
+
+    # 17 (WARN, never fatal). Code tasks closed without commit evidence —
+    #     surfaced here and in the review's matching section.
+    warn_offenders = [
+        ids.render_id("task", row["id"])
+        for row in conn.execute(
+            "SELECT id FROM tasks WHERE status = 'done' AND kind = 'code' "
+            "AND NOT EXISTS (SELECT 1 FROM evidence e "
+            "WHERE e.task_id = tasks.id AND e.kind = 'commit') ORDER BY id"
+        ).fetchall()
+    ]
+    checks.append(
+        Check(
+            "code tasks done without commit evidence",
+            not warn_offenders,
+            ", ".join(warn_offenders[:10]),
+            warn_only=True,
         )
     )
 

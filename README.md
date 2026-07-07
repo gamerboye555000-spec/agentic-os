@@ -46,7 +46,82 @@ python aos.py log T-0001
 
 Quick capture without a project: `python aos.py in "some thought"`.
 Machine-readable output: `task list`, `task show`, `status`, `log`,
-`memory list`, and `search` accept `--json`.
+`memory list`, `agent list`, `agent show`, and `search` accept `--json`.
+
+## The coordination loop
+
+The full workflow one task travels: capture → triage → pack → agent →
+write-back → review → done.
+
+```bash
+python aos.py in "idea captured mid-flight"        # T-0007, projectless inbox
+python aos.py task assign T-0007 -p agentic-os     # triage: give it a project
+python aos.py task edit T-0007 --title "Real title" --spec "What & why" --priority 2
+python aos.py task status T-0007 ready             # inbox→ready (legal moves only)
+python aos.py pack build T-0007 --for claude-code  # context pack for the agent
+python aos.py run start T-0007 --agent claude-code # R-0004; task → in_progress
+
+# The agent works in its own tool, then writes back — either via the CLI
+# (evidence add / run end), or by leaving a dropfile that you ingest:
+python aos.py ingest dropfile .agentic-os/exports/dropfile-T-0007-claude-code-1.md
+
+# Attach verified commit evidence (read-only git; full sha + subject captured):
+python aos.py evidence git T-0007 HEAD
+
+python aos.py review build                          # daily review note
+python aos.py done T-0007                           # closes only with evidence
+python aos.py sync                                  # refresh the Obsidian mirror
+```
+
+## Task lifecycle commands
+
+```bash
+python aos.py task assign T-0002 -p agentic-os   # project onto a projectless task
+                                                 # (or move a non-done task)
+python aos.py task edit T-0001 [--title TEXT] [--spec TEXT] [--accept TEXT]
+                               [--kind code|research|writing|ops] [--priority 1-5]
+python aos.py task status T-0001 ready           # legal: inbox→ready,
+                                                 # ready→in_progress, in_progress→ready
+python aos.py task list [--kind code] [--missing-evidence] [--status ready] [--json]
+```
+
+`task edit` refuses done tasks — closed means frozen; append evidence or
+decisions instead. `task status X done` always refuses and points at
+`python aos.py done X`: the evidence gate is the only path to done.
+
+## Dropfile ingest
+
+Every generated pack tells its agent: if the aos CLI is unavailable, write a
+dropfile (`adapters/*/PROTOCOL.md` publishes the exact format). `ingest
+dropfile PATH` reads it back into the ledger:
+
+- Strict parser — any malformed line refuses the whole file (exit 1, nothing
+  ingested) naming the first bad line by number.
+- Dropfile content is untrusted data: nothing in it is executed, no path it
+  names is opened, values are one-line-collapsed, and the same secret scanner
+  that guards packs refuses secret-shaped content without echoing it.
+- Evidence rows land with provenance `agent:<name>`; open questions become a
+  handoff to `generic`.
+- Runs ladder: exactly one open run for that task+agent is ended with the
+  dropfile outcome; zero or several open runs ingest evidence only and say so.
+- Dedupe by file sha256 (recorded in the ingest event): re-ingesting the same
+  bytes is refused. The dropfile itself is never modified or deleted.
+
+## Agent registry
+
+Records only — Agentic OS never executes agents.
+
+```bash
+python aos.py agent add codex --kind cloud --notes "cloud runner" \
+    --capability code --capability review
+python aos.py agent update codex --notes "new notes" --capability docs
+python aos.py agent list --json
+python aos.py agent show codex --json
+```
+
+Registered agents get generated `AOS/Agents/<name>.md` notes on sync. There
+is deliberately no `--trust-level` flag anywhere: autonomy is earned through
+the ladder, never set by hand.
 
 ## Weekend commands
 
@@ -77,9 +152,14 @@ python aos.py memory retire M-0002
 # Search tasks, decisions, evidence, handoffs, and memory:
 python aos.py search "SQLite" --json
 
-# Build (or refresh) today's review note — everything you write from the
-# "## Notes" line down survives every rebuild byte-for-byte:
-python aos.py review build
+# Build (or refresh) review notes — everything you write from the
+# "## Notes" line down survives every rebuild byte-for-byte. Reviews cover
+# open/attention tasks, recent evidence and runs, open handoffs, stale
+# in-progress tasks, code tasks closed without commit evidence, and memory
+# needing refresh:
+python aos.py review build                     # daily  → Reviews/YYYY-MM-DD.md
+python aos.py review weekly [--date 2026-07-07]  # ISO week → Reviews/YYYY-Www.md
+python aos.py review project agentic-os        # one project → Reviews/project-<slug>.md
 
 # Backups: JSONL event export + a WAL-safe database snapshot:
 python aos.py export events --jsonl
@@ -127,8 +207,9 @@ matches whole words; the fallback matches substrings.
   exports/          # events-*.jsonl exports, aos-*.db snapshots, agent dropfiles
   adapters/         # per-agent PROTOCOL.md (claude-code, codex, gemini, generic)
   obsidian-vault/
-    AOS/            # generated mirror: Home.md, CONVENTIONS.md, Tasks/, Runs/,
-                    # Decisions/, Evidence/, Handoffs/, Memory/, Reviews/, ...
+    AOS/            # generated mirror: Home.md, CONVENTIONS.md, index notes
+                    # (Tasks.md, Decisions.md, ...), Tasks/, Runs/, Decisions/,
+                    # Evidence/, Handoffs/, Memory/, Agents/, Reviews/, ...
 ```
 
 Human-facing IDs are stable and zero-padded: tasks `T-0001`, runs `R-0001`,
@@ -140,9 +221,11 @@ memory `M-0001`.
 - The vault is generated: never rename generated notes; edit data via the CLI
   and re-run `python aos.py sync` (see `AOS/CONVENTIONS.md`).
 - Context packs are secret-scanned at build time and refuse to compile if
-  anything credential-shaped is found.
-- The only subprocess Agentic OS ever runs is read-only `git rev-parse` to
-  anchor runs to a commit; failures degrade to a note, never a crash.
+  anything credential-shaped is found; dropfiles are secret-scanned at
+  ingest time under the same rule.
+- The only subprocesses Agentic OS ever runs are read-only git queries
+  (`rev-parse` / `show`) — to anchor runs to a commit and to verify commit
+  evidence. Failures degrade gracefully; nothing is ever written to a repo.
 
 ## Tests
 
@@ -152,18 +235,15 @@ python -m unittest discover -s tests
 
 ## Status
 
-Weekend MVP, extending the committed Night-1 MVP — a database created by the
-Night-1 build works with Weekend code unmodified (no schema change, no
-migration). Deliberately deferred: agent CLI commands, dropfile ingest, git
-evidence ingest, MCP server, Obsidian plugin, vector search, any autonomous
-execution.
+Complete-today build, extending the Weekend and Night-1 MVPs — a database
+created by either earlier build works with this code unmodified (no schema
+change, no migration; `schema_version` stays `"1"`). This phase closed the
+coordinate-and-audit loop: task lifecycle (`assign`/`edit`/`status` + list
+filters), dropfile ingest, verified commit evidence (`evidence git`), the
+agent registry with vault notes, richer daily/weekly/project reviews, Home
+dashboard + index notes, and doctor hardening (17 checks incl. a non-fatal
+commit-evidence warning).
 
-## Roadmap
-
-The next phase is planned in `agentic-os-two-week-plan.md` (pending approval):
-task lifecycle repair (`task assign` / `task edit` / `task status`), dropfile
-ingest, commit-evidence validation via read-only git, a minimal agent registry
-(no execution), and richer review notes — zero schema changes, no new
-dependencies. Longer-horizon items (MCP server, Obsidian plugin, background
-runs, vector search, two-way review ingest) stay deferred behind the explicit
-un-defer triggers listed in that plan.
+Deliberately deferred (unchanged triggers, see `agentic-os-two-week-plan.md`
+§4): MCP server, Obsidian plugin, vector search, background runs, two-way
+review ingest, routing/scoring, multi-device sync, any autonomous execution.

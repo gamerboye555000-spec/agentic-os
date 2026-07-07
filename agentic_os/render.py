@@ -94,11 +94,28 @@ Read this before editing anything here.
 - Every mutation is journaled in an append-only events table.
 
 Tag namespace: `aos/task`, `aos/run`, `aos/decision`, `aos/evidence`,
-`aos/handoff`, `aos/project`, `aos/memory`.
+`aos/handoff`, `aos/project`, `aos/memory`, `aos/agent`.
 """
 
 
-def home_md(projects: list[dict], open_tasks: list[dict], recent_tasks: list[dict]) -> str:
+#: The generated top-level index notes (stable wikilink stems).
+INDEX_NOTE_DESCRIPTIONS = (
+    ("Tasks", "every task by status"),
+    ("Decisions", "the decision log"),
+    ("Evidence", "every evidence row"),
+    ("Handoffs", "agent-to-agent handoffs"),
+    ("Memory", "scoped memory rows"),
+    ("Agents", "the agent registry"),
+    ("Reviews", "generated review notes"),
+)
+
+
+def home_md(
+    projects: list[dict],
+    open_tasks: list[dict],
+    recent_tasks: list[dict],
+    counts: dict | None = None,
+) -> str:
     """Home dashboard. Inputs are dicts with pre-fetched fields; content is a
     pure function of them (no clock, no counters beyond what is passed)."""
 
@@ -117,15 +134,47 @@ def home_md(projects: list[dict], open_tasks: list[dict], recent_tasks: list[dic
         "Evidence proves. Nothing claims done without proof.",
         "",
         "Start with [[CONVENTIONS]] before editing anything under `AOS/`.",
-        "",
-        "## Projects",
-        "",
     ]
+    if counts is not None:
+        lines += ["", "## At a glance", ""]
+        lines += [
+            f"- projects: {counts['projects']}",
+            f"- open tasks: {counts['open_tasks']} "
+            f"(inbox {counts['inbox_tasks']} · ready {counts['ready_tasks']} "
+            f"· in progress {counts['in_progress_tasks']})",
+            f"- done tasks: {counts['done_tasks']}",
+            f"- open runs: {counts['open_runs']}",
+            f"- open handoffs: {counts['open_handoffs']}",
+            f"- decisions: {counts['decisions']}",
+            f"- evidence rows: {counts['evidence']}",
+            f"- memory rows: {counts['memory']}",
+            f"- registered agents: {counts['agents']}",
+        ]
+    lines += ["", "## Index", ""]
+    lines += [
+        f"- [[{name}]] — {description}"
+        for name, description in INDEX_NOTE_DESCRIPTIONS
+    ]
+    lines += ["", "## Projects", ""]
     lines += [project_line(p) for p in projects] or ["*(none)*"]
     lines += ["", "## Open tasks", ""]
     lines += [task_line(t) for t in open_tasks] or ["*(none)*"]
     lines += ["", "## Recent tasks", ""]
     lines += [task_line(t) for t in recent_tasks] or ["*(none)*"]
+    return "\n".join(lines) + "\n"
+
+
+def index_note(title: str, sections: list[tuple[str, list[str]]]) -> str:
+    """A generated top-level index note: heading + bullet sections."""
+    lines = [
+        f"# {title}",
+        "",
+        "Generated index — regenerate with `python aos.py sync`; "
+        "see [[Home]] and [[CONVENTIONS]].",
+    ]
+    for heading, bullets in sections:
+        lines += ["", f"## {heading}", ""]
+        lines += bullets or ["*(none)*"]
     return "\n".join(lines) + "\n"
 
 
@@ -363,6 +412,29 @@ def memory_note(item, project_slug: str | None) -> str:
             f"- superseded by: [[{ids.render_id('memory', item.superseded_by)}]]"
         ]
     lines += _section("Value", item.value_md)
+    return "\n".join(lines) + "\n"
+
+
+def agent_note(agent, capabilities: list[str]) -> str:
+    """Registry note. Pure function of the agents row — the table carries no
+    timestamps, so the note is trivially deterministic."""
+    head = frontmatter(
+        [
+            ("type", "agent"),
+            ("name", agent.name),
+            ("kind", agent.kind),
+            ("trust_level", agent.trust_level),
+            ("capabilities", ", ".join(capabilities)),
+        ],
+        ["aos/agent"],
+    )
+    capability_lines = [f"- {_one_line(c)}" for c in capabilities]
+    lines = [head, "", f"# Agent {agent.name}", ""]
+    lines += [f"- kind: {agent.kind}"]
+    lines += [f"- trust level: {agent.trust_level}"]
+    lines += [f"- invoke hint: {_one_line(agent.invoke_hint) if agent.invoke_hint else '-'}"]
+    lines += ["", "## Capabilities", "", _bullets(capability_lines)]
+    lines += _section("Notes", agent.notes)
     return "\n".join(lines) + "\n"
 
 

@@ -101,15 +101,63 @@ def cmd_task_add(args) -> int:
             kind=args.kind,
             acceptance=args.accept,
             priority=args.priority,
+            spec=args.spec,
         )
         print(ids.render_id("task", task.id))
+    return 0
+
+
+def cmd_task_assign(args) -> int:
+    task_id = ids.parse_id(args.id, "task")
+    with _ledger(args) as (aos_dir, conn):
+        task, changed = ops.assign_task(
+            conn, task_id=task_id, project_slug=args.project
+        )
+        task_hid = ids.render_id("task", task.id)
+        if changed:
+            print(f"{task_hid} assigned to project {args.project}")
+        else:
+            print(f"{task_hid} already in project {args.project}; nothing changed.")
+    return 0
+
+
+def cmd_task_edit(args) -> int:
+    task_id = ids.parse_id(args.id, "task")
+    with _ledger(args) as (aos_dir, conn):
+        task, changed = ops.edit_task(
+            conn,
+            task_id=task_id,
+            title=args.title,
+            kind=args.kind,
+            priority=args.priority,
+            acceptance=args.accept,
+            spec=args.spec,
+        )
+        print(f"{ids.render_id('task', task.id)} edited: {', '.join(changed)}")
+    return 0
+
+
+def cmd_task_status(args) -> int:
+    task_id = ids.parse_id(args.id, "task")
+    with _ledger(args) as (aos_dir, conn):
+        task, from_status = ops.set_task_status(
+            conn, task_id=task_id, status=args.status
+        )
+        print(
+            f"{ids.render_id('task', task.id)} status: "
+            f"{from_status} → {task.status}"
+        )
     return 0
 
 
 def cmd_task_list(args) -> int:
     with _ledger(args) as (aos_dir, conn):
         tasks = ops.list_tasks(
-            conn, project_slug=args.project, status=args.status
+            conn,
+            project_slug=args.project,
+            status=args.status,
+            kind=args.kind,
+            missing_evidence=args.missing_evidence,
         )
         if args.json:
             _print_json({"tasks": tasks})
@@ -303,6 +351,117 @@ def cmd_evidence_add(args) -> int:
     return 0
 
 
+def cmd_agent_add(args) -> int:
+    with _ledger(args) as (aos_dir, conn):
+        agent = ops.add_agent(
+            conn,
+            name=args.name,
+            kind=args.kind,
+            notes=args.notes,
+            capabilities=args.capability,
+        )
+        print(f"Added agent {agent.name} ({agent.kind})")
+    return 0
+
+
+def cmd_agent_update(args) -> int:
+    with _ledger(args) as (aos_dir, conn):
+        agent, changed = ops.update_agent(
+            conn,
+            name=args.name,
+            notes=args.notes,
+            capabilities=args.capability,
+        )
+        print(f"{agent.name} updated: {', '.join(changed)}")
+    return 0
+
+
+def cmd_agent_list(args) -> int:
+    with _ledger(args) as (aos_dir, conn):
+        agents = ops.list_agents(conn)
+        if args.json:
+            _print_json({"agents": agents})
+            return 0
+        if not agents:
+            print("(no agents)")
+            return 0
+        for agent in agents:
+            capabilities = ",".join(agent["capabilities"]) or "-"
+            notes = " ".join(agent["notes"].split()) if agent["notes"] else "-"
+            print(
+                f"{agent['name']:<16} {agent['kind']:<8} "
+                f"{capabilities:<24} {notes}"
+            )
+    return 0
+
+
+def cmd_agent_show(args) -> int:
+    with _ledger(args) as (aos_dir, conn):
+        agent = ops.get_agent(conn, args.name)
+        if agent is None:
+            raise AosError(
+                f"No agent '{args.name}'. Run: python aos.py agent list"
+            )
+        public = ops.agent_public(agent)
+        if args.json:
+            _print_json({"agent": public})
+            return 0
+        print(f"{public['name']}  ({public['kind']})")
+        print(
+            "capabilities: "
+            + (", ".join(public["capabilities"]) or "-")
+        )
+        print(f"notes:        {_dash(public['notes'])}")
+        print(f"invoke hint:  {_dash(public['invoke_hint'])}")
+        print(f"trust level:  {public['trust_level']}")
+    return 0
+
+
+def cmd_evidence_git(args) -> int:
+    task_id = ids.parse_id(args.id, "task")
+    with _ledger(args) as (aos_dir, conn):
+        item = ops.add_git_evidence(
+            conn,
+            task_id=task_id,
+            commit=args.commit,
+            repo=args.repo,
+            claim=args.claim,
+        )
+        claim = " ".join(item.claim.split()) if item.claim else "-"
+        print(
+            f"{ids.render_id('evidence', item.id)} commit {item.ref[:12]} "
+            f"— {claim}"
+        )
+    return 0
+
+
+def cmd_ingest_dropfile(args) -> int:
+    with _ledger(args) as (aos_dir, conn):
+        from . import ingest
+
+        result = ingest.ingest_dropfile(
+            conn, Path(args.path).expanduser()
+        )
+        print(
+            f"Ingested dropfile for {result['task']} from {result['agent']} "
+            f"(outcome: {result['outcome']})"
+        )
+        if result["evidence"]:
+            print(f"evidence: {', '.join(result['evidence'])}")
+        else:
+            print("evidence: (none)")
+        if result["run_ended"]:
+            print(f"run ended: {result['run_ended']} → {result['outcome']}")
+        else:
+            print(
+                f"runs: {result['open_runs']} open for {result['agent']} — "
+                "no run created or ended"
+            )
+        if result["handoff"]:
+            print(f"open questions → handoff {result['handoff']} (to generic)")
+    return 0
+
+
 def cmd_done(args) -> int:
     task_id = ids.parse_id(args.id, "task")
     with _ledger(args) as (aos_dir, conn):
@@ -444,6 +603,28 @@ def cmd_review_build(args) -> int:
     return 0
 
 
+def cmd_review_weekly(args) -> int:
+    date_str = args.date if args.date is not None else utils.utc_today()
+    utils.validate_date(date_str, "--date")
+    with _ledger(args) as (aos_dir, conn):
+        from . import review
+
+        path = review.build_weekly_review(conn, aos_dir, date_str)
+        print(str(path))
+    return 0
+
+
+def cmd_review_project(args) -> int:
+    date_str = args.date if args.date is not None else utils.utc_today()
+    utils.validate_date(date_str, "--date")
+    with _ledger(args) as (aos_dir, conn):
+        from . import review
+
+        path = review.build_project_review(conn, aos_dir, args.slug, date_str)
+        print(str(path))
+    return 0
+
+
 def cmd_export_events(args) -> int:
     if not args.jsonl:
         raise AosError("Only JSONL export is supported. Pass --jsonl.")
@@ -476,9 +657,14 @@ def cmd_doctor(args) -> int:
         from . import doctor
 
         checks = doctor.run_checks(conn, aos_dir)
-    failed = [c for c in checks if not c.ok]
+    failed = [c for c in checks if not c.ok and not c.warn_only]
     for check in checks:
-        marker = "PASS" if check.ok else "FAIL"
+        if check.ok:
+            marker = "PASS"
+        elif check.warn_only:
+            marker = "WARN"
+        else:
+            marker = "FAIL"
         detail = f" — {check.detail}" if check.detail else ""
         print(f"[{marker}] {check.name}{detail}")
     if failed:
@@ -529,11 +715,36 @@ def build_parser() -> _Parser:
     p_task_add.add_argument("-p", "--project", required=True)
     p_task_add.add_argument("--kind", default="code")
     p_task_add.add_argument("--accept", default=None)
+    p_task_add.add_argument("--spec", default=None)
     p_task_add.add_argument("--priority", type=int, default=2)
     p_task_add.set_defaults(func=cmd_task_add)
+    p_task_assign = task_sub.add_parser(
+        "assign", help="assign a task to a project"
+    )
+    p_task_assign.add_argument("id")
+    p_task_assign.add_argument("-p", "--project", required=True)
+    p_task_assign.set_defaults(func=cmd_task_assign)
+    p_task_edit = task_sub.add_parser("edit", help="edit an open task's fields")
+    p_task_edit.add_argument("id")
+    p_task_edit.add_argument("--title", default=None)
+    p_task_edit.add_argument("--accept", default=None)
+    p_task_edit.add_argument("--spec", default=None)
+    p_task_edit.add_argument("--kind", default=None)
+    p_task_edit.add_argument("--priority", type=int, default=None)
+    p_task_edit.set_defaults(func=cmd_task_edit)
+    p_task_status = task_sub.add_parser(
+        "status", help="change task status (safe transitions only)"
+    )
+    p_task_status.add_argument("id")
+    p_task_status.add_argument("status")
+    p_task_status.set_defaults(func=cmd_task_status)
     p_task_list = task_sub.add_parser("list", help="list tasks")
     p_task_list.add_argument("--project", default=None)
     p_task_list.add_argument("--status", default=None)
+    p_task_list.add_argument("--kind", default=None)
+    p_task_list.add_argument(
+        "--missing-evidence", dest="missing_evidence", action="store_true"
+    )
     p_task_list.add_argument("--json", action="store_true")
     p_task_list.set_defaults(func=cmd_task_list)
     p_task_show = task_sub.add_parser("show", help="show one task")
@@ -584,6 +795,14 @@ def build_parser() -> _Parser:
     p_evidence_add.add_argument("--claim", default=None)
     p_evidence_add.add_argument("--provenance", default="human")
     p_evidence_add.set_defaults(func=cmd_evidence_add)
+    p_evidence_git = evidence_sub.add_parser(
+        "git", help="attach verified commit evidence via read-only git"
+    )
+    p_evidence_git.add_argument("id")
+    p_evidence_git.add_argument("commit")
+    p_evidence_git.add_argument("--repo", default=None)
+    p_evidence_git.add_argument("--claim", default=None)
+    p_evidence_git.set_defaults(func=cmd_evidence_git)
 
     p_decision = sub.add_parser("decision", help="decision records")
     decision_sub = p_decision.add_subparsers(
@@ -641,6 +860,47 @@ def build_parser() -> _Parser:
     p_memory_retire.add_argument("id")
     p_memory_retire.set_defaults(func=cmd_memory_retire)
 
+    p_agent = sub.add_parser(
+        "agent", help="agent registry (records only; never executes agents)"
+    )
+    agent_sub = p_agent.add_subparsers(
+        dest="subcommand", metavar="SUBCOMMAND", required=True
+    )
+    p_agent_add = agent_sub.add_parser("add", help="register an agent")
+    p_agent_add.add_argument("name")
+    p_agent_add.add_argument("--kind", default="generic")
+    p_agent_add.add_argument("--notes", default=None)
+    p_agent_add.add_argument(
+        "--capability", action="append", default=None, metavar="TEXT"
+    )
+    p_agent_add.set_defaults(func=cmd_agent_add)
+    p_agent_update = agent_sub.add_parser(
+        "update", help="update a registered agent"
+    )
+    p_agent_update.add_argument("name")
+    p_agent_update.add_argument("--notes", default=None)
+    p_agent_update.add_argument(
+        "--capability", action="append", default=None, metavar="TEXT"
+    )
+    p_agent_update.set_defaults(func=cmd_agent_update)
+    p_agent_list = agent_sub.add_parser("list", help="list registered agents")
+    p_agent_list.add_argument("--json", action="store_true")
+    p_agent_list.set_defaults(func=cmd_agent_list)
+    p_agent_show = agent_sub.add_parser("show", help="show one agent")
+    p_agent_show.add_argument("name")
+    p_agent_show.add_argument("--json", action="store_true")
+    p_agent_show.set_defaults(func=cmd_agent_show)
+
+    p_ingest = sub.add_parser("ingest", help="ingest agent write-back artifacts")
+    ingest_sub = p_ingest.add_subparsers(
+        dest="subcommand", metavar="SUBCOMMAND", required=True
+    )
+    p_ingest_dropfile = ingest_sub.add_parser(
+        "dropfile", help="ingest an agent dropfile (evidence + open questions)"
+    )
+    p_ingest_dropfile.add_argument("path")
+    p_ingest_dropfile.set_defaults(func=cmd_ingest_dropfile)
+
     p_done = sub.add_parser("done", help="close a task (requires evidence)")
     p_done.add_argument("id")
     p_done.add_argument("--no-evidence", action="store_true")
@@ -665,6 +925,23 @@ def build_parser() -> _Parser:
         help="review date (default: today, UTC)",
     )
     p_review_build.set_defaults(func=cmd_review_build)
+    p_review_weekly = review_sub.add_parser(
+        "weekly", help="build the review note for an ISO week"
+    )
+    p_review_weekly.add_argument(
+        "--date", default=None, metavar="YYYY-MM-DD",
+        help="any date inside the week (default: today, UTC)",
+    )
+    p_review_weekly.set_defaults(func=cmd_review_weekly)
+    p_review_project = review_sub.add_parser(
+        "project", help="build the review note for one project"
+    )
+    p_review_project.add_argument("slug")
+    p_review_project.add_argument(
+        "--date", default=None, metavar="YYYY-MM-DD",
+        help="review date (default: today, UTC)",
+    )
+    p_review_project.set_defaults(func=cmd_review_project)
 
     p_export = sub.add_parser("export", help="export ledger data")
     export_sub = p_export.add_subparsers(

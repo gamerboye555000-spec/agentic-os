@@ -14,6 +14,7 @@ from pathlib import Path
 
 from . import db, events, ids, obsidian, utils
 from .models import (
+    AGENT_KINDS,
     EVIDENCE_KINDS,
     MEMORY_CONFIDENCES,
     MEMORY_KINDS,
@@ -21,6 +22,7 @@ from .models import (
     RUN_OUTCOMES,
     TASK_KINDS,
     TASK_STATUSES,
+    Agent,
     Decision,
     Evidence,
     Handoff,
@@ -29,6 +31,7 @@ from .models import (
     Project,
     Run,
     Task,
+    validate_agent_name,
     validate_enum,
     validate_provenance,
     validate_slug,
@@ -306,6 +309,7 @@ def add_task(
     kind: str = "code",
     acceptance: str | None = None,
     priority: int = 2,
+    spec: str | None = None,
 ) -> Task:
     title = title.strip()
     if not title:
@@ -321,9 +325,9 @@ def add_task(
     with db.transaction(conn):
         cursor = conn.execute(
             "INSERT INTO tasks (project_id, title, kind, status, priority, "
-            "acceptance_md, created_at, updated_at) "
-            "VALUES (?, ?, ?, 'ready', ?, ?, ?, ?)",
-            (project.id, title, kind, priority, acceptance, now, now),
+            "acceptance_md, spec_md, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'ready', ?, ?, ?, ?, ?)",
+            (project.id, title, kind, priority, acceptance, spec, now, now),
         )
         task_id = cursor.lastrowid
         events.emit(
@@ -341,6 +345,175 @@ def add_task(
             },
         )
     return get_task(conn, task_id)
+
+
+#: The only manual status moves; `done` stays exclusively `aos done`'s.
+LEGAL_TASK_TRANSITIONS = (
+    ("inbox", "ready"),
+    ("ready", "in_progress"),
+    ("in_progress", "ready"),
+)
+
+TASK_PRIORITY_RANGE = (1, 5)
+
+
+def assign_task(
+    conn: sqlite3.Connection, *, task_id: int, project_slug: str
+) -> tuple[Task, bool]:
+    """Assign a project to a task (or move a non-done task between
+    projects). Status never changes here; `task status` owns transitions.
+    Returns (task, changed) — same-project re-assign is a no-op, no event.
+    """
+    task = get_task(conn, task_id)
+    task_hid = ids.render_id("task", task.id)
+    if task.status == "done":
+        raise AosError(
+            f"Task {task_hid} is done; refusing to reassign a closed task."
+        )
+    project = get_project_by_slug(conn, project_slug)
+    if project is None:
+        raise AosError(
+            f"No project '{project_slug}'. Run: python aos.py project add "
+            f"{project_slug} --name NAME --repo PATH"
+        )
+    if task.project_id == project.id:
+        return task, False
+    from_project = None
+    if task.project_id is not None:
+        old = get_project(conn, task.project_id)
+        from_project = old.slug if old else None
+    now = utils.utc_now_iso()
+    with db.transaction(conn):
+        conn.execute(
+            "UPDATE tasks SET project_id = ?, updated_at = ? WHERE id = ?",
+            (project.id, now, task.id),
+        )
+        events.emit(
+            conn,
+            actor=ACTOR_HUMAN,
+            entity="task",
+            entity_id=task.id,
+            action="assign",
+            payload={
+                "task": task_hid,
+                "project": project.slug,
+                "from_project": from_project,
+            },
+        )
+    return get_task(conn, task.id), True
+
+
+def edit_task(
+    conn: sqlite3.Connection,
+    *,
+    task_id: int,
+    title: str | None = None,
+    kind: str | None = None,
+    priority: int | None = None,
+    acceptance: str | None = None,
+    spec: str | None = None,
+) -> tuple[Task, list[str]]:
+    """Edit an open task's fields. Done tasks are frozen — no exceptions.
+    Returns (task, changed field names); the event payload carries the
+    field NAMES only, never the values."""
+    task = get_task(conn, task_id)
+    task_hid = ids.render_id("task", task.id)
+    if task.status == "done":
+        raise AosError(
+            f"Task {task_hid} is done; closed tasks are frozen — "
+            "append evidence or decisions instead of editing."
+        )
+    updates: dict[str, object] = {}
+    changed: list[str] = []
+    if title is not None:
+        title = title.strip()
+        if not title:
+            raise AosError("Task title must not be empty.")
+        updates["title"] = title
+        changed.append("title")
+    if kind is not None:
+        validate_enum(kind, TASK_KINDS, "task kind")
+        updates["kind"] = kind
+        changed.append("kind")
+    if priority is not None:
+        low, high = TASK_PRIORITY_RANGE
+        if not low <= priority <= high:
+            raise AosError(f"Task priority must be between {low} and {high}.")
+        updates["priority"] = priority
+        changed.append("priority")
+    if acceptance is not None:
+        if not acceptance.strip():
+            raise AosError("--accept must not be empty.")
+        updates["acceptance_md"] = acceptance
+        changed.append("accept")
+    if spec is not None:
+        if not spec.strip():
+            raise AosError("--spec must not be empty.")
+        updates["spec_md"] = spec
+        changed.append("spec")
+    if not updates:
+        raise AosError(
+            "Nothing to edit: pass at least one of "
+            "--title/--kind/--priority/--accept/--spec."
+        )
+    now = utils.utc_now_iso()
+    with db.transaction(conn):
+        assignments = ", ".join(f"{column} = ?" for column in updates)
+        conn.execute(
+            f"UPDATE tasks SET {assignments}, updated_at = ? WHERE id = ?",
+            (*updates.values(), now, task.id),
+        )
+        events.emit(
+            conn,
+            actor=ACTOR_HUMAN,
+            entity="task",
+            entity_id=task.id,
+            action="edit",
+            payload={"task": task_hid, "changed": changed},
+        )
+    return get_task(conn, task.id), changed
+
+
+def set_task_status(
+    conn: sqlite3.Connection, *, task_id: int, status: str
+) -> tuple[Task, str]:
+    """Manual status transition, legal moves only. Returns (task, from)."""
+    validate_enum(status, TASK_STATUSES, "task status")
+    task = get_task(conn, task_id)
+    task_hid = ids.render_id("task", task.id)
+    if status == "done":
+        raise AosError(
+            f"Refusing: 'done' requires evidence. Run: python aos.py done {task_hid}"
+        )
+    if task.status == "done":
+        raise AosError(
+            f"Task {task_hid} is done; closed tasks keep their status."
+        )
+    legal = ", ".join(f"{a}→{b}" for a, b in LEGAL_TASK_TRANSITIONS)
+    if (task.status, status) not in LEGAL_TASK_TRANSITIONS:
+        raise AosError(
+            f"Illegal transition {task.status}→{status}. Legal: {legal}."
+        )
+    if task.status == "inbox" and task.project_id is None:
+        raise AosError(
+            f"Task {task_hid} has no project; assign a project first: "
+            f"python aos.py task assign {task_hid} -p PROJECT"
+        )
+    now = utils.utc_now_iso()
+    with db.transaction(conn):
+        conn.execute(
+            "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+            (status, now, task.id),
+        )
+        events.emit(
+            conn,
+            actor=ACTOR_HUMAN,
+            entity="task",
+            entity_id=task.id,
+            action="status",
+            payload={"task": task_hid, "from": task.status, "to": status},
+        )
+    return get_task(conn, task.id), task.status
 
 
 def add_decision(
@@ -792,6 +965,7 @@ def add_evidence(
     ref: str,
     claim: str | None = None,
     provenance: str = "human",
+    extra_payload: dict | None = None,
 ) -> Evidence:
     validate_enum(kind, EVIDENCE_KINDS, "evidence kind")
     validate_provenance(provenance)
@@ -810,24 +984,124 @@ def add_evidence(
             (task.id, claim, kind, ref, sha, provenance, now),
         )
         evidence_id = cursor.lastrowid
+        payload = {
+            "task": ids.render_id("task", task.id),
+            "kind": kind,
+            "ref": ref,
+            "claim": claim,
+            "sha256": sha,
+        }
+        if extra_payload:
+            payload.update(extra_payload)
         events.emit(
             conn,
             actor=provenance,
             entity="evidence",
             entity_id=evidence_id,
             action="add",
-            payload={
-                "task": ids.render_id("task", task.id),
-                "kind": kind,
-                "ref": ref,
-                "claim": claim,
-                "sha256": sha,
-            },
+            payload=payload,
         )
     row = conn.execute(
         "SELECT * FROM evidence WHERE id = ?", (evidence_id,)
     ).fetchone()
     return Evidence.from_row(row)
+
+
+def _run_git(git: str, repo_path: Path, *args: str) -> subprocess.CompletedProcess:
+    """Read-only git query: list-form args, timeout, output captured.
+
+    errors='replace' — git output is arbitrary bytes (commit subjects,
+    i18n.logOutputEncoding re-encoding); a strict decode would crash a
+    valid ingest with exit 2 instead of degrading gracefully."""
+    return subprocess.run(
+        [git, *args],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+
+
+def add_git_evidence(
+    conn: sqlite3.Connection,
+    *,
+    task_id: int,
+    commit: str,
+    repo: str | None = None,
+    claim: str | None = None,
+) -> Evidence:
+    """Verified commit evidence: resolve `commit` in the task's project repo
+    (or --repo) via read-only git, store the FULL sha as the ref, and default
+    the claim to the commit subject. Unknown commit / no repo → exit 1."""
+    task = get_task(conn, task_id)
+    task_hid = ids.render_id("task", task.id)
+    if repo is not None:
+        repo_path = Path(repo).expanduser().resolve()
+    elif task.project_id is not None:
+        project = get_project(conn, task.project_id)
+        repo_path = Path(project.repo_path)
+    else:
+        raise AosError(
+            f"Task {task_hid} has no project; pass --repo PATH to name the "
+            "git repository."
+        )
+    if not repo_path.is_dir():
+        raise AosError(f"Repo path is not an existing directory: {repo_path}")
+    commit = commit.strip()
+    if not commit or commit.startswith("-"):
+        raise AosError(
+            "Invalid commit ref: must be a non-empty ref that does not "
+            "start with '-'."
+        )
+    git = shutil.which("git")
+    if git is None:
+        raise AosError("git executable not found; cannot verify the commit.")
+    try:
+        probe = _run_git(git, repo_path, "rev-parse", "--is-inside-work-tree")
+        if probe.returncode != 0 or probe.stdout.strip() != "true":
+            raise AosError(f"Not a git repository: {repo_path}")
+        resolved = _run_git(
+            git, repo_path, "rev-parse", "--verify", "--quiet",
+            f"{commit}^{{commit}}",
+        )
+        if resolved.returncode != 0 or not resolved.stdout.strip():
+            raise AosError(
+                f"Unknown commit {commit!r} in {repo_path}. "
+                f"Check: git -C {repo_path} log --oneline"
+            )
+        sha = resolved.stdout.strip()
+        subject = None
+        subject_proc = _run_git(git, repo_path, "show", "-s", "--format=%s", sha)
+        if subject_proc.returncode == 0 and subject_proc.stdout.strip():
+            subject = " ".join(subject_proc.stdout.split())[:200]
+        diffstat = None
+        stat_proc = _run_git(git, repo_path, "show", "--stat", "--format=", sha)
+        if stat_proc.returncode == 0:
+            stat_lines = [
+                line.strip() for line in stat_proc.stdout.splitlines()
+                if line.strip()
+            ]
+            if stat_lines:
+                diffstat = stat_lines[-1][:200]
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AosError(
+            f"git unavailable ({exc.__class__.__name__}); "
+            "cannot verify the commit."
+        )
+    return add_evidence(
+        conn,
+        task_id=task.id,
+        kind="commit",
+        ref=sha,
+        claim=claim if claim is not None else subject,
+        extra_payload={
+            "repo": str(repo_path),
+            "subject": subject,
+            "diffstat": diffstat,
+            "via": "git",
+        },
+    )
 
 
 def mark_done(
@@ -880,6 +1154,124 @@ def mark_done(
 
 
 # ---------------------------------------------------------------------------
+# Agent registry (registry only — Agentic OS never executes agents)
+
+def get_agent(conn: sqlite3.Connection, name: str) -> Agent | None:
+    row = conn.execute(
+        "SELECT * FROM agents WHERE name = ?", (name,)
+    ).fetchone()
+    return Agent.from_row(row) if row else None
+
+
+def agent_public(agent: Agent) -> dict:
+    return {
+        "name": agent.name,
+        "kind": agent.kind,
+        "capabilities": agent.capabilities(),
+        "notes": agent.notes,
+        "invoke_hint": agent.invoke_hint,
+        "trust_level": agent.trust_level,
+    }
+
+
+def _clean_capabilities(capabilities: list[str] | None) -> list[str]:
+    cleaned = []
+    for capability in capabilities or []:
+        capability = " ".join(capability.split())
+        if not capability:
+            raise AosError("--capability values must not be empty.")
+        cleaned.append(capability)
+    return cleaned
+
+
+def add_agent(
+    conn: sqlite3.Connection,
+    *,
+    name: str,
+    kind: str = "generic",
+    notes: str | None = None,
+    capabilities: list[str] | None = None,
+) -> Agent:
+    validate_agent_name(name)
+    validate_enum(kind, AGENT_KINDS, "agent kind")
+    caps = _clean_capabilities(capabilities)
+    if get_agent(conn, name) is not None:
+        raise AosError(
+            f"Agent '{name}' already exists. "
+            f"Run: python aos.py agent update {name}"
+        )
+    import json
+
+    with db.transaction(conn):
+        cursor = conn.execute(
+            "INSERT INTO agents (name, kind, capabilities_json, notes) "
+            "VALUES (?, ?, ?, ?)",
+            (name, kind, json.dumps(caps), notes),
+        )
+        events.emit(
+            conn,
+            actor=ACTOR_HUMAN,
+            entity="agent",
+            entity_id=cursor.lastrowid,
+            action="add",
+            payload={"agent": name, "kind": kind, "capabilities": caps},
+        )
+    return get_agent(conn, name)
+
+
+def update_agent(
+    conn: sqlite3.Connection,
+    *,
+    name: str,
+    notes: str | None = None,
+    capabilities: list[str] | None = None,
+) -> tuple[Agent, list[str]]:
+    agent = get_agent(conn, name)
+    if agent is None:
+        raise AosError(
+            f"No agent '{name}'. Run: python aos.py agent add {name}"
+        )
+    import json
+
+    updates: dict[str, object] = {}
+    changed: list[str] = []
+    if notes is not None:
+        if not notes.strip():
+            raise AosError("--notes must not be empty.")
+        updates["notes"] = notes
+        changed.append("notes")
+    if capabilities is not None:
+        updates["capabilities_json"] = json.dumps(
+            _clean_capabilities(capabilities)
+        )
+        changed.append("capabilities")
+    if not updates:
+        raise AosError(
+            "Nothing to update: pass at least one of --notes/--capability."
+        )
+    with db.transaction(conn):
+        assignments = ", ".join(f"{column} = ?" for column in updates)
+        conn.execute(
+            f"UPDATE agents SET {assignments} WHERE id = ?",
+            (*updates.values(), agent.id),
+        )
+        events.emit(
+            conn,
+            actor=ACTOR_HUMAN,
+            entity="agent",
+            entity_id=agent.id,
+            action="update",
+            payload={"agent": name, "changed": changed},
+        )
+    return get_agent(conn, name), changed
+
+
+def list_agents(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute("SELECT * FROM agents ORDER BY name").fetchall()
+    return [agent_public(Agent.from_row(row)) for row in rows]
+
+
+# ---------------------------------------------------------------------------
 # Queries for CLI read commands
 
 def list_tasks(
@@ -887,6 +1279,8 @@ def list_tasks(
     *,
     project_slug: str | None = None,
     status: str | None = None,
+    kind: str | None = None,
+    missing_evidence: bool = False,
 ) -> list[dict]:
     clauses, params = [], []
     if project_slug is not None:
@@ -902,6 +1296,14 @@ def list_tasks(
         validate_enum(status, TASK_STATUSES, "task status")
         clauses.append("t.status = ?")
         params.append(status)
+    if kind is not None:
+        validate_enum(kind, TASK_KINDS, "task kind")
+        clauses.append("t.kind = ?")
+        params.append(kind)
+    if missing_evidence:
+        clauses.append(
+            "NOT EXISTS (SELECT 1 FROM evidence e WHERE e.task_id = t.id)"
+        )
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     rows = conn.execute(
         f"SELECT t.*, p.slug AS project_slug FROM tasks t "

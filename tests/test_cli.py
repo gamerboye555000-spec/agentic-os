@@ -103,6 +103,9 @@ class TestInit(CliTestCase):
     def test_commands_before_init_exit_1(self):
         for argv in (
             ["task", "list"],
+            ["task", "assign", "T-0001", "-p", "demo"],
+            ["task", "edit", "T-0001", "--title", "x"],
+            ["task", "status", "T-0001", "ready"],
             ["status"],
             ["in", "x"],
             ["log"],
@@ -114,8 +117,16 @@ class TestInit(CliTestCase):
             ["handoff", "accept", "H-0001"],
             ["memory", "list"],
             ["memory", "retire", "M-0001"],
+            ["ingest", "dropfile", "drop.md"],
+            ["evidence", "git", "T-0001", "HEAD"],
+            ["agent", "add", "codex"],
+            ["agent", "list"],
+            ["agent", "show", "codex"],
+            ["agent", "update", "codex", "--notes", "n"],
             ["search", "anything"],
             ["review", "build"],
+            ["review", "weekly"],
+            ["review", "project", "demo"],
             ["export", "events", "--jsonl"],
             ["snapshot"],
         ):
@@ -472,6 +483,21 @@ class TestEventPerMutatingCommand(CliTestCase):
     def test_every_mutating_command_writes_an_event(self):
         artifact = self.root / "artifact.txt"
         artifact.write_text("proof\n", encoding="utf-8")
+        dropfile = self.root / "drop.md"
+        dropfile.write_text(
+            "# AOS DROPFILE\n"
+            "task: T-0001\n"
+            "agent: codex\n"
+            "outcome: success\n"
+            "summary: sweep dropfile\n"
+            "\n"
+            "## evidence\n"
+            "- kind: note | ref: sweep-proof | claim: sweep works\n"
+            "\n"
+            "## open questions\n"
+            "- none worth escalating\n",
+            encoding="utf-8",
+        )
         steps = [
             (["init"], [("system", "init")]),
             (
@@ -480,6 +506,10 @@ class TestEventPerMutatingCommand(CliTestCase):
             ),
             (["task", "add", "Build auth flow", "-p", "demo"], [("task", "add")]),
             (["in", "inbox thought"], [("task", "add")]),
+            # Complete-today lifecycle commands join the same sequence seal.
+            (["task", "assign", "T-0002", "-p", "demo"], [("task", "assign")]),
+            (["task", "edit", "T-0002", "--priority", "3"], [("task", "edit")]),
+            (["task", "status", "T-0002", "ready"], [("task", "status")]),
             (["pack", "build", "T-0001"], [("pack", "build")]),
             (
                 ["run", "start", "T-0001", "--agent", "claude-code"],
@@ -535,10 +565,30 @@ class TestEventPerMutatingCommand(CliTestCase):
                 [("memory", "add")],
             ),
             (["memory", "retire", "M-0002"], [("memory", "retire")]),
+            (
+                ["agent", "add", "codex", "--kind", "cloud"],
+                [("agent", "add")],
+            ),
+            (
+                ["agent", "update", "codex", "--capability", "code"],
+                [("agent", "update")],
+            ),
+            (
+                ["ingest", "dropfile", str(dropfile)],
+                [
+                    ("evidence", "add"),
+                    ("handoff", "create"),
+                    ("system", "dropfile_ingest"),
+                ],
+            ),
             (["snapshot"], [("system", "snapshot")]),
             # Derived views stay eventless — the final seal proves it.
+            (["agent", "list"], []),
+            (["agent", "show", "codex"], []),
             (["search", "auth"], []),
             (["review", "build"], []),
+            (["review", "weekly"], []),
+            (["review", "project", "demo"], []),
             (["export", "events", "--jsonl"], []),
             (["sync"], []),
         ]
@@ -762,11 +812,19 @@ class TestDoctor(CliTestCase):
         code, out, err = self.run_cli("doctor")
         self.assertEqual(code, 0, out + err)
         lines = [l for l in out.strip().splitlines() if l]
-        # 6 Night-1 checks + 6 Weekend hardening checks (D-W8.1): the count
-        # moved UP with the mandated new checks; all must still pass.
-        self.assertEqual(len(lines), 12)
+        # 6 Night-1 + 6 Weekend + 4 complete-today checks + 1 warn-only line
+        # (D-W8.1 pattern: the pin moves UP with mandated new checks). The
+        # demo closes a code task with note evidence, so the warn-only
+        # commit-evidence line fires — [WARN], never [FAIL], exit stays 0.
+        self.assertEqual(len(lines), 17)
+        warn_lines = [l for l in lines if l.startswith("[WARN]")]
+        self.assertEqual(len(warn_lines), 1)
+        self.assertIn("code tasks done without commit evidence", warn_lines[0])
+        self.assertIn("T-0001", warn_lines[0])
         for line in lines:
-            self.assertTrue(line.startswith("[PASS]"), line)
+            self.assertTrue(
+                line.startswith("[PASS]") or line.startswith("[WARN]"), line
+            )
 
     def test_doctor_fails_on_done_without_evidence_or_override(self):
         self.force_done_without_evidence()
