@@ -650,6 +650,53 @@ def cmd_snapshot(args) -> int:
     return 0
 
 
+def cmd_backup_create(args) -> int:
+    with _ledger(args) as (aos_dir, conn):
+        from . import backup
+
+        result = backup.create_backup(conn, aos_dir)
+        print(str(result["path"]))
+        print(f"manifest: {result['manifest_path']}")
+    return 0
+
+
+def cmd_backup_verify(args) -> int:
+    # Deliberately no _ledger: verifying a backup must work when the live
+    # workspace is damaged or absent (that is what backups are for).
+    from . import backup
+
+    checks = backup.verify_backup(Path(args.path).expanduser().resolve())
+    for check in checks:
+        marker = "PASS" if check.ok else "FAIL"
+        detail = f" — {check.detail}" if check.detail else ""
+        print(f"[{marker}] {check.name}{detail}")
+    failed = [check for check in checks if not check.ok]
+    if failed:
+        print(
+            f"Backup verification failed: {failed[0].name}. "
+            "Do not restore from this copy.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def cmd_backup_restore(args) -> int:
+    # Deliberately no _ledger: restore must work without a live workspace.
+    from . import backup
+
+    target = backup.restore_backup(
+        Path(args.path).expanduser().resolve(),
+        Path(args.to).expanduser().resolve(),
+    )
+    print(str(target))
+    print(
+        "Verified against its manifest before the copy. Adopting it as the "
+        "live ledger is your move — see RECOVERY.md for the drill."
+    )
+    return 0
+
+
 def cmd_sync(args) -> int:
     with _ledger(args) as (aos_dir, conn):
         total, written = obsidian.sync_vault(conn, aos_dir)
@@ -970,6 +1017,37 @@ def build_parser() -> _Parser:
         "snapshot", help="snapshot aos.db via the SQLite backup API"
     )
     p_snapshot.set_defaults(func=cmd_snapshot)
+
+    p_backup = sub.add_parser(
+        "backup", help="verifiable backups: create, verify, restore "
+        "(drill in RECOVERY.md)"
+    )
+    backup_sub = p_backup.add_subparsers(
+        dest="subcommand", metavar="SUBCOMMAND", required=True
+    )
+    p_backup_create = backup_sub.add_parser(
+        "create",
+        help="write a manifest-carrying backup via the SQLite backup API",
+    )
+    p_backup_create.set_defaults(func=cmd_backup_create)
+    p_backup_verify = backup_sub.add_parser(
+        "verify",
+        help="verify a backup against its manifest and PRAGMA "
+        "integrity_check (works without a workspace)",
+    )
+    p_backup_verify.add_argument("path")
+    p_backup_verify.set_defaults(func=cmd_backup_verify)
+    p_backup_restore = backup_sub.add_parser(
+        "restore",
+        help="copy a verified backup to a NEW database path "
+        "(never overwrites; no overwrite flag)",
+    )
+    p_backup_restore.add_argument("path")
+    p_backup_restore.add_argument(
+        "--to", required=True, metavar="NEW_DB_PATH",
+        help="target database file path; must not exist yet",
+    )
+    p_backup_restore.set_defaults(func=cmd_backup_restore)
 
     p_sync = sub.add_parser("sync", help="regenerate the Obsidian mirror")
     p_sync.set_defaults(func=cmd_sync)

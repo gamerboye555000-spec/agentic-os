@@ -164,6 +164,14 @@ python aos.py review project agentic-os        # one project → Reviews/project
 # Backups: JSONL event export + a WAL-safe database snapshot:
 python aos.py export events --jsonl
 python aos.py snapshot
+
+# Verifiable backups (manifest: sha256, schema_version, size) — the full
+# create/verify/restore drill lives in RECOVERY.md. Restore writes to a NEW
+# path only and never overwrites:
+python aos.py backup create
+python aos.py backup verify .agentic-os/backups/aos-backup-<stamp>.db
+python aos.py backup restore .agentic-os/backups/aos-backup-<stamp>.db \
+    --to /somewhere/new/aos.db
 ```
 
 Memory in context packs: the pack MEMORY section carries live rows only
@@ -206,6 +214,7 @@ matches whole words; the fallback matches substrings.
   packs/            # compiled context packs (T-0001-claude-code.md, ...)
   exports/          # events-*.jsonl exports, aos-*.db snapshots, agent dropfiles
   adapters/         # per-agent PROTOCOL.md (claude-code, codex, gemini, generic)
+  backups/          # created on first `backup create`: aos-backup-*.db + manifest
   obsidian-vault/
     AOS/            # generated mirror: Home.md, CONVENTIONS.md, index notes
                     # (Tasks.md, Decisions.md, ...), Tasks/, Runs/, Decisions/,

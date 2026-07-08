@@ -129,6 +129,7 @@ class TestInit(CliTestCase):
             ["review", "project", "demo"],
             ["export", "events", "--jsonl"],
             ["snapshot"],
+            ["backup", "create"],
         ):
             with self.subTest(argv=argv):
                 code, out, err = self.run_cli(*argv)
@@ -585,6 +586,7 @@ class TestEventPerMutatingCommand(CliTestCase):
                 ],
             ),
             (["snapshot"], [("system", "snapshot")]),
+            (["backup", "create"], [("system", "backup_create")]),
             # Derived views stay eventless — the final seal proves it.
             (["agent", "list"], []),
             (["agent", "show", "codex"], []),

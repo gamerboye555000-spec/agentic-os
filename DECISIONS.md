@@ -1,3 +1,119 @@
+# DECISIONS — Agentic OS v0.2 U-C2 backup/verify/restore run
+
+This section continues the `D-v0.2.*` series for the U-C2 pass executed per
+`agentic-os-v0.2-u-c2-backup-restore-contract.md` on branch
+`v0.2-u-c2-backup-restore` (2026-07-08). That contract wins over the
+two-week plan and the v2 research report where they differ. Prepended above
+the earlier sections per the established precedent (D-W0.4, reaffirmed in
+D-v0.2.7); everything below stays byte-identical.
+
+## D-v0.2 decisions (U-C2)
+
+- **D-v0.2.8 — U-C2 baseline gate results.** Branch
+  `v0.2-u-c2-backup-restore`; HEAD `1ed30a3` ("docs: add v0.2 U-C2 backup
+  restore contract"). Working tree clean. Python 3.12.3. Baseline suite:
+  **300 tests, OK**; doctor: **17/17 PASS** (incl. the warn-only check).
+  `CLAUDE.md` in the contract's read-first list still does not exist —
+  recorded, nothing to read. Behavior pinned by prototype before writing
+  code: a single flipped bit in a backup copy passes
+  `PRAGMA integrity_check` (SQLite pages carry no checksums) but fails a
+  sha256; a zeroed page or truncation makes `integrity_check` *raise*
+  `sqlite3.DatabaseError` rather than return a row; and a plain read-only
+  open of a WAL-marked backup file creates `-shm`/`-wal` droppings beside
+  it, which `immutable=1` prevents. These three facts shaped U-C2.2–U-C2.3.
+- **D-v0.2.9 — Backup format and location (U-C2.1).** `backup create`
+  writes `backups/aos-backup-<UTCSTAMP>Z.db` inside the workspace via the
+  sqlite3 backup API (`conn.backup`, the D-W7.2 rule — never a raw copy of
+  a live WAL database), then a sibling manifest, then emits one
+  `system/backup_create` event carrying the sha256/size/paths — event
+  after files, so a backup never contains its own event (the `snapshot`
+  precedent). Name collisions bump `-2, -3, …` pair-aware (a lone stale
+  manifest also blocks its stem). The `backups/` folder is created lazily
+  on first use and deliberately NOT added to the required workspace layout
+  (`obsidian.WORKSPACE_DIRS`) — adding it would fail doctor's
+  required-folders check on every existing workspace, breaking Night-1
+  back-compat for a folder most workspaces won't have yet. `create`
+  refuses (exit 1, before any write) when the live database fails
+  `PRAGMA integrity_check`: a nightly `backup create` must be a health
+  check, not a machine for archiving corruption. No `--output` override
+  and no retention policy in v0.2 (noted as limitations; RECOVERY.md tells
+  humans to copy the pair off-machine).
+- **D-v0.2.10 — Manifest fields (U-C2.2).** Sibling file
+  `<stem>.manifest.json` (the pair moves together; verify refuses a lone
+  backup): `aos_backup_manifest` (format version, `1`), `created_at`
+  (UTC-Z, single clock), `source_db_path`, `schema_version` (read from the
+  source meta table), `size_bytes`, `sha256` (of the backup db file), and
+  `tool` (`agentic-os <version> (aos.py backup create)` — the contract's
+  "where practical" label). JSON via the canonical `utils.json_dumps` +
+  `write_text_lf` (LF-only guarantee). Unknown extra keys are tolerated on
+  read (forward compat); an unknown `aos_backup_manifest` value is refused.
+  Field types are validated on verify (sha256 must be 64 lowercase hex —
+  `\Z`-anchored per D-v0.2.3; `size_bytes` a non-negative non-bool int).
+- **D-v0.2.11 — Verify semantics (U-C2.3).** `backup verify PATH` runs
+  eight ordered checks and stops at the first failure (each later check
+  assumes the earlier ones): file exists · manifest exists · manifest
+  well-formed · size matches · sha256 matches · opens as SQLite ·
+  schema_version supported (backup ↔ manifest ↔ build) ·
+  `PRAGMA integrity_check` passes (its `DatabaseError` raise is caught and
+  reported as the check's failure). Output is doctor-style `[PASS]`/
+  `[FAIL]` lines, exit 1 + a one-line stderr verdict on failure. Both hash
+  and structure checks are load-bearing per D-v0.2.8, and each has a test
+  the other cannot pass (bit-flip vs zeroed-page-with-regenerated-
+  manifest). Verify (and restore) deliberately never open the live ledger
+  and are eventless (extends D-P0.6): recovery tooling must work exactly
+  when the workspace is damaged or absent, so unlike every other
+  later-phase command they do not go through `_ledger` and work pre-init
+  (a deliberate, journaled exception to the D-P2.4 pattern). The backup is
+  opened `mode=ro&immutable=1` with a percent-encoded URI (`%`, `#`,
+  spaces in paths covered by test), so verifying cannot write anything —
+  pinned by a directory-snapshot test.
+- **D-v0.2.12 — Restore overwrite policy (U-C2.4).** `backup restore PATH
+  --to NEW_DB_PATH` targets a database file path (restore-into-a-fresh-root
+  is documented in RECOVERY.md as db-restore + the drill, since a db alone
+  is not a workspace). It verifies the backup first (a corrupt backup
+  refuses before any write, naming the failed check), creates the target
+  with `open(..., "xb")` — an atomic, TOCTOU-free refusal of any existing
+  file/directory including the live `aos.db`, with **no overwrite flag by
+  design** (the contract's preferred v0.2 behavior; pinned by a test that
+  `--force`/`--overwrite` are unrecognized) — streams the copy with an
+  in-flight sha256, and on any post-copy mismatch removes the partial file.
+  A byte copy is correct here (unlike create) because the source is a cold
+  verified file, and it makes the restored file provably bit-identical to
+  the manifest. Adopting the restored db as the live ledger is the human's
+  manual `mv`, mirroring human-controlled git; RECOVERY.md's drill has the
+  human move the damaged db (and its `-wal`/`-shm`) aside first.
+- **D-v0.2.13 — Adversarial review round.** Before final validation, a
+  five-lens review (correctness, contract compliance, test integrity, docs
+  accuracy, adversarial bypass) with two independent refuters per finding
+  ran over the diff. Confirmed and fixed: a mid-copy `OSError` during
+  restore left a partial target file that blocked its own retry with a
+  misleading overwrite refusal and leaked as exit 2 (now unlinked +
+  refused as a one-line exit-1 error, pinned failing-then-passing); this
+  run's first DECISIONS.md edit deleted the U-C1 section's H1 heading —
+  not a pure prepend (restored; `git diff` now shows zero deleted lines);
+  no test could distinguish backup-API creation from a raw live-file copy
+  — a `shutil.copyfile` mutant survived all 333 tests (now killed by a
+  WAL-discriminator test: `wal_autocheckpoint=0`, committed marker row
+  living only in `-wal`, raw main-file copy proven blind to it, backup
+  proven to contain it); verify's supported-by-this-build schema branch
+  was unexercised — deleting it survived the suite (now killed by a test
+  where backup db and manifest AGREE on schema `999`); RECOVERY.md
+  overstated the exit-1 refusal of `backup create` on corruption (gross
+  corruption dies in the workspace open with a database error before the
+  guard — reworded). Also hardened from technically-true-but-refuted
+  findings: manifest format check is now type-strict (JSON `true`/`1.0`
+  no longer pass as format 1 via Python's `True == 1`; pinned by tests)
+  and RECOVERY.md's inspection step no longer assumes a `sqlite3` CLI
+  this machine doesn't have (stdlib `python3 -c` one-liner). Refuted, no
+  change (recorded as known limitations): a write-locked live db makes
+  `backup create` exit 2 after writing a valid-but-unjournaled backup
+  pair (busy_timeout makes this a >5s-contention corner; the pair is
+  harmless and verifiable); empty `--to` resolves to cwd and refuses with
+  a literal-but-safe message; verify blesses any structurally-valid
+  schema-1 SQLite file with a consistent manifest (verify proves
+  integrity and provenance-by-hash, not ledger-shape — matches the
+  contract's check list exactly).
+
 # DECISIONS — Agentic OS v0.2 U-C1 input-hardening run
 
 This section (`D-v0.2.*`) journals the U-C1 pass executed per
