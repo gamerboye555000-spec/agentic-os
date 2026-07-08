@@ -30,22 +30,24 @@ from .models import AGENT_KINDS, AGENT_NAME_RE, TASK_STATUSES
 
 _WIKILINK = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
 
+# Note stems are filesystem-derived input; \Z anchors, never $ (D-v0.2.3) —
+# a newline-bearing filename must not pass the containment check.
 _NOTE_PATTERNS = {
-    "Tasks": re.compile(r"^T-[0-9]{4,}$"),
-    "Runs": re.compile(r"^R-[0-9]{4,}$"),
-    "Decisions": re.compile(r"^D-[0-9]{4,}$"),
-    "Evidence": re.compile(r"^E-[0-9]{4,}$"),
-    "Handoffs": re.compile(r"^H-[0-9]{4,}$"),
-    "Memory": re.compile(r"^M-[0-9]{4,}$"),
-    "Projects": re.compile(r"^[a-z0-9][a-z0-9._-]*$", re.ASCII),
+    "Tasks": re.compile(r"^T-[0-9]{4,}\Z"),
+    "Runs": re.compile(r"^R-[0-9]{4,}\Z"),
+    "Decisions": re.compile(r"^D-[0-9]{4,}\Z"),
+    "Evidence": re.compile(r"^E-[0-9]{4,}\Z"),
+    "Handoffs": re.compile(r"^H-[0-9]{4,}\Z"),
+    "Memory": re.compile(r"^M-[0-9]{4,}\Z"),
+    "Projects": re.compile(r"^[a-z0-9][a-z0-9._-]*\Z", re.ASCII),
     # Daily YYYY-MM-DD · weekly YYYY-Www · per-project project-<slug>.
     "Reviews": re.compile(
         r"^([0-9]{4}-[0-9]{2}-[0-9]{2}"
         r"|[0-9]{4}-W[0-9]{2}"
-        r"|project-[a-z0-9][a-z0-9._-]*)$",
+        r"|project-[a-z0-9][a-z0-9._-]*)\Z",
         re.ASCII,
     ),
-    "Agents": re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", re.ASCII),
+    "Agents": re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z", re.ASCII),
 }
 
 

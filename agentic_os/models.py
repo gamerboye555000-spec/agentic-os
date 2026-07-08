@@ -18,11 +18,13 @@ MEMORY_KINDS = ("preference", "fact", "constraint", "summary")
 MEMORY_CONFIDENCES = ("confirmed", "single", "inferred", "assumed")
 AGENT_KINDS = ("local", "cloud", "human", "generic")
 
-SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$", re.ASCII)
-PROVENANCE_RE = re.compile(r"^(human|agent:[A-Za-z0-9._-]+)$", re.ASCII)
+#: All user-input validators anchor with \Z, never $ (D-v0.2.3) — '$' admits
+#: a trailing newline, letting e.g. $'proj\n' become a slug (and a mirror
+#: filename) that no equality lookup will ever find again.
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*\Z", re.ASCII)
+PROVENANCE_RE = re.compile(r"^(human|agent:[A-Za-z0-9._-]+)\Z", re.ASCII)
 #: Registry names must be referenceable as `agent:<name>` provenance AND be
 #: safe stable note filenames — so: provenance charset, leading alnum.
-#: \Z, not $ — '$' would admit a trailing newline straight into a filename.
 AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z", re.ASCII)
 
 

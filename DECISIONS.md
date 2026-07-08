@@ -1,3 +1,102 @@
+# DECISIONS — Agentic OS v0.2 U-C1 input-hardening run
+
+This section (`D-v0.2.*`) journals the U-C1 pass executed per
+`agentic-os-v0.2-u-c1-hardening-contract.md` on branch
+`v0.2-u-c1-input-hardening` (2026-07-08). That contract wins over the
+two-week plan and the v2 research report where they differ. Prepended above
+the earlier sections per the established precedent (D-W0.4); everything
+below stays byte-identical.
+
+## D-v0.2 decisions
+
+- **D-v0.2.1 — P0 baseline gate results.** Branch
+  `v0.2-u-c1-input-hardening`; HEAD `5dc5971` ("docs: add v0.2 U-C1
+  hardening contract"). Working tree clean (ignored: `.agentic-os/`,
+  `__pycache__/`). Python 3.12.3. Baseline suite: **256 tests, OK**;
+  doctor: **17/17 PASS** (incl. the warn-only check). The contract's
+  read-first list names `CLAUDE.md`, which does not exist in this repo —
+  recorded here, nothing to read. Pre-fix defects reproduced live before
+  any edit: `T-0000` reached the DB lookup; a 32-digit id exited 2
+  (`OverflowError` on the SQLite bind, W-1); a 5000-digit id exited 2
+  (CPython int-conversion limit — a failure mode the research report did
+  not list); `project add $'proj\n'` succeeded, writing a newline-bearing
+  slug (W-2's INFERRED exploit, now CONFIRMED end-to-end).
+- **D-v0.2.2 — ID maximum (U-C1.1).** `ids.MAX_ID = 2**63 - 1`, the SQLite
+  INTEGER (signed 64-bit) bound already used by the dropfile parser — no
+  row can ever carry a bigger rowid, so anything above it is refused
+  *before* any DB lookup, as are zero-equivalent ids (`T-0`, `T-0000`, …;
+  ids start at 1). Magnitude is judged after stripping leading zeros, so
+  zero-padding stays legal (as it always was) at any length; a digit-length
+  pre-check on the stripped digits (`> 19` refuses without converting)
+  keeps CPython's ~4300-digit int-conversion limit unreachable. The
+  over-maximum message does not echo the oversized input back. Round-trip
+  behavior for all real ids (1…MAX_ID) is unchanged.
+- **D-v0.2.3 — Strict validator anchors (U-C1.2).** Every regex that
+  validates user/filesystem input now anchors with `\Z`, never `$` (which
+  admits a trailing newline): `ids._ID_RE`, `models.SLUG_RE`,
+  `models.PROVENANCE_RE`, `utils._DATE_RE`, `ingest._TASK_RE`,
+  `ingest._AGENT_RE`, all nine `doctor._NOTE_PATTERNS`, and
+  `render._PLAIN_SAFE` (with `$`, a trailing-newline value was written
+  *plain* into note frontmatter — mirror corruption, found during this
+  run's audit; `models.AGENT_NAME_RE` already used `\Z`). Audited and
+  deliberately left on `$`: per-line parsers whose input is split on
+  newlines first and so cannot contain one (`ingest._EVIDENCE_BULLET_RE`,
+  `doctor._FRONTMATTER_LINE`) and `pack._HEX_ONLY` (input pre-filtered to
+  `[A-Za-z0-9+/=]` runs) — behaviorally identical there, and the diff
+  stays surgical. `parse_id` still strips *surrounding* whitespace by
+  design (pinned by an existing test); `\Z` guards the match itself.
+- **D-v0.2.4 — Run-start lifecycle policy (U-C1.3).** `run start` requires
+  task status `ready`, consuming the legal `ready→in_progress` transition;
+  `inbox` (untriaged), `in_progress` (already running), and `done` tasks
+  refuse (done keeps its specific closed-task message). The refusal names
+  the fix (`task status T-XXXX ready`) and writes no rows and no events.
+  Two existing tests used the closed loophole as *setup* and were re-routed
+  without weakening their assertions: the projectless-in_progress assign
+  test now forces the legacy state via raw SQL (this class's established
+  pattern for unreachable states), and the multiple-open-runs ingest test
+  reaches two open runs via the legal ladder (start → status ready →
+  start). A projectless run-start is now impossible via the CLI (ready
+  implies a project); the ops-layer degradation note for legacy projectless
+  rows remains.
+- **D-v0.2.5 — no-evidence reason policy (U-C1.4).** `done --no-evidence`
+  without `--reason TEXT` (or with a blank reason) refuses; with a reason
+  it closes and journals the text in the `done_override` event payload as
+  `{"task", "reason": TEXT, "via": "--no-evidence"}` (formerly the payload
+  carried the constant `"reason": "--no-evidence"`; no test pinned it).
+  `--reason` without `--no-evidence` is flag misuse and refuses, and so is
+  `--no-evidence` on a task that turns out to have evidence (previously the
+  flag was silently ignored and the reason silently discarded; now the
+  refusal names the plain `done` command to run instead). Evidence-gated
+  done is byte-for-byte unchanged. Four existing test call sites that
+  passed the bare flag gained a reason argument; their assertions are
+  untouched.
+- **D-v0.2.6 — Dropfile ingest caps (U-C1.5).** `MAX_DROPFILE_BYTES` = 1
+  MiB (checked via `stat` before the file is read, then re-checked on the
+  bytes actually read — the writer is an untrusted agent process that may
+  still be appending between stat and read), `MAX_EVIDENCE_ROWS` = 200,
+  `MAX_QUESTIONS` = 100 (checked during parsing, naming the first line
+  beyond the cap) — the research report §10 values. Refusals exit 1 before
+  the write transaction opens, so no partial rows ever land, and a refused
+  file records no ingest event (dedupe behavior intact). Boundary behavior
+  pinned: exactly-at-cap ingests. The parser's task-id bound now also
+  refuses `T-0000` and applies the D-v0.2.2 magnitude rule (leading zeros
+  stripped, digit-length checked before `int()`), reusing `ids.MAX_ID` and
+  keeping the pinned "task id out of range" message.
+- **D-v0.2.7 — Adversarial review round.** Before final validation, a
+  four-lens review (correctness, contract compliance, test integrity,
+  remaining bypasses) with two independent refuters per finding ran over
+  the diff. Confirmed-and-fixed: `--no-evidence` with existing evidence
+  silently discarded the reason (now refuses, D-v0.2.5); byte cap was
+  stat-only (now re-checked on read, D-v0.2.6); zero-padded >19-digit ids
+  refused with a wrong message (now magnitude-based, D-v0.2.2); D-v0.2.x
+  code-comment cross-references were off by one (renumbered); two anchor
+  tests didn't discriminate pre/post fix (regex-level assertions added);
+  ingest no-partial-write assertions now also count the tasks and
+  decisions tables the contract names. Refuted (no change): DECISIONS.md
+  prepend-not-append (follows the file's own D-W0.4 precedent; old
+  sections byte-identical), and a claimed second open run on T-0005
+  (factually false — R-0003 was ended before R-0004 started).
+
 # DECISIONS — Agentic OS complete-today BUILD run
 
 This section (`D-C.*`) journals the build pass executed per

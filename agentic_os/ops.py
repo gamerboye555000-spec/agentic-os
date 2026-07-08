@@ -892,6 +892,14 @@ def start_run(conn: sqlite3.Connection, *, task_id: int, agent: str) -> Run:
         raise AosError(
             f"Task {task_hid} is done; cannot start a run on a closed task."
         )
+    # Lifecycle gate (D-v0.2.4): runs consume the ready→in_progress
+    # transition, so inbox (untriaged) and in_progress (already running)
+    # tasks must go through `task status` first.
+    if task.status != "ready":
+        raise AosError(
+            f"Task {task_hid} is {task.status}; only ready tasks can start "
+            f"a run. Run: python aos.py task status {task_hid} ready"
+        )
     anchor, note = None, None
     if task.project_id is not None:
         project = get_project(conn, task.project_id)
@@ -1105,20 +1113,43 @@ def add_git_evidence(
 
 
 def mark_done(
-    conn: sqlite3.Connection, *, task_id: int, no_evidence: bool = False
+    conn: sqlite3.Connection,
+    *,
+    task_id: int,
+    no_evidence: bool = False,
+    reason: str | None = None,
 ) -> Task:
     task = get_task(conn, task_id)
     task_hid = ids.render_id("task", task.id)
     if task.status == "done":
         raise AosError(f"Task {task_hid} is already done.")
+    # Override policy (D-v0.2.5): closing without evidence is journaled and
+    # must say why; a reason without the override flag is flag misuse, and
+    # so is the override flag when evidence actually exists.
+    reason = reason.strip() if reason is not None else None
+    if reason is not None and not no_evidence:
+        raise AosError(
+            "--reason only applies with --no-evidence; an evidence-gated "
+            "done needs no justification."
+        )
+    if no_evidence and not reason:
+        raise AosError(
+            f"done --no-evidence requires --reason TEXT saying why "
+            f"{task_hid} closes without evidence; the reason is journaled."
+        )
     count = evidence_count(conn, task.id)
+    if no_evidence and count > 0:
+        raise AosError(
+            f"Task {task_hid} has {count} evidence row(s); --no-evidence "
+            f"does not apply. Run: python aos.py done {task_hid}"
+        )
     override = False
     if count == 0:
         if not no_evidence:
             raise AosError(
                 f"Task {task_hid} has no evidence; refusing to close. Add some: "
                 f'python aos.py evidence add {task_hid} --kind note --ref "..." '
-                "(or pass --no-evidence to override)"
+                "(or pass --no-evidence --reason TEXT to override)"
             )
         override = True
     now = utils.utc_now_iso()
@@ -1148,7 +1179,11 @@ def mark_done(
                 entity="task",
                 entity_id=task.id,
                 action="done_override",
-                payload={"task": task_hid, "reason": "--no-evidence"},
+                payload={
+                    "task": task_hid,
+                    "reason": reason,
+                    "via": "--no-evidence",
+                },
             )
     return get_task(conn, task.id)
 

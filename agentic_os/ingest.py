@@ -16,6 +16,10 @@ so in the output and the event payload.
 
 Dedupe (pinned): the ingest event payload stores the dropfile's sha256; a
 prior ingest event with the same hash refuses the ingest (exit 1).
+
+Input caps (D-v0.2.6): file size, evidence rows, and open questions are
+bounded (MAX_DROPFILE_BYTES / MAX_EVIDENCE_ROWS / MAX_QUESTIONS); oversized
+input is refused whole, before any row is written.
 """
 
 from __future__ import annotations
@@ -33,14 +37,21 @@ HEADER_LINE = "# AOS DROPFILE"
 EVIDENCE_HEADING = "## evidence"
 QUESTIONS_HEADING = "## open questions"
 
-_TASK_RE = re.compile(r"^T-[0-9]+$")
-_AGENT_RE = re.compile(r"^[A-Za-z0-9._-]+$", re.ASCII)
+_TASK_RE = re.compile(r"^T-[0-9]+\Z")
+_AGENT_RE = re.compile(r"^[A-Za-z0-9._-]+\Z", re.ASCII)
 _EVIDENCE_BULLET_RE = re.compile(
     r"^- kind: (.+?) \| ref: (.+?) \| claim: (.+)$"
 )
 
 #: Payload summaries are capped so a giant dropfile cannot bloat the journal.
 SUMMARY_PAYLOAD_LIMIT = 300
+
+#: Ingest caps (D-v0.2.6): dropfiles are untrusted agent output, so input
+#: size is bounded before anything is parsed or written. Oversized input is
+#: refused whole — no partial rows ever land.
+MAX_DROPFILE_BYTES = 1024 * 1024  # 1 MiB
+MAX_EVIDENCE_ROWS = 200
+MAX_QUESTIONS = 100
 
 
 def _one_line(text: str) -> str:
@@ -92,9 +103,17 @@ def parse_dropfile(text: str) -> dict:
 
     if not _TASK_RE.match(fields["task"]):
         raise _malformed(field_lines["task"], "task must look like T-0001")
-    task_number = int(fields["task"].split("-", 1)[1])
-    if task_number > 2**63 - 1:  # SQLite INTEGER bound; untrusted input
+    digits = fields["task"].split("-", 1)[1].lstrip("0")
+    # SQLite INTEGER bound (ids.MAX_ID), judged on magnitude (zero-padding
+    # legal, zero itself not); the digit-length check runs first so a huge
+    # digit string cannot trip CPython's int-conversion limit.
+    if (
+        not digits
+        or len(digits) > len(str(ids.MAX_ID))
+        or int(digits) > ids.MAX_ID
+    ):
         raise _malformed(field_lines["task"], "task id out of range")
+    task_number = int(digits)
     if not _AGENT_RE.match(fields["agent"]):
         raise _malformed(
             field_lines["agent"], "agent name must match [A-Za-z0-9._-]+"
@@ -118,6 +137,10 @@ def parse_dropfile(text: str) -> dict:
             raise _malformed(len(lines), f"missing '{QUESTIONS_HEADING}'")
         if line == QUESTIONS_HEADING:
             break
+        if len(evidence) >= MAX_EVIDENCE_ROWS:
+            raise _malformed(
+                line_no, f"too many evidence rows (max {MAX_EVIDENCE_ROWS})"
+            )
         match = _EVIDENCE_BULLET_RE.match(line)
         if not match:
             raise _malformed(
@@ -138,6 +161,10 @@ def parse_dropfile(text: str) -> dict:
         line_no, line = next_content_line()
         if line is None:
             break
+        if len(questions) >= MAX_QUESTIONS:
+            raise _malformed(
+                line_no, f"too many open questions (max {MAX_QUESTIONS})"
+            )
         if not line.startswith("- ") or not _one_line(line[2:]):
             raise _malformed(line_no, "expected '- <open question>'")
         questions.append(_one_line(line[2:]))
@@ -189,7 +216,20 @@ def ingest_dropfile(conn: sqlite3.Connection, path: Path) -> dict:
     """Ingest one dropfile. The file itself is never modified or deleted."""
     if not path.is_file():
         raise AosError(f"Dropfile not found: {path}")
+    size = path.stat().st_size
+    if size > MAX_DROPFILE_BYTES:
+        raise AosError(
+            f"Dropfile too large: {size} bytes "
+            f"(max {MAX_DROPFILE_BYTES}). Nothing was ingested."
+        )
     raw = path.read_bytes()
+    # Re-check the bytes actually read: the writer (an untrusted agent
+    # process) may still be appending between stat and read.
+    if len(raw) > MAX_DROPFILE_BYTES:
+        raise AosError(
+            f"Dropfile too large: {len(raw)} bytes "
+            f"(max {MAX_DROPFILE_BYTES}). Nothing was ingested."
+        )
     sha = utils.sha256_bytes(raw)
     try:
         text = raw.decode("utf-8")

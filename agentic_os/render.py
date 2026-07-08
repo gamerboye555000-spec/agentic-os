@@ -23,7 +23,9 @@ def _one_line(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Flat YAML frontmatter, written by hand (no PyYAML)
 
-_PLAIN_SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$", re.ASCII)
+#: \Z, not $ (D-v0.2.3): with '$' a trailing-newline value counted as plain
+#: and the raw newline landed inside the frontmatter block.
+_PLAIN_SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]*\Z", re.ASCII)
 
 
 def _yaml_value(value) -> str:

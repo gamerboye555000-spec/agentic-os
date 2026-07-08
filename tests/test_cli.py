@@ -400,7 +400,10 @@ class TestRunEvidenceDone(CliTestCase):
         self.assertIn("already done", err)
 
     def test_no_evidence_override_logs_override_event(self):
-        self.ok("done", "T-0001", "--no-evidence")
+        self.ok(
+            "done", "T-0001", "--no-evidence",
+            "--reason", "no artifact to attach",
+        )
         doc = json.loads(self.ok("log", "T-0001", "--json"))
         actions = [e["action"] for e in doc["events"]]
         self.assertIn("done", actions)
@@ -528,7 +531,7 @@ class TestEventPerMutatingCommand(CliTestCase):
             ),
             (["done", "T-0001"], [("task", "done")]),
             (
-                ["done", "T-0002", "--no-evidence"],
+                ["done", "T-0002", "--no-evidence", "--reason", "spike"],
                 [("task", "done"), ("task", "done_override")],
             ),
             # Weekend mutating commands join the same sequence seal.
@@ -837,7 +840,10 @@ class TestDoctor(CliTestCase):
 
     def test_doctor_accepts_logged_override(self):
         self.ok("task", "add", "Overridden", "-p", "demo")
-        self.ok("done", "T-0002", "--no-evidence")
+        self.ok(
+            "done", "T-0002", "--no-evidence",
+            "--reason", "doctor override fixture",
+        )
         self.ok("sync")
         code, out, err = self.run_cli("doctor")
         self.assertEqual(code, 0, out + err)

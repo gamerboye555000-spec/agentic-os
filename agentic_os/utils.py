@@ -31,7 +31,7 @@ def utc_today() -> str:
     return utc_now_iso()[:10]
 
 
-_DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$", re.ASCII)
+_DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}\Z", re.ASCII)
 
 
 def validate_date(text: str, what: str) -> str:

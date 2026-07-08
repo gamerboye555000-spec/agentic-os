@@ -465,7 +465,12 @@ def cmd_ingest_dropfile(args) -> int:
 def cmd_done(args) -> int:
     task_id = ids.parse_id(args.id, "task")
     with _ledger(args) as (aos_dir, conn):
-        task = ops.mark_done(conn, task_id=task_id, no_evidence=args.no_evidence)
+        task = ops.mark_done(
+            conn,
+            task_id=task_id,
+            no_evidence=args.no_evidence,
+            reason=args.reason,
+        )
         count = ops.evidence_count(conn, task.id)
         print(f"{ids.render_id('task', task.id)} done (evidence: {count})")
     return 0
@@ -903,7 +908,14 @@ def build_parser() -> _Parser:
 
     p_done = sub.add_parser("done", help="close a task (requires evidence)")
     p_done.add_argument("id")
-    p_done.add_argument("--no-evidence", action="store_true")
+    p_done.add_argument(
+        "--no-evidence", action="store_true",
+        help="close without evidence (requires --reason; journaled)",
+    )
+    p_done.add_argument(
+        "--reason", default=None, metavar="TEXT",
+        help="justification for --no-evidence, stored in the override event",
+    )
     p_done.set_defaults(func=cmd_done)
 
     p_search = sub.add_parser(

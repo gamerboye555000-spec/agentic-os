@@ -222,7 +222,10 @@ class TestReviewBuild(Night1BackCompatCase):
         # An override-closed done task (listed) next to the fixture's
         # evidenced done task (not listed)...
         self.aos("task", "add", "Overridden task", "-p", "demo")
-        self.aos("done", "T-0004", "--no-evidence")
+        self.aos(
+            "done", "T-0004", "--no-evidence",
+            "--reason", "review fixture override",
+        )
         # ...a done task with no evidence and no override, forced via SQL as
         # if written outside the CLI's done gate...
         conn = self.open_db()

@@ -50,8 +50,10 @@ class TestTaskAssign(Night1BackCompatCase):
         self.assert_no_schema_drift()
 
     def test_assign_projectless_in_progress_task_keeps_status(self):
-        # `run start` on a capture creates the projectless in_progress state.
-        self.aos("run", "start", "T-0003", "--agent", "claude-code")
+        # The run-start gate (U-C1.3) closed the CLI route to a projectless
+        # in_progress task; force the legacy state directly to keep proving
+        # that `task assign` never touches status.
+        self.raw("UPDATE tasks SET status = 'in_progress' WHERE id = 3")
         self.aos("task", "assign", "T-0003", "-p", "demo")
         detail = json.loads(self.aos("task", "show", "T-0003", "--json"))
         self.assertEqual(detail["task"]["project"], "demo")
@@ -532,7 +534,10 @@ class TestDropfileIngest(DropfileCase):
         self.assertEqual(payload["open_runs"], 0)
 
     def test_multiple_open_runs_end_nothing(self):
+        # Two open runs stay reachable under the U-C1.3 gate via the legal
+        # ladder: start (ready→in_progress), flip back to ready, start again.
         self.aos("run", "start", "T-0002", "--agent", "codex")
+        self.aos("task", "status", "T-0002", "ready")
         self.aos("run", "start", "T-0002", "--agent", "codex")
         path = self.write_dropfile()
         out = self.aos("ingest", "dropfile", str(path))
