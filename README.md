@@ -229,9 +229,18 @@ memory `M-0001`.
 
 - The vault is generated: never rename generated notes; edit data via the CLI
   and re-run `python aos.py sync` (see `AOS/CONVENTIONS.md`).
-- Context packs are secret-scanned at build time and refuse to compile if
-  anything credential-shaped is found; dropfiles are secret-scanned at
-  ingest time under the same rule.
+- One shared secret detector guards three boundaries with three postures:
+  context packs **refuse** to build on secret-shaped content (naming the
+  section and pattern, never the value); untrusted dropfile ingest
+  **refuses the whole file atomically** (no partial rows, no dedupe
+  marker, no event); trusted human CLI writes are **accepted with a
+  warning** — the append-only ledger is never silently falsified — printed
+  on stderr with field and pattern names only. The mutation event records
+  the same safe metadata and never the value itself (secret-shaped payload
+  strings are replaced by a fixed placeholder; the canonical row keeps the
+  accepted value), and `doctor` reads that metadata — plus legacy raw
+  payloads — to list affected record IDs (never values) so a real
+  credential can be rotated and removed.
 - The only subprocesses Agentic OS ever runs are read-only git queries
   (`rev-parse` / `show`) — to anchor runs to a commit and to verify commit
   evidence. Failures degrade gracefully; nothing is ever written to a repo.
@@ -250,8 +259,8 @@ change, no migration; `schema_version` stays `"1"`). This phase closed the
 coordinate-and-audit loop: task lifecycle (`assign`/`edit`/`status` + list
 filters), dropfile ingest, verified commit evidence (`evidence git`), the
 agent registry with vault notes, richer daily/weekly/project reviews, Home
-dashboard + index notes, and doctor hardening (17 checks incl. a non-fatal
-commit-evidence warning).
+dashboard + index notes, and doctor hardening (now 18 checks incl. the
+non-fatal commit-evidence warning and the U-C3 secret sweep).
 
 Deliberately deferred (unchanged triggers, see `agentic-os-two-week-plan.md`
 §4): MCP server, Obsidian plugin, vector search, background runs, two-way

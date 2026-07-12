@@ -627,10 +627,11 @@ class TestDoctorHardening(Night1BackCompatCase):
 
     def test_clean_weekend_workspace_passes_all_checks(self):
         # Exercise every Weekend surface, then expect a fully green doctor.
-        # (Pin moved 12 → 17 under the D-W8.1 pattern: 4 complete-today
-        # checks + 1 warn-only line joined the mandated set. The fixture's
-        # T-0001 is a code task closed with note evidence, so the warn-only
-        # commit-evidence line fires without failing the run.)
+        # (Pin moved 12 → 17 → 18 under the D-W8.1 pattern: 4 complete-today
+        # checks + 1 warn-only line, then the U-C3 warn-only secret sweep,
+        # joined the mandated set. The fixture's T-0001 is a code task
+        # closed with note evidence, so the warn-only commit-evidence line
+        # fires without failing the run; the secret sweep stays [PASS].)
         self.aos(
             "decision", "add", "Use SQLite", "-p", "demo",
             "--decision", "SQLite is the source of truth", "--task", "T-0002",
@@ -653,7 +654,7 @@ class TestDoctorHardening(Night1BackCompatCase):
         code, out = self.doctor()
         self.assertEqual(code, 0, out)
         lines = [l for l in out.strip().splitlines() if l]
-        self.assertEqual(len(lines), 17)
+        self.assertEqual(len(lines), 18)
         warn_lines = [l for l in lines if l.startswith("[WARN]")]
         self.assertEqual(len(warn_lines), 1)
         self.assertIn("T-0001", warn_lines[0])

@@ -15,6 +15,14 @@ Complete-today hardening adds: agent registry rows well-formed · dropfile
 ingest events carry their dedupe hash · generated entity notes have
 well-formed frontmatter · PRAGMA integrity_check — plus one WARN-ONLY line
 (code tasks done without commit evidence) that never fails the run.
+
+U-C3 adds one more WARN-ONLY line: a bounded secret sweep over the
+canonical ledger rows and event payloads, naming identifiers plus
+field/pattern names only — never a stored value. Event payloads are
+covered twice: the safe secret_warning/secret_fields/secret_patterns
+metadata (redacted post-U-C3 events carry nothing else) and a raw scan of
+legacy payload strings via the shared detector. The events.actor column
+is raw-scanned too (fixed label `actor`) for legacy pre-redaction rows.
 """
 
 from __future__ import annotations
@@ -25,7 +33,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import db, ids, obsidian, utils
+from . import db, ids, obsidian, secretscan, utils
 from .models import AGENT_KINDS, AGENT_NAME_RE, TASK_STATUSES
 
 _WIKILINK = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
@@ -59,6 +67,198 @@ class Check:
     #: A warn-only check prints [WARN] instead of [FAIL] and never affects
     #: the exit code.
     warn_only: bool = False
+
+
+#: Secret-sweep findings shown per doctor run; the rest is a count. Keeps
+#: large ledgers from producing unbounded terminal output (U-C3.5).
+SECRET_SWEEP_DISPLAY_LIMIT = 10
+
+#: (entity, table, (field label, column)) — the canonical human-text
+#: fields the U-C3 sweep scans; the entity name is also the render_id key.
+_SWEEP_DOMAIN_FIELDS = (
+    ("task", "tasks", (
+        ("title", "title"),
+        ("spec", "spec_md"),
+        ("acceptance", "acceptance_md"),
+        # No CLI write path yet, but rendered into task frontmatter and
+        # pack REPO & BRANCH content — mirror/pack-bearing, so swept.
+        ("assignee", "assignee"),
+        ("branch_hint", "branch_hint"),
+    )),
+    ("run", "runs", (
+        ("agent", "agent"),
+        ("summary", "summary_md"),
+    )),
+    ("decision", "decisions", (
+        ("title", "title"),
+        ("decision", "decision_md"),
+        ("alternatives", "alternatives_md"),
+    )),
+    ("evidence", "evidence", (
+        ("ref", "ref"),
+        ("claim", "claim"),
+        # Trusted mirror/export-bearing field: the canonical row keeps a
+        # warned credential-shaped provenance, so the sweep must find it.
+        ("provenance", "provenance"),
+    )),
+    ("handoff", "handoffs", (
+        ("from_agent", "from_agent"),
+        ("to_agent", "to_agent"),
+        ("state", "state_md"),
+    )),
+    ("memory", "memory", (
+        ("key", "key"),
+        ("value", "value_md"),
+        ("source", "source"),
+    )),
+)
+
+
+def _iter_payload_strings(value, key: str | None = None):
+    """Yield (innermost key, string value) pairs from a decoded event
+    payload. Strings are scanned individually so a JSON key like "key"
+    or "token_estimate" can never lend keyword context to a neighboring
+    value."""
+    if isinstance(value, str):
+        yield key or "payload", value
+    elif isinstance(value, dict):
+        for child_key, child in value.items():
+            yield from _iter_payload_strings(child, child_key)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_payload_strings(child, key)
+
+
+#: A payload key doctor is willing to echo as a finding label: one of our
+#: snake_case identifiers, nothing longer or stranger. Keys are stored
+#: data too — a tampered event must not smuggle text out through the label.
+_PAYLOAD_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}\Z", re.ASCII)
+
+
+def _safe_payload_key(key: str) -> str:
+    if _PAYLOAD_KEY_RE.match(key) and not secretscan.scan_secrets(key):
+        return key
+    return "payload"
+
+
+def _event_secret_metadata(payload) -> list[tuple[str, list[str]]]:
+    """Read well-formed U-C3 event metadata (D-v0.2.21): the safe record a
+    redacted post-U-C3 event keeps of what its payload no longer shows.
+    Returns [(field, pattern names)] with every name validated against the
+    fixed allowlists — secretscan.TRUSTED_FIELD_LABELS and
+    secretscan.PATTERN_NAMES — so malformed or tampered metadata is
+    ignored, never echoed. (Its strings still get the raw leaf scan.)"""
+    if not isinstance(payload, dict) or payload.get("secret_warning") is not True:
+        return []
+    fields = payload.get("secret_fields")
+    patterns = payload.get("secret_patterns")
+    if not isinstance(fields, list) or not isinstance(patterns, list):
+        return []
+    safe_fields = list(
+        dict.fromkeys(
+            field
+            for field in fields
+            if isinstance(field, str)
+            and field in secretscan.TRUSTED_FIELD_LABELS
+        )
+    )
+    safe_patterns = [
+        name for name in secretscan.PATTERN_NAMES if name in patterns
+    ]
+    if not safe_fields or not safe_patterns:
+        return []
+    return [(field, safe_patterns) for field in safe_fields]
+
+
+def _secret_sweep_findings(conn: sqlite3.Connection) -> list[str]:
+    """U-C3.5 ledger sweep: every finding names an entity type, a public
+    ID (or event #id), the field, and the pattern names — never a stored
+    value, excerpt, or fingerprint. Domain rows get the raw scan; events
+    get the safe-metadata read plus the raw scan of legacy payloads and
+    of the top-level actor column (legacy raw actors)."""
+    findings: list[str] = []
+
+    def note(label: str, fields) -> None:
+        for field, hits in secretscan.scan_fields(fields):
+            findings.append(f"{label} {field}: {','.join(hits)}")
+
+    # Projects and agents are identified by ROW id: their public names
+    # (slug, agent name) are themselves scanned fields, and a secret-shaped
+    # one must never be echoed as the identifier of another field's hit.
+    for row in conn.execute(
+        "SELECT id, slug, name, repo_path, conventions_md FROM projects "
+        "ORDER BY id"
+    ).fetchall():
+        note(
+            f"project #{row['id']}",
+            [
+                ("slug", row["slug"]),
+                ("name", row["name"]),
+                ("repo_path", row["repo_path"]),
+                ("conventions", row["conventions_md"]),
+            ],
+        )
+    for entity, table, columns in _SWEEP_DOMAIN_FIELDS:
+        for row in conn.execute(
+            f"SELECT * FROM {table} ORDER BY id"
+        ).fetchall():
+            hid = ids.render_id(entity, row["id"])
+            note(
+                f"{entity} {hid}",
+                [(field, row[column]) for field, column in columns],
+            )
+    for row in conn.execute(
+        "SELECT id, name, invoke_hint, notes, capabilities_json FROM agents "
+        "ORDER BY id"
+    ).fetchall():
+        capabilities = None
+        if row["capabilities_json"]:
+            try:
+                decoded = json.loads(row["capabilities_json"])
+                if isinstance(decoded, list):
+                    capabilities = "\n".join(
+                        item for item in decoded if isinstance(item, str)
+                    )
+            except ValueError:
+                pass  # check 13 already reports the malformed JSON
+        note(
+            f"agent #{row['id']}",
+            [
+                ("name", row["name"]),
+                ("invoke_hint", row["invoke_hint"]),
+                ("notes", row["notes"]),
+                ("capabilities", capabilities),
+            ],
+        )
+    for row in conn.execute(
+        "SELECT id, actor, payload_json FROM events ORDER BY id"
+    ).fetchall():
+        label = f"event #{row['id']}"
+        # Legacy raw actor values, under the FIXED label "actor" (never
+        # derived from the stored text). emit now redacts a secret-shaped
+        # actor to the benign placeholder, so only pre-redaction rows can
+        # hit here; redacted new events surface via their safe metadata.
+        note(label, [("actor", row["actor"])])
+        try:
+            payload = json.loads(row["payload_json"])
+        except ValueError:
+            continue  # check 14 reports unparseable dropfile payloads
+        # Safe metadata first (the only trace a redacted event keeps),
+        # then the raw leaf scan for legacy pre-redaction payloads. Keys
+        # pass _safe_payload_key so no stored text rides out as a label.
+        for field, patterns in _event_secret_metadata(payload):
+            findings.append(f"{label} {field}: {','.join(patterns)}")
+        note(
+            label,
+            (
+                (_safe_payload_key(field), value)
+                for field, value in _iter_payload_strings(payload)
+            ),
+        )
+    # Metadata and a legacy raw payload (or repeated payload keys) can
+    # produce identical finding lines; report each distinct finding once,
+    # in first-seen order — deterministic for identical ledgers.
+    return list(dict.fromkeys(findings))
 
 
 #: Entity folders whose notes carry frontmatter (Reviews and the top-level
@@ -412,6 +612,27 @@ def run_checks(conn: sqlite3.Connection, aos_dir: Path) -> list[Check]:
             "code tasks done without commit evidence",
             not warn_offenders,
             ", ".join(warn_offenders[:10]),
+            warn_only=True,
+        )
+    )
+
+    # 18 (WARN, never fatal). U-C3 secret sweep (D-v0.2.15): secret-shaped
+    #     text sitting in otherwise valid ledger rows, or event payloads
+    #     whose safe metadata (or legacy raw strings) mark one. The ledger
+    #     stays an honest historical record — doctor names the affected
+    #     identifiers, field and pattern names so the human can
+    #     rotate/remove, and never prints a stored value. Output is bounded.
+    secret_findings = _secret_sweep_findings(conn)
+    shown = secret_findings[:SECRET_SWEEP_DISPLAY_LIMIT]
+    hidden = len(secret_findings) - len(shown)
+    detail = "; ".join(shown)
+    if hidden > 0:
+        detail += f" (+{hidden} more)"
+    checks.append(
+        Check(
+            "secret-shaped text in ledger rows or event payloads",
+            not secret_findings,
+            detail,
             warn_only=True,
         )
     )

@@ -10,9 +10,10 @@ from __future__ import annotations
 import shutil
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
-from . import db, events, ids, obsidian, utils
+from . import db, events, ids, obsidian, secretscan, utils
 from .models import (
     AGENT_KINDS,
     EVIDENCE_KINDS,
@@ -41,6 +42,62 @@ from .utils import AosError
 ACTOR_HUMAN = "human"
 
 GIT_TIMEOUT_SECONDS = 5
+
+
+# ---------------------------------------------------------------------------
+# U-C3 warn-on-write (D-v0.2.15): the trusted human CLI boundary accepts
+# secret-shaped text into the canonical domain row (the append-only ledger
+# stays honest) but the human is warned on stderr and the mutation event
+# carries safe metadata doctor can find later. The event payload itself
+# never carries a matched value: events.emit redacts every secret-shaped
+# string leaf via secretscan.redact_tree. Packs and dropfile ingest keep
+# their hard refusals.
+
+def _scan_trusted_write(
+    entity: str, fields: list[tuple[str, str | None]]
+) -> tuple[dict | None, str | None]:
+    """Scan canonical human-supplied field values AFTER normal validation.
+
+    Returns (event metadata, stderr warning line) — both None when nothing
+    is secret-shaped. Both carry field and pattern NAMES only, never the
+    matched value or anything derived from it.
+    """
+    unknown = sorted(
+        {label for label, _ in fields} - secretscan.TRUSTED_FIELD_LABELS
+    )
+    if unknown:
+        # Programming error, not user input: doctor reports event metadata
+        # field names only from the fixed allowlist, so an unregistered
+        # label would journal metadata doctor refuses to show.
+        raise ValueError(
+            "unregistered trusted-write field label(s): " + ", ".join(unknown)
+        )
+    findings = secretscan.scan_fields(fields)
+    if not findings:
+        return None, None
+    field_names = [label for label, _ in findings]
+    patterns = secretscan.merge_pattern_names(findings)
+    metadata = {
+        "secret_warning": True,
+        "secret_fields": field_names,
+        "secret_patterns": patterns,
+    }
+    warning = (
+        f"WARNING: secret-shaped text in {entity} field(s) "
+        f"{', '.join(field_names)} (patterns: {', '.join(patterns)}). "
+        "The write succeeded and this text can reach context packs, the "
+        "Obsidian mirror, and exports — if it is a real credential, rotate "
+        "it and remove it from the ledger. doctor flags affected records."
+    )
+    return metadata, warning
+
+
+def _warn_secret(warning: str | None) -> None:
+    """Print AFTER the transaction commits: the warning must accompany a
+    successful mutation, never a rolled-back one. stderr only, so stdout
+    (including --json documents) stays byte-clean."""
+    if warning:
+        print(warning, file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +339,12 @@ def add_project(
     repo_path = Path(repo).expanduser().resolve()
     if not repo_path.is_dir():
         raise AosError(f"Repo path is not an existing directory: {repo_path}")
+    # Slug and resolved repo path are human-selected and copied into event
+    # and mirror surfaces, so they are scanned like the display name.
+    secret_meta, secret_warning = _scan_trusted_write(
+        "project",
+        [("slug", slug), ("name", name), ("repo_path", str(repo_path))],
+    )
     now = utils.utc_now_iso()
     with db.transaction(conn):
         cursor = conn.execute(
@@ -290,14 +353,18 @@ def add_project(
             (slug, name, str(repo_path), now, now),
         )
         project_id = cursor.lastrowid
+        payload = {"slug": slug, "name": name, "repo_path": str(repo_path)}
+        if secret_meta:
+            payload.update(secret_meta)
         events.emit(
             conn,
             actor=ACTOR_HUMAN,
             entity="project",
             entity_id=project_id,
             action="add",
-            payload={"slug": slug, "name": name, "repo_path": str(repo_path)},
+            payload=payload,
         )
+    _warn_secret(secret_warning)
     return get_project(conn, project_id), True
 
 
@@ -321,6 +388,10 @@ def add_task(
             f"No project '{project_slug}'. "
             f"Run: python aos.py project add {project_slug} --name NAME --repo PATH"
         )
+    secret_meta, secret_warning = _scan_trusted_write(
+        "task",
+        [("title", title), ("spec", spec), ("acceptance", acceptance)],
+    )
     now = utils.utc_now_iso()
     with db.transaction(conn):
         cursor = conn.execute(
@@ -330,20 +401,24 @@ def add_task(
             (project.id, title, kind, priority, acceptance, spec, now, now),
         )
         task_id = cursor.lastrowid
+        payload = {
+            "title": title,
+            "project": project.slug,
+            "kind": kind,
+            "status": "ready",
+            "priority": priority,
+        }
+        if secret_meta:
+            payload.update(secret_meta)
         events.emit(
             conn,
             actor=ACTOR_HUMAN,
             entity="task",
             entity_id=task_id,
             action="add",
-            payload={
-                "title": title,
-                "project": project.slug,
-                "kind": kind,
-                "status": "ready",
-                "priority": priority,
-            },
+            payload=payload,
         )
+    _warn_secret(secret_warning)
     return get_task(conn, task_id)
 
 
@@ -456,6 +531,14 @@ def edit_task(
             "Nothing to edit: pass at least one of "
             "--title/--kind/--priority/--accept/--spec."
         )
+    secret_meta, secret_warning = _scan_trusted_write(
+        "task",
+        [
+            ("title", updates.get("title")),
+            ("spec", updates.get("spec_md")),
+            ("acceptance", updates.get("acceptance_md")),
+        ],
+    )
     now = utils.utc_now_iso()
     with db.transaction(conn):
         assignments = ", ".join(f"{column} = ?" for column in updates)
@@ -463,14 +546,18 @@ def edit_task(
             f"UPDATE tasks SET {assignments}, updated_at = ? WHERE id = ?",
             (*updates.values(), now, task.id),
         )
+        payload = {"task": task_hid, "changed": changed}
+        if secret_meta:
+            payload.update(secret_meta)
         events.emit(
             conn,
             actor=ACTOR_HUMAN,
             entity="task",
             entity_id=task.id,
             action="edit",
-            payload={"task": task_hid, "changed": changed},
+            payload=payload,
         )
+    _warn_secret(secret_warning)
     return get_task(conn, task.id), changed
 
 
@@ -545,6 +632,14 @@ def add_decision(
                 f"project '{project.slug}'; a decision's task and project "
                 "must match."
             )
+    secret_meta, secret_warning = _scan_trusted_write(
+        "decision",
+        [
+            ("title", title),
+            ("decision", decision),
+            ("alternatives", alternatives),
+        ],
+    )
     now = utils.utc_now_iso()
     with db.transaction(conn):
         cursor = conn.execute(
@@ -561,20 +656,24 @@ def add_decision(
             ),
         )
         decision_id = cursor.lastrowid
+        payload = {
+            "decision": ids.render_id("decision", decision_id),
+            "title": title,
+            "project": project.slug,
+            "task": ids.render_id("task", task.id) if task else None,
+            "status": "accepted",
+        }
+        if secret_meta:
+            payload.update(secret_meta)
         events.emit(
             conn,
             actor=ACTOR_HUMAN,
             entity="decision",
             entity_id=decision_id,
             action="add",
-            payload={
-                "decision": ids.render_id("decision", decision_id),
-                "title": title,
-                "project": project.slug,
-                "task": ids.render_id("task", task.id) if task else None,
-                "status": "accepted",
-            },
+            payload=payload,
         )
+    _warn_secret(secret_warning)
     row = conn.execute(
         "SELECT * FROM decisions WHERE id = ?", (decision_id,)
     ).fetchone()
@@ -608,6 +707,14 @@ def create_handoff(
     if not state or not state.strip():
         raise AosError("Handoff state (--state) must not be empty.")
     task = get_task(conn, task_id)
+    secret_meta, secret_warning = _scan_trusted_write(
+        "handoff",
+        [
+            ("from_agent", from_agent),
+            ("to_agent", to_agent),
+            ("state", state),
+        ],
+    )
     now = utils.utc_now_iso()
     with db.transaction(conn):
         cursor = conn.execute(
@@ -616,19 +723,23 @@ def create_handoff(
             (task.id, from_agent, to_agent, state, now),
         )
         handoff_id = cursor.lastrowid
+        payload = {
+            "handoff": ids.render_id("handoff", handoff_id),
+            "task": ids.render_id("task", task.id),
+            "from_agent": from_agent,
+            "to_agent": to_agent,
+        }
+        if secret_meta:
+            payload.update(secret_meta)
         events.emit(
             conn,
             actor=ACTOR_HUMAN,
             entity="handoff",
             entity_id=handoff_id,
             action="create",
-            payload={
-                "handoff": ids.render_id("handoff", handoff_id),
-                "task": ids.render_id("task", task.id),
-                "from_agent": from_agent,
-                "to_agent": to_agent,
-            },
+            payload=payload,
         )
+    _warn_secret(secret_warning)
     return get_handoff(conn, handoff_id)
 
 
@@ -717,6 +828,9 @@ def add_memory(
                 f"Memory {ids.render_id('memory', old.id)} is already "
                 f"superseded by {ids.render_id('memory', old.superseded_by)}."
             )
+    secret_meta, secret_warning = _scan_trusted_write(
+        "memory", [("key", key), ("value", value), ("source", source)]
+    )
     now = utils.utc_now_iso()
     with db.transaction(conn):
         cursor = conn.execute(
@@ -743,25 +857,29 @@ def add_memory(
                 "WHERE id = ?",
                 (memory_id, now, old.id),
             )
+        payload = {
+            "memory": ids.render_id("memory", memory_id),
+            "scope": scope,
+            "project": project.slug if project else None,
+            "kind": kind,
+            "key": key,
+            "confidence": confidence,
+            "valid_until": valid_until,
+            "supersedes": (
+                ids.render_id("memory", old.id) if old else None
+            ),
+        }
+        if secret_meta:
+            payload.update(secret_meta)
         events.emit(
             conn,
             actor=ACTOR_HUMAN,
             entity="memory",
             entity_id=memory_id,
             action="add",
-            payload={
-                "memory": ids.render_id("memory", memory_id),
-                "scope": scope,
-                "project": project.slug if project else None,
-                "kind": kind,
-                "key": key,
-                "confidence": confidence,
-                "valid_until": valid_until,
-                "supersedes": (
-                    ids.render_id("memory", old.id) if old else None
-                ),
-            },
+            payload=payload,
         )
+    _warn_secret(secret_warning)
     return get_memory(conn, memory_id)
 
 
@@ -828,6 +946,9 @@ def capture_inbox(conn: sqlite3.Connection, text: str) -> Task:
     text = text.strip()
     if not text:
         raise AosError("Nothing to capture: text must not be empty.")
+    secret_meta, secret_warning = _scan_trusted_write(
+        "task", [("title", text)]
+    )
     now = utils.utc_now_iso()
     with db.transaction(conn):
         cursor = conn.execute(
@@ -836,14 +957,18 @@ def capture_inbox(conn: sqlite3.Connection, text: str) -> Task:
             (text, now, now),
         )
         task_id = cursor.lastrowid
+        payload = {"title": text, "status": "inbox", "via": "in"}
+        if secret_meta:
+            payload.update(secret_meta)
         events.emit(
             conn,
             actor=ACTOR_HUMAN,
             entity="task",
             entity_id=task_id,
             action="add",
-            payload={"title": text, "status": "inbox", "via": "in"},
+            payload=payload,
         )
+    _warn_secret(secret_warning)
     return get_task(conn, task_id)
 
 
@@ -906,6 +1031,9 @@ def start_run(conn: sqlite3.Connection, *, task_id: int, agent: str) -> Run:
         anchor, note = _git_anchor(Path(project.repo_path))
     else:
         note = "task has no project; no repo to anchor"
+    secret_meta, secret_warning = _scan_trusted_write(
+        "run", [("agent", agent)]
+    )
     now = utils.utc_now_iso()
     with db.transaction(conn):
         cursor = conn.execute(
@@ -926,6 +1054,8 @@ def start_run(conn: sqlite3.Connection, *, task_id: int, agent: str) -> Run:
         }
         if note:
             payload["note"] = note
+        if secret_meta:
+            payload.update(secret_meta)
         events.emit(
             conn,
             actor=ACTOR_HUMAN,
@@ -934,6 +1064,7 @@ def start_run(conn: sqlite3.Connection, *, task_id: int, agent: str) -> Run:
             action="start",
             payload=payload,
         )
+    _warn_secret(secret_warning)
     return get_run(conn, run_id)
 
 
@@ -945,23 +1076,30 @@ def end_run(
     run_hid = ids.render_id("run", run.id)
     if run.ended_at is not None:
         raise AosError(f"Run {run_hid} already ended at {run.ended_at}.")
+    secret_meta, secret_warning = _scan_trusted_write(
+        "run", [("summary", summary)]
+    )
     now = utils.utc_now_iso()
     with db.transaction(conn):
         conn.execute(
             "UPDATE runs SET ended_at = ?, outcome = ?, summary_md = ? WHERE id = ?",
             (now, outcome, summary, run.id),
         )
+        payload = {
+            "task": ids.render_id("task", run.task_id),
+            "outcome": outcome,
+        }
+        if secret_meta:
+            payload.update(secret_meta)
         events.emit(
             conn,
             actor=ACTOR_HUMAN,
             entity="run",
             entity_id=run.id,
             action="end",
-            payload={
-                "task": ids.render_id("task", run.task_id),
-                "outcome": outcome,
-            },
+            payload=payload,
         )
+    _warn_secret(secret_warning)
     return get_run(conn, run.id)
 
 
@@ -984,6 +1122,14 @@ def add_evidence(
         if not file_path.is_file():
             raise AosError(f"Evidence file not found: {ref}")
         sha = utils.sha256_file(file_path)
+    # Provenance is validated (human | agent:<name>) but the agent-name
+    # charset admits token-shaped values, so it is scanned like ref/claim.
+    # The canonical evidence row keeps the trusted value; events.emit
+    # redacts the secret-shaped actor it would otherwise journal verbatim.
+    secret_meta, secret_warning = _scan_trusted_write(
+        "evidence",
+        [("ref", ref), ("claim", claim), ("provenance", provenance)],
+    )
     now = utils.utc_now_iso()
     with db.transaction(conn):
         cursor = conn.execute(
@@ -1001,6 +1147,8 @@ def add_evidence(
         }
         if extra_payload:
             payload.update(extra_payload)
+        if secret_meta:
+            payload.update(secret_meta)
         events.emit(
             conn,
             actor=provenance,
@@ -1009,6 +1157,7 @@ def add_evidence(
             action="add",
             payload=payload,
         )
+    _warn_secret(secret_warning)
     row = conn.execute(
         "SELECT * FROM evidence WHERE id = ?", (evidence_id,)
     ).fetchone()
@@ -1152,6 +1301,13 @@ def mark_done(
                 "(or pass --no-evidence --reason TEXT to override)"
             )
         override = True
+    secret_meta, secret_warning = (None, None)
+    if override:
+        # The override reason is stored verbatim in the done_override
+        # payload (D-v0.2.5), so it is scanned like any other trusted write.
+        secret_meta, secret_warning = _scan_trusted_write(
+            "task", [("reason", reason)]
+        )
     now = utils.utc_now_iso()
     with db.transaction(conn):
         conn.execute(
@@ -1173,18 +1329,22 @@ def mark_done(
             },
         )
         if override:
+            payload = {
+                "task": task_hid,
+                "reason": reason,
+                "via": "--no-evidence",
+            }
+            if secret_meta:
+                payload.update(secret_meta)
             events.emit(
                 conn,
                 actor=ACTOR_HUMAN,
                 entity="task",
                 entity_id=task.id,
                 action="done_override",
-                payload={
-                    "task": task_hid,
-                    "reason": reason,
-                    "via": "--no-evidence",
-                },
+                payload=payload,
             )
+    _warn_secret(secret_warning)
     return get_task(conn, task.id)
 
 
@@ -1237,20 +1397,32 @@ def add_agent(
         )
     import json
 
+    secret_meta, secret_warning = _scan_trusted_write(
+        "agent",
+        [
+            ("name", name),
+            ("notes", notes),
+            ("capabilities", "\n".join(caps) if caps else None),
+        ],
+    )
     with db.transaction(conn):
         cursor = conn.execute(
             "INSERT INTO agents (name, kind, capabilities_json, notes) "
             "VALUES (?, ?, ?, ?)",
             (name, kind, json.dumps(caps), notes),
         )
+        payload = {"agent": name, "kind": kind, "capabilities": caps}
+        if secret_meta:
+            payload.update(secret_meta)
         events.emit(
             conn,
             actor=ACTOR_HUMAN,
             entity="agent",
             entity_id=cursor.lastrowid,
             action="add",
-            payload={"agent": name, "kind": kind, "capabilities": caps},
+            payload=payload,
         )
+    _warn_secret(secret_warning)
     return get_agent(conn, name)
 
 
@@ -1270,34 +1442,49 @@ def update_agent(
 
     updates: dict[str, object] = {}
     changed: list[str] = []
+    caps = None
     if notes is not None:
         if not notes.strip():
             raise AosError("--notes must not be empty.")
         updates["notes"] = notes
         changed.append("notes")
     if capabilities is not None:
-        updates["capabilities_json"] = json.dumps(
-            _clean_capabilities(capabilities)
-        )
+        caps = _clean_capabilities(capabilities)
+        updates["capabilities_json"] = json.dumps(caps)
         changed.append("capabilities")
     if not updates:
         raise AosError(
             "Nothing to update: pass at least one of --notes/--capability."
         )
+    # The (pre-existing) name is scanned too: a secret-shaped identifier
+    # accepted by an earlier warned write must mark — and be redacted
+    # from — every later event payload it would be copied into.
+    secret_meta, secret_warning = _scan_trusted_write(
+        "agent",
+        [
+            ("name", name),
+            ("notes", notes),
+            ("capabilities", "\n".join(caps) if caps else None),
+        ],
+    )
     with db.transaction(conn):
         assignments = ", ".join(f"{column} = ?" for column in updates)
         conn.execute(
             f"UPDATE agents SET {assignments} WHERE id = ?",
             (*updates.values(), agent.id),
         )
+        payload = {"agent": name, "changed": changed}
+        if secret_meta:
+            payload.update(secret_meta)
         events.emit(
             conn,
             actor=ACTOR_HUMAN,
             entity="agent",
             entity_id=agent.id,
             action="update",
-            payload={"agent": name, "changed": changed},
+            payload=payload,
         )
+    _warn_secret(secret_warning)
     return get_agent(conn, name), changed
 
 
