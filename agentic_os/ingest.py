@@ -29,7 +29,7 @@ import re
 import sqlite3
 from pathlib import Path
 
-from . import db, events, ids, ops, pack, utils
+from . import db, events, ids, ops, secretscan, utils
 from .models import EVIDENCE_KINDS, RUN_OUTCOMES
 from .utils import AosError
 
@@ -186,7 +186,7 @@ def _scan_for_secrets(doc: dict) -> None:
     for index, question in enumerate(doc["questions"], start=1):
         targets.append((f"open question {index}", question))
     for where, value in targets:
-        for pattern_name in pack.scan_secrets(value):
+        for pattern_name in secretscan.scan_secrets(value):
             findings.append(f"{pattern_name} in {where}")
     if findings:
         raise AosError(

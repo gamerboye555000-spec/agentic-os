@@ -1,3 +1,95 @@
+# DECISIONS — Agentic OS v0.2 U-C3 secret warn-on-write run
+
+This section continues the `D-v0.2.*` series for the U-C3 pass executed per
+`agentic-os-v0.2-u-c3-secret-safety-contract.md` on branch
+`v0.2-u-c3-secret-safety` (2026-07-12). D-v0.2.15 remains the behavioral
+decision; this section records only the implementation policies the build
+surfaced. Prepended per the established precedent (D-W0.4, reaffirmed in
+D-v0.2.7); everything below stays byte-identical.
+
+## D-v0.2 decisions (U-C3)
+
+- **D-v0.2.21 — U-C3 implementation policies.** Baseline gate: branch
+  `v0.2-u-c3-secret-safety`, HEAD `410289f`, clean tree, 336 tests OK,
+  doctor 17/17 on a fresh workspace. The detector moved verbatim to
+  `agentic_os/secretscan.py` (side-effect-free; `pack.scan_secrets` and
+  `pack.SECRET_PATTERNS` stay as re-exports because pack was its
+  historical home). Policies pinned during implementation:
+  (a) *Metadata keys, sparsity, and payload redaction.* An affected
+  successful mutation's normal event payload gains `secret_warning`
+  (true), `secret_fields` (canonical field labels, input order), and
+  `secret_patterns` (detector order, deduplicated) — and never the
+  matched value: every event payload passes `secretscan.redact_tree`
+  inside `events.emit`, replacing each secret-shaped string leaf (nested
+  lists/dicts included) with the one fixed placeholder
+  `secretscan.REDACTED_VALUE` — no hash, fingerprint, preview, excerpt,
+  or offset. The emit choke point also keeps a previously accepted
+  secret-shaped identifier (an agent name on `agent update`, a project
+  slug or repo path copied forward) out of every later event, and applies
+  the same fixed placeholder to the top-level `events.actor` column: a
+  syntactically valid `agent:<name>` evidence provenance can be
+  credential-shaped and flows directly into the actor, so no matched
+  value may remain anywhere in the event record — payload OR actor —
+  while benign actors are stored byte-identical. The canonical domain
+  row keeps the accepted value (the ledger stays honest). Redaction is
+  the identity on benign strings and the metadata keys are absent on
+  unaffected writes, so every pre-U-C3 payload shape AND value stays
+  byte-identical. No second event. Scan labels are enforced against the
+  fixed `secretscan.TRUSTED_FIELD_LABELS` allowlist; `project add` scans
+  the validated slug, display name, and resolved repo path,
+  `agent update` re-scans the reused name, and `evidence add` scans ref,
+  claim, and the validated provenance — a trusted mirror/export-bearing
+  field (rendered in the evidence note, passed as the event actor).
+  (b) *Warn after commit.* The stderr WARNING prints only after the
+  mutation's transaction commits — a rolled-back write must never warn,
+  and a warned write is always a real one. One line per command, fields
+  and pattern names only, value never repeated.
+  (c) *Override reason included.* `done --no-evidence --reason` stores the
+  reason verbatim in the `done_override` payload, so the reason is scanned
+  and that payload (the one carrying the text) gets the safe metadata —
+  the minimum-coverage list did not name it, but an unscanned journaled
+  free-text field would be a hole in the sweep.
+  (d) *Doctor sweep shape.* One warn-only check (#18) scans the canonical
+  text columns of projects/tasks/runs/decisions/evidence/handoffs/memory/
+  agents — including `slug`, `repo_path`, `conventions_md`,
+  `invoke_hint`, evidence `provenance`, and the task `assignee` and
+  `branch_hint` columns (rendered task frontmatter and pack REPO & BRANCH
+  content), which have no CLI write path yet or arrive validated but are
+  pack/mirror-bearing. Legacy raw `events.actor` values are raw-scanned
+  with the shared detector and reported as `event #id` under the fixed
+  safe label `actor` with canonical pattern names only; post-U-C3 events
+  never hold a matched actor (emit redacts it), so their visibility comes
+  from the safe metadata. Event payloads are covered two ways: doctor
+  reads well-formed U-C3 metadata (`secret_warning` is `true` plus
+  list-typed `secret_fields`/`secret_patterns`) so redacted historical
+  events stay visible, accepting field names only from
+  `secretscan.TRUSTED_FIELD_LABELS` and pattern names only from
+  `secretscan.PATTERN_NAMES` — malformed or tampered metadata is ignored,
+  never echoed — and still raw-scans every legacy payload string value,
+  each string individually so a JSON key (`key`, `token_estimate`) can
+  never lend keyword context to a neighboring value. A payload key is
+  echoed as a finding label only when it looks like one of our snake_case
+  keys and is itself negative under the detector; anything else reports
+  as `payload`. Findings name entity + public ID (or `event #id`) + field
+  + pattern names; distinct findings are deduplicated deterministically
+  in first-seen order and display is bounded to 10 findings plus a
+  `(+N more)` count. Projects and agents are identified by ROW id
+  (`project #1`, `agent #1`), never slug or name: those fields are
+  themselves scanned, and a secret-shaped one must not be echoed as the
+  identifier of another field's finding. Domain hits normally also appear
+  as event-metadata hits (the add event marks the same fields): accepted
+  as honest double visibility, not deduplicated across sources. Doctor's
+  exit semantics are unchanged.
+  (e) *Value-echo policy scope.* Canonical domain rows retain accepted
+  trusted-human values, and ordinary user-requested ledger readbacks
+  (`task list`/`show`, `log`, `--json` documents) and the generated
+  mirror may reflect them. Warnings, event payloads, the event actor
+  column, doctor findings, U-C3 refusal/exception text, and this unit's
+  test failure diagnostics never echo a matched value. Context packs and
+  untrusted dropfile ingest
+  keep their atomic hard refusals. This is a targeted no-echo rule at the
+  listed surfaces, not general output redaction.
+
 # DECISIONS — Agentic OS v0.2 release-readiness audit
 
 This section records the 2026-07-11 continuation audit across the public

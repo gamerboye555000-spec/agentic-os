@@ -817,11 +817,13 @@ class TestDoctor(CliTestCase):
         code, out, err = self.run_cli("doctor")
         self.assertEqual(code, 0, out + err)
         lines = [l for l in out.strip().splitlines() if l]
-        # 6 Night-1 + 6 Weekend + 4 complete-today checks + 1 warn-only line
-        # (D-W8.1 pattern: the pin moves UP with mandated new checks). The
-        # demo closes a code task with note evidence, so the warn-only
-        # commit-evidence line fires — [WARN], never [FAIL], exit stays 0.
-        self.assertEqual(len(lines), 17)
+        # 6 Night-1 + 6 Weekend + 4 complete-today checks + 2 warn-only
+        # lines (commit evidence + the U-C3 secret sweep; D-W8.1 pattern:
+        # the pin moves UP with mandated new checks). The demo closes a
+        # code task with note evidence, so the warn-only commit-evidence
+        # line fires — [WARN], never [FAIL], exit stays 0 — while the
+        # secret sweep stays [PASS] on the secret-free fixture.
+        self.assertEqual(len(lines), 18)
         warn_lines = [l for l in lines if l.startswith("[WARN]")]
         self.assertEqual(len(warn_lines), 1)
         self.assertIn("code tasks done without commit evidence", warn_lines[0])

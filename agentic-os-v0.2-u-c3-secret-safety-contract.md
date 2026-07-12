@@ -58,8 +58,15 @@ The U-C3 PR diff must be explainable entirely by this contract.
 - No schema change, migration, or schema-version bump.
 - No autonomous execution, model/API call, network call, MCP, A2A, background
   process, Obsidian plugin, two-way sync, vector database, or cloud sync.
-- No raw secret value in warnings, events, doctor output, exceptions, JSON
-  output, test failure messages, or generated documentation.
+- No matched secret value in warnings, event payloads, event actors, doctor
+  output, U-C3 refusal/exception text, or test failure diagnostics: nothing
+  matched may remain anywhere in an event record — payload OR the top-level
+  actor column. Canonical domain rows keep accepted trusted-human values
+  (the ledger stays honest), and ordinary user-requested ledger readbacks
+  (including `--json` documents) and the generated mirror may reflect
+  them — this is a targeted no-echo rule at the listed surfaces, not
+  general output redaction. Context packs and untrusted dropfile ingest
+  keep their atomic hard refusals.
 - No silent write refusal at the trusted human CLI boundary.
 - Existing context-pack and untrusted dropfile hard refusals stay at least as
   strict as the U-C2 baseline.
@@ -104,7 +111,10 @@ Minimum domain coverage:
 - task: title, spec, acceptance, and other mirror-bearing text;
 - run: agent identifier where applicable and end summary;
 - decision: question, choice, rationale, alternatives;
-- evidence: reference and claim;
+- evidence: reference, claim, and provenance — provenance is validated
+  (`human` | `agent:<name>`) but the agent-name charset admits credential
+  shapes, and it is a trusted mirror/export-bearing field whose canonical
+  row keeps the accepted value;
 - handoff: from/to agent, status or summary/question fields that are mirrored;
 - memory: key/value/source note fields that are mirrored or packed;
 - agent registry: name/invoke hint/capabilities/notes where supported.
@@ -132,9 +142,18 @@ only safe metadata sufficient for later audit, for example:
 - matched detector pattern names.
 
 Do not store excerpts, offsets that reveal content, hashes intended to identify
-a specific credential, entropy samples, or the matched value. Keep the normal
-event in the same transaction as the mutation; do not add a second event unless
-the implementation contract and tests explicitly require it.
+a specific credential, entropy samples, or the matched value. Where the normal
+payload would otherwise carry the matched value — or a previously accepted
+secret-shaped identifier copied forward into a later event — replace each
+matched string leaf (nested lists/dicts included) with one fixed, deterministic,
+non-secret placeholder; safe non-matching payload values stay unchanged. The
+same rule covers the top-level event actor at the single emission choke point:
+a secret-shaped actor (evidence provenance flows directly into `events.actor`)
+is stored as the same fixed placeholder, while benign actors are stored
+byte-identical — no matched value may remain anywhere in the event record.
+Keep the normal event in the same transaction as the mutation; do not add a
+second event unless the implementation contract and tests explicitly require
+it.
 
 ### U-C3.5 Doctor sweep
 
@@ -144,6 +163,15 @@ event payloads using the shared detector/safe metadata.
 - `PASS` when no findings exist.
 - `WARN`, not `FAIL`, when secret-shaped text is found in otherwise valid
   records. The ledger remains an honest historical record.
+- The event sweep reads the safe U-C3 metadata — field and pattern names
+  accepted only from the fixed allowlists; malformed or tampered metadata is
+  ignored without echoing arbitrary values — so redacted historical events
+  stay visible, and it still scans legacy raw payload strings.
+- The domain sweep covers evidence `provenance` and the mirror/pack-bearing
+  task `assignee` and `branch_hint` columns; the event sweep also raw-scans
+  legacy `events.actor` values, reported as `event #ID` under the fixed safe
+  label `actor` with canonical pattern names only. New redacted events are
+  visible through their safe metadata, never a stored actor value.
 - Output names entity type and public ID or a safe row/event identifier plus
   pattern/field names.
 - Output never prints stored values or excerpts.

@@ -502,6 +502,11 @@ record; you act in your own tools. Follow this protocol exactly.
 
    Use the honest outcome: `success`, `partial`, `fail`, or `unknown`.
 
+6. **Never write secret values into the ledger.** Packs refuse to build on
+   secret-shaped content, and dropfile ingest refuses the whole file. The
+   human CLI accepts such text but warns and flags it for `doctor` — keep
+   credentials out of refs, claims, summaries, and open questions entirely.
+
 ## If aos is unavailable
 
 Create a dropfile at `.agentic-os/exports/dropfile-<T-XXXX>-{agent}-<n>.md`
