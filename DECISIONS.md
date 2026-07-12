@@ -1,3 +1,59 @@
+# DECISIONS — Agentic OS v0.2 release-readiness audit
+
+This section records the 2026-07-11 continuation audit across the public
+`agentic-os` control plane and private `ai-company-runtime` execution plane.
+It prepends new decisions without changing the historical sections below.
+
+## D-v0.2 decisions (release readiness)
+
+- **D-v0.2.14 — Two repositories, one artifact boundary.** `agentic-os`
+  remains the local governance/memory ledger (SQLite); `ai-company-runtime`
+  remains the operational execution plane (Postgres). They will not share or
+  synchronize tables. Future integration uses a versioned result envelope
+  carrying AOS/runtime task references, evidence hashes, and trace/correlation/
+  causation ids. This prevents two mutable sources of truth while preserving
+  end-to-end auditability.
+- **D-v0.2.15 — Warn-on-write secret posture (U-C3).** U-C3 preserves
+  the existing hard refusals for pack construction and untrusted dropfile
+  ingest. Trusted human CLI writes to mirror-bearing project/task/run/decision/
+  evidence/handoff/memory/agent fields remain non-blocking; an affected
+  successful mutation will print a warning and store pattern/field names only
+  in its normal event. Doctor will report identifiers and safe metadata only,
+  never matching values. Rationale: do not silently falsify the append-only
+  record, but make exposure visible and actionable.
+- **D-v0.2.16 — Success claims require proof (approved later U-H2
+  unit).** A separate U-H2 contract will require a dropfile declaring
+  `outcome: success` to carry evidence or be refused atomically. Direct run
+  endings will remain available for honest/manual recovery, while doctor will
+  warn when a successful run has no evidence created inside its run window.
+  This behavior is not part of the U-C2 baseline or the U-C3 implementation.
+- **D-v0.2.17 — Distribution boundary approved for later U-P1.**
+  A separate U-P1 unit may add `pyproject.toml`, an `aos` console script,
+  `python -m agentic_os`, build metadata, version `0.2.0`, and a Python 3.12
+  floor. None of that packaging behavior is present in the verified U-C2
+  baseline or included in U-C3.
+- **D-v0.2.18 — GitHub delivery gate approved for later U-P1.**
+  A separate delivery unit will add PR/push CI for supported Python versions,
+  including unittest, compile, wheel, installed-entrypoint, fresh-init, and
+  doctor smoke gates with official actions pinned to immutable full commit
+  SHAs. Branch protection and reviewed-PR requirements remain human repository
+  settings. No CI implementation is claimed by this audit.
+- **D-v0.2.19 — Blueprint authority without roadmap erasure.** The canonical
+  near-term sequence remains the user's existing plan: U-C1 input hardening →
+  U-C2 backup/verify/restore → U-C3 secret warn-on-write + doctor sweep → U-C4
+  Windows Obsidian export → U-H1 SessionEnd dropfile hook + trust-gated
+  installer. U-C1 and U-C2 are complete, so U-C3 is next. The broader
+  `AGENTIC_OS_BLUEPRINT.md` extends that spine with cross-repository architecture
+  and later milestones; it does not supersede, reorder, or erase it. Older
+  research and two-week documents remain evidence/history, while newer explicit
+  decisions may amend individual items without silently rewriting the sequence.
+- **D-v0.2.20 — Proof and identifier hardening approved for a later
+  bounded unit.** A separate contract may enforce priority 1–5, non-blank
+  optional task text, non-blank evidence refs/claims, safe agent-name grammar,
+  non-blank run summaries, and post-collapse dropfile evidence validation.
+  These changes are not present in the verified U-C2 baseline and are excluded
+  from U-C3.
+
 # DECISIONS — Agentic OS v0.2 U-C2 backup/verify/restore run
 
 This section continues the `D-v0.2.*` series for the U-C2 pass executed per
