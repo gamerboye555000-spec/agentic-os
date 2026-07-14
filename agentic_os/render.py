@@ -468,6 +468,48 @@ _ADAPTER_NOTES = {
 }
 
 
+#: Adapter-specific protocol sections inserted between the dropfile section
+#: and the agent notes. Only claude-code has one today (the U-H1 session
+#: hooks exist only for Claude Code); every other adapter renders unchanged.
+_ADAPTER_EXTRAS = {
+    "claude-code": """\
+## Session write-back envelope (U-H1 hooks)
+
+If the AOS session hooks are installed (`python aos.py hooks status` says
+`installed`), you may skip writing the dropfile yourself: end your FINAL
+response with exactly one fenced `aos-dropfile` block whose content is
+exactly the dropfile format above, starting at `# AOS DROPFILE`:
+
+    ```aos-dropfile
+    # AOS DROPFILE
+    task: T-XXXX
+    agent: claude-code
+    outcome: success|partial|fail|unknown
+    summary: <one paragraph, what actually happened>
+
+    ## evidence
+    - kind: <note|file|commit|test|url|command_output> | ref: <ref> | claim: <claim>
+
+    ## open questions
+    - <anything the next run must know>
+    ```
+
+Rules: at most one envelope per response (two or more refuse; both fences
+must start at column 0); a new envelope in a later response replaces the
+earlier one — the last envelope before the session ends wins. The same size
+caps and secret refusals as dropfile ingest apply. On Stop the hook stages
+the envelope; on SessionEnd it publishes at most one dropfile under
+`.agentic-os/exports/`. Ingest stays manual: the human runs
+`python aos.py ingest dropfile <path>` to accept it into the ledger.
+"""
+}
+
+
+def _adapter_extra(agent: str) -> str:
+    extra = _ADAPTER_EXTRAS.get(agent)
+    return f"{extra}\n" if extra else ""
+
+
 def adapter_protocol_md(agent: str) -> str:
     return f"""\
 # Agentic OS — {agent} protocol
@@ -526,7 +568,7 @@ exactly this structure:
     ## open questions
     - <anything the next run must know>
 
-## Agent notes
+{_adapter_extra(agent)}## Agent notes
 
 {_ADAPTER_NOTES[agent]}
 """

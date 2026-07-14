@@ -177,7 +177,11 @@ def parse_dropfile(text: str) -> dict:
     }
 
 
-def _scan_for_secrets(doc: dict) -> None:
+def secret_findings(doc: dict) -> list[str]:
+    """Safe '<pattern> in <field>' findings for a parsed dropfile doc —
+    pattern names and positional field labels only, never values. Shared by
+    the ingest refusal below and the U-H1 hook's pre-staging scan, so both
+    boundaries judge dropfile content with exactly the same posture."""
     findings = []
     targets = [("summary", doc["summary"])]
     for index, (kind, ref, claim) in enumerate(doc["evidence"], start=1):
@@ -188,6 +192,11 @@ def _scan_for_secrets(doc: dict) -> None:
     for where, value in targets:
         for pattern_name in secretscan.scan_secrets(value):
             findings.append(f"{pattern_name} in {where}")
+    return findings
+
+
+def _scan_for_secrets(doc: dict) -> None:
+    findings = secret_findings(doc)
     if findings:
         raise AosError(
             "Refusing to ingest dropfile: secret-shaped content detected — "

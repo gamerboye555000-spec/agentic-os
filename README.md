@@ -107,6 +107,55 @@ dropfile PATH` reads it back into the ledger:
 - Dedupe by file sha256 (recorded in the ingest event): re-ingesting the same
   bytes is refused. The dropfile itself is never modified or deleted.
 
+## Claude Code session hooks (U-H1)
+
+Optional bridge: a Claude Code session can hand its write-back to the
+dropfile path without running the CLI. Two AOS-owned command hooks do it in
+two deterministic stages:
+
+- **Stop (capture):** when Claude's final response contains exactly one
+  fenced ```` ```aos-dropfile ```` block — whose content is exactly the
+  dropfile format above — the hook validates it with the same parser, size
+  caps, and secret scanner as `ingest dropfile` and stages it under
+  `.agentic-os/exports/hook-staging/`, bound to the session id and a sha256
+  digest. At most one staged record per session; a later envelope replaces
+  it. No envelope, or a session outside an AOS workspace, is a silent no-op.
+  The hook never blocks Claude from stopping.
+- **SessionEnd (publish):** the hook re-validates its own session's staged
+  record and publishes at most one dropfile at a deterministic,
+  collision-safe name (`dropfile-<task>-<agent>-hook-<session8>-<sha12>.md`)
+  under `.agentic-os/exports/`. Publication is atomic and idempotent — a
+  retried SessionEnd never creates a duplicate. Refusals (tampered staging,
+  secret-shaped content, name collisions) leave no partial file and retain
+  the staged record for inspection.
+
+**Ingest stays manual.** The hooks never run `aos`, never open the ledger,
+never read transcripts or workspace files, never call git or the network —
+they only write the two owned exports paths. You review and ingest:
+
+```bash
+python aos.py ingest dropfile .agentic-os/exports/dropfile-T-XXXX-claude-code-hook-*.md
+```
+
+Install is previewable and reversible (dry-run is the default; apply asks
+for confirmation and backs up your settings file first):
+
+```bash
+python aos.py hooks install              # dry-run: exact settings diff, no writes
+python aos.py hooks install --apply      # confirm with 'yes'; backup written first
+python aos.py hooks status               # absent | installed (version, digest) | drifted
+python aos.py hooks uninstall            # dry-run preview of the removal
+python aos.py hooks uninstall --apply    # removes only the AOS-owned entries
+```
+
+The target is the documented Claude Code user settings file
+(`~/.claude/settings.json`; override with `--settings PATH`). Only the exact
+AOS-owned `Stop`/`SessionEnd` entries are added, healed, or removed —
+unrelated settings and hooks are preserved. Restore any apply with the
+printed backup: `cp <backup> <settings>`. Compatibility is capability-based:
+the hooks need a Claude Code that provides Stop/SessionEnd command hooks
+with JSON on stdin and `last_assistant_message` in the Stop input.
+
 ## Agent registry
 
 Records only — Agentic OS never executes agents.
@@ -298,6 +347,7 @@ documented in `TROUBLESHOOTING.md`.
   aos.db            # SQLite ledger (source of truth)
   packs/            # compiled context packs (T-0001-claude-code.md, ...)
   exports/          # events-*.jsonl exports, aos-*.db snapshots, agent dropfiles
+                    # (hook-staging/ holds U-H1 staged session write-backs)
   adapters/         # per-agent PROTOCOL.md (claude-code, codex, gemini, generic)
   backups/          # created on first `backup create`: aos-backup-*.db + manifest
   obsidian-vault/

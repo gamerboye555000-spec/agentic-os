@@ -1,3 +1,136 @@
+# DECISIONS — Agentic OS v0.2 U-H1 SessionEnd hook + installer run
+
+This section continues the `D-v0.2.*` series for the U-H1 pass executed per
+`agentic-os-v0.2-u-h1-sessionend-hook-contract.md` on branch
+`v0.2-u-h1-sessionend-hook` (2026-07-14). Prepended per the established
+precedent (D-W0.4, reaffirmed in D-v0.2.7); everything below stays
+byte-identical.
+
+## D-v0.2 decisions (U-H1)
+
+- **D-v0.2.28 — Two-stage bridge: Stop captures the official
+  `last_assistant_message` only; SessionEnd publishes.** The Stop hook is
+  the only stage that sees session text, and it sees exactly one field of
+  the official hook JSON — never the transcript. `transcript_path`
+  (supplied to SessionEnd) is metadata and is never opened, so the bridge
+  has zero dependency on the transcript JSONL format and cannot break when
+  that format changes. Splitting capture from publication buys three
+  things: the envelope is validated while the session is still alive (the
+  agent sees the refusal diagnostic on its own Stop and can correct
+  itself in the next turn — latest envelope wins); publication happens
+  exactly once per session at a well-defined lifecycle point with a
+  documented `reason` vocabulary (`clear|logout|prompt_input_exit|other`;
+  anything else refuses rather than guesses); and a crashed session
+  leaves an inert staged record instead of a half-published dropfile.
+  The Stop handler never blocks: stdout stays empty in every outcome (no
+  decision JSON can exist on an empty stream) and exit 2 — the Stop-hook
+  blocking signal — is never used; refusals are exit-1 diagnostics.
+  Compatibility is capability-based (Stop/SessionEnd command hooks, JSON
+  on stdin, `last_assistant_message` present); no Claude Code minimum
+  version is invented anywhere.
+
+- **D-v0.2.29 — The envelope IS the dropfile protocol; one schema, two
+  transports.** The write-back envelope is a fenced ```` ```aos-dropfile ````
+  block (both fences at column 0) whose content is byte-for-byte the
+  existing dropfile format. The hook reuses `ingest.parse_dropfile`, the
+  U-C1 `MAX_DROPFILE_BYTES` cap, and the U-C3 detector via the new shared
+  `ingest.secret_findings` (extracted from `_scan_for_secrets`, same
+  behavior) — no competing schema, no new validators, and every field the
+  manual path supports (task, agent, outcome, summary, evidence rows,
+  open questions) flows through unchanged. U-H2 is explicitly NOT smuggled
+  in: a success outcome with zero evidence rows stages and publishes.
+  Exactly one envelope per message; two or more refuse (with one staged
+  record per session, picking a winner would silently drop the rest). An
+  unterminated or indented fence is "no envelope" (silent no-op), as is a
+  session outside any initialized workspace — the hooks are safe to
+  install user-wide. Hook stdin itself is capped (16 MiB) in the U-C1
+  bounded-input posture. Diagnostics name conditions, counts, and line
+  numbers, never untrusted values — a session id, reason string, or
+  envelope value is never echoed.
+
+- **D-v0.2.30 — Staging/publication identity and the deterministic
+  recovery rule.** The staged record
+  (`exports/hook-staging/stop-<session>.json`) binds a format marker
+  (`aos-u-h1-staged/1`), the session id (charset-fenced
+  `[A-Za-z0-9-]{8,128}` — it becomes a filename component, so the fence is
+  also the traversal guard), the envelope text, and its sha256. SessionEnd
+  re-validates ALL of it immediately before publication (marker, binding,
+  digest, size caps, parse, secret scan): a tampered, replaced,
+  secret-bearing, or malformed record refuses with the record retained;
+  only ENOENT reads as absence — any other inspection error refuses
+  (U-C4's fail-closed lesson). The published name
+  `dropfile-<task>-<agent>-hook-<session8>-<sha12>.md` is deterministic
+  and carries the dedupe identity: the sha256 of the published bytes is
+  exactly the hash `ingest` journals for its own dedupe, closing the loop
+  end-to-end. Publication is a same-directory temp file + `os.link`
+  (never overwrites) + temp unlink; retries converge — identical bytes at
+  the name are idempotent success, different bytes refuse. Recovery rule,
+  pinned: a staged record is removed ONLY after verified publication
+  (fresh or identical); every refusal retains it byte-for-byte; a
+  post-publication removal failure warns at exit 0 (the deterministic
+  name makes the leftover harmless). Stale records from crashed sessions
+  are inert and documented as safe to delete or salvage by hand. Honest
+  limit, stated: owned-path checks are lstat/O_NOFOLLOW (symlinked
+  `exports/`/`hook-staging/` and non-regular files refuse before any read
+  or write), not the U-C4 descriptor-pinned depth — a same-directory race
+  inside the check-to-write window is documented, not defended.
+
+- **D-v0.2.31 — Hook handlers run via a dedicated root runner, not the
+  CLI; the prohibition list is structural.** Claude Code invokes
+  `python3 <checkout>/aos_hooks.py stop|session-end` — a thin sibling of
+  `aos.py` that imports `agentic_os.hooks` (script-directory sys.path,
+  works from any hook cwd). The handlers therefore reuse the package's
+  validators without ever invoking the `aos` CLI, and the module's runtime
+  path contains no subprocess, SQLite, git, or network call to misuse —
+  the test suite additionally hard-patches `subprocess.*`, `os.system`,
+  `sqlite3.connect`, and `socket.socket` to prove none is reached, records
+  every file open to prove nothing under the workspace outside
+  `exports/` is read (transcript included), and pins stdout-empty across
+  all outcomes.
+
+- **D-v0.2.32 — Installer: documented user settings file, dry-run
+  default, marker-based ownership, semantic idempotency.** Target is the
+  documented Claude Code user settings file `~/.claude/settings.json`
+  (`--settings PATH` overrides; tests and the build never touch the real
+  one). Dry-run is the default posture and prints the exact deterministic
+  unified diff; `--apply` demands a typed `yes`, writes a byte-exact
+  collision-suffixed backup (`settings.json.aos-backup-<stamp>`,
+  documented restore: `cp <backup> <settings>`), validates the exact
+  resulting bytes, and lands via same-directory temp file + fsync +
+  atomic `os.replace` with the original file mode preserved (0600 fresh).
+  Ownership is the `aos_hooks.py` token in a command entry: install heals
+  to exactly one AOS-owned group per event (appended last), uninstall
+  removes only owned entries and drops only containers its own removal
+  emptied; unrelated settings, events, and hooks survive semantically via
+  the JSON round-trip (a reformat of an untouched file never happens —
+  idempotency is judged on the parsed document, so an already-merged file
+  is never rewritten). Unsupported shapes (non-object root, non-list
+  event arrays, non-object groups, non-list group hooks), invalid JSON,
+  symlinked/irregular settings paths, and missing parent directories all
+  refuse with zero mutation. `status` reports
+  absent/installed(version+digest)/drifted, where the digest is the
+  sha256 over the exact expected handler commands and protocol version
+  `u-h1/1`. The installer opens no ledger and records no evidence — the
+  human records merge evidence per repo convention.
+
+- **D-v0.2.33 — Accelerated dogfood gate.** Instead of five repetitive
+  manual sessions: an automated five-scenario matrix (normal success,
+  failure outcome, no envelope/no evidence, secret-shaped refusal,
+  duplicate/retry) driven against a REAL initialized workspace all the
+  way through manual `ingest dropfile` of the published file — plus ONE
+  real live smoke (hooks installed into a disposable settings file, one
+  real Claude Code session, manual ingest) to be performed by the human
+  before merge. The matrix also proves the ledger's own sha256 dedupe
+  refuses a second ingest of the same published bytes.
+
+- **D-v0.2.34 — Gate U-H1 result.** Focused suite
+  (`tests/test_v02_hooks.py`) 67 green; full suite 670 green (603
+  pre-existing, none weakened or deleted); `compileall` clean;
+  `git diff --check` clean. Renderer and checked-in
+  `adapters/claude-code/PROTOCOL.md` stay byte-identical (existing U-C3
+  parity test now also covers the envelope section); codex/gemini/generic
+  adapters unchanged.
+
 # DECISIONS — Agentic OS v0.2 U-C4 Windows read-only export run
 
 This section continues the `D-v0.2.*` series for the U-C4 pass executed per
