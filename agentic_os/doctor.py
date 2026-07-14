@@ -36,27 +36,10 @@ from pathlib import Path
 from . import db, ids, obsidian, secretscan, utils
 from .models import AGENT_KINDS, AGENT_NAME_RE, TASK_STATUSES
 
-_WIKILINK = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
-
-# Note stems are filesystem-derived input; \Z anchors, never $ (D-v0.2.3) —
-# a newline-bearing filename must not pass the containment check.
-_NOTE_PATTERNS = {
-    "Tasks": re.compile(r"^T-[0-9]{4,}\Z"),
-    "Runs": re.compile(r"^R-[0-9]{4,}\Z"),
-    "Decisions": re.compile(r"^D-[0-9]{4,}\Z"),
-    "Evidence": re.compile(r"^E-[0-9]{4,}\Z"),
-    "Handoffs": re.compile(r"^H-[0-9]{4,}\Z"),
-    "Memory": re.compile(r"^M-[0-9]{4,}\Z"),
-    "Projects": re.compile(r"^[a-z0-9][a-z0-9._-]*\Z", re.ASCII),
-    # Daily YYYY-MM-DD · weekly YYYY-Www · per-project project-<slug>.
-    "Reviews": re.compile(
-        r"^([0-9]{4}-[0-9]{2}-[0-9]{2}"
-        r"|[0-9]{4}-W[0-9]{2}"
-        r"|project-[a-z0-9][a-z0-9._-]*)\Z",
-        re.ASCII,
-    ),
-    "Agents": re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z", re.ASCII),
-}
+# Shared generated-layout rules live in obsidian.py (public, also consumed
+# by the U-C4 mirror export); these aliases keep doctor's historical names.
+_WIKILINK = obsidian.WIKILINK_RE
+_NOTE_PATTERNS = obsidian.NOTE_STEM_PATTERNS
 
 
 @dataclass
@@ -290,11 +273,9 @@ def _frontmatter_problem(text: str) -> str | None:
 
 
 def _is_hidden(path: Path, base: Path) -> bool:
-    """True when any component below `base` starts with '.' (e.g. the
-    .obsidian folder Obsidian creates at the vault root)."""
-    return any(
-        part.startswith(".") for part in path.relative_to(base).parts
-    )
+    """Shared rule (obsidian.is_hidden_rel, D-P5.2) under doctor's
+    historical name."""
+    return obsidian.is_hidden_rel(path, base)
 
 
 def run_checks(conn: sqlite3.Connection, aos_dir: Path) -> list[Check]:
@@ -387,19 +368,7 @@ def run_checks(conn: sqlite3.Connection, aos_dir: Path) -> list[Check]:
                 strays.append(path.relative_to(vault).as_posix())
                 continue
             rel = path.relative_to(aos_root)
-            allowed_top_level = ("Home.md", "CONVENTIONS.md") + tuple(
-                f"{name}.md" for name in obsidian.INDEX_NOTES
-            )
-            if rel.as_posix() in allowed_top_level:
-                continue
-            pattern = (
-                _NOTE_PATTERNS.get(rel.parts[0]) if len(rel.parts) == 2 else None
-            )
-            if (
-                pattern is None
-                or path.suffix != ".md"
-                or not pattern.match(path.stem)
-            ):
+            if not obsidian.recognized_note_rel(rel):
                 strays.append(rel.as_posix())
     checks.append(
         Check(

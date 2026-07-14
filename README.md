@@ -204,6 +204,91 @@ drop at any time, and rebuilt automatically whenever it is stale (its
 watermark is the last events id it indexed). Semantics differ slightly: FTS5
 matches whole words; the fallback matches substrings.
 
+## Windows / Obsidian export (one-way)
+
+`sync --export-to` projects the generated mirror beneath a directory of your
+choice — typically a Windows path mounted under WSL — as a read-only copy:
+
+```bash
+python aos.py sync --export-to "/mnt/c/Users/you/Vaults/AOS Mirror" --dry-run
+python aos.py sync --export-to "/mnt/c/Users/you/Vaults/AOS Mirror"
+```
+
+- Open **PATH as the Obsidian vault root**, never `PATH/AOS` — your
+  `.obsidian/` settings and any other files beside `AOS/` are never touched.
+- `PATH/AOS` is fully owned by the export: it always holds one complete
+  generation, replaced wholesale via a validated staging directory
+  (`PATH/.aos-export-staging`) and atomic renames. Ownership is proven by
+  the reserved empty marker directory `PATH/AOS/.aos-export-owned` (don't
+  delete it); a tree without it — or content inside `AOS` that the export
+  didn't generate, hidden files and hardlinked aliases included — refuses
+  the export instead of being deleted.
+- The plan is computed from a fresh destination scan, and the destination
+  must still match it at swap time: any mid-export change to `PATH/AOS`
+  content or structure (files, bytes, sizes, directories, the ownership
+  marker, or the directories' identities) makes the run refuse with
+  "destination changed during export" rather than sweep the change away —
+  rerun to get a fresh plan. Metadata-only changes (permissions,
+  timestamps) are not part of the comparison.
+- Strictly one-way: edits made on the Windows side are never ingested; the
+  next export overwrites them. The ledger stays the only authority.
+- Copy-if-changed: an identical source performs zero writes, and unchanged
+  notes keep their identity via hardlinks where the destination filesystem
+  supports them (DrvFS does not — there a changed export recopies the tree).
+- Contained: destinations resolving into the live workspace, its database,
+  the source mirror, or the enclosing repository are refused — as are
+  symlinked `AOS` directories and traversal-escaping paths. The apply
+  additionally pins PATH by descriptor identity before its first write and
+  performs every rename, fsync, cleanup, and pre-swap verification read
+  relative to that descriptor, so a concurrently replaced PATH (or staging
+  directory) refuses instead of receiving a single write.
+- Verified twice: the staged generation is validated in full and then
+  re-verified — bytes, file/directory sets, sentinel, and hardlink
+  relationships — against an immutable snapshot immediately before the
+  swap, in freshest-last order (source first, destination next, the
+  complete staging rescan and hash last, right before the renames); state
+  probes treat an inspection error (EIO, EACCES) as a refusal, never as
+  "absent". The staging build reads its source bytes only through a
+  pinned source-root descriptor with per-file identity proofs — a swapped
+  source directory or file refuses instead of redirecting the copy.
+- Mount boundaries: a mounted or cross-device subtree inside `PATH/AOS`,
+  the staging directory, or the source mirror refuses the export, and
+  cleanup never recurses a delete across one — the cleanup root itself is
+  checked for device and mount transitions before anything beneath it is
+  touched. Caveat: a bind mount of the *same* filesystem is
+  indistinguishable from a plain directory with standard-library checks,
+  so only cross-device mounts are detected.
+- Cleanup is quarantine-based and identity-proven: a staging or
+  previous-generation tree is deleted only after its pinned descriptor
+  identity matches what this run created or moved aside; the tree is
+  atomically moved to a reserved private `PATH/.aos-export-cleanup-*`
+  name, every entry inside it is atomically moved to a
+  `.aos-export-cleanup-*` name within its own directory (nested inside
+  the quarantined tree), and each is re-proven before its deletion — no
+  meaningful name is ever deleted without an identity proof, and a
+  substituted entry is retained (restored where possible) and reported.
+  A leftover cleanup name from an interrupted run refuses the next export
+  until inspected. Honest limits: POSIX cannot make deletion conditional
+  on identity, so a racer hitting a just-verified single-use private name
+  in the microseconds before its unlink/rmdir is outside the guarantee;
+  and POSIX rename overwrites a type-compatible entry, so one raced onto
+  a quarantine or restore target name inside the probe-to-rename
+  microseconds (an empty directory for a directory move; a regular file
+  or symlink for a file move — for restores that target is the entry's
+  public name) is also outside it. The contract documents both windows;
+  no stronger claim is made.
+- Dry run previews every file create/update/delete with byte totals AND
+  every directory create/delete (`create-dir Reviews/`), performs no
+  destination mutation of any kind, and summarizes files and directories
+  separately.
+- The apply report counts what actually happened: created, updated,
+  deleted, unchanged (split into hardlinked vs copied), and the payload
+  bytes actually written — a hardlinked unchanged note costs zero bytes,
+  a fallback-copied one counts in full.
+
+Refusal messages, interrupted-export recovery, and DrvFS specifics are
+documented in `TROUBLESHOOTING.md`.
+
 ## Layout
 
 `python aos.py init` creates, under the current directory:

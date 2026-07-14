@@ -7,8 +7,9 @@ writes outside it and never deletes or renames.
 
 from __future__ import annotations
 
+import re
 import sqlite3
-from pathlib import Path
+from pathlib import Path, PurePath
 
 from . import ids, render, utils
 from .models import (
@@ -103,6 +104,61 @@ def _home_counts(conn: sqlite3.Connection) -> dict:
 
 #: Top-level generated index notes (filename stems double as wikilinks).
 INDEX_NOTES = tuple(name for name, _ in render.INDEX_NOTE_DESCRIPTIONS)
+
+
+# ---------------------------------------------------------------------------
+# Shared generated-layout rules. Public: consumed by doctor's containment
+# checks and by the U-C4 mirror export's adoption/provenance gates — the
+# single definition of "a file sync itself generates".
+
+#: Generated wikilink shape ([[stem]] with optional |alias / #heading).
+WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
+
+#: Note stems are filesystem-derived input; \Z anchors, never $ (D-v0.2.3) —
+#: a newline-bearing filename must not pass the containment check.
+NOTE_STEM_PATTERNS = {
+    "Tasks": re.compile(r"^T-[0-9]{4,}\Z"),
+    "Runs": re.compile(r"^R-[0-9]{4,}\Z"),
+    "Decisions": re.compile(r"^D-[0-9]{4,}\Z"),
+    "Evidence": re.compile(r"^E-[0-9]{4,}\Z"),
+    "Handoffs": re.compile(r"^H-[0-9]{4,}\Z"),
+    "Memory": re.compile(r"^M-[0-9]{4,}\Z"),
+    "Projects": re.compile(r"^[a-z0-9][a-z0-9._-]*\Z", re.ASCII),
+    # Daily YYYY-MM-DD · weekly YYYY-Www · per-project project-<slug>.
+    "Reviews": re.compile(
+        r"^([0-9]{4}-[0-9]{2}-[0-9]{2}"
+        r"|[0-9]{4}-W[0-9]{2}"
+        r"|project-[a-z0-9][a-z0-9._-]*)\Z",
+        re.ASCII,
+    ),
+    "Agents": re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z", re.ASCII),
+}
+
+
+def is_hidden_rel(path: Path, base: Path) -> bool:
+    """True when any component of `path` below `base` starts with '.'
+    (e.g. the .obsidian folder Obsidian creates at the vault root).
+    Hidden entries are the user's, not sync's (D-P5.2)."""
+    return any(part.startswith(".") for part in path.relative_to(base).parts)
+
+
+def recognized_note_rel(rel: PurePath) -> bool:
+    """True when `rel` (relative to the AOS/ mirror root) names a note that
+    sync itself generates: a fixed top-level note, or <EntityDir>/<stem>.md
+    with that entity's stem shape."""
+    if len(rel.parts) == 1:
+        allowed = ("Home.md", "CONVENTIONS.md") + tuple(
+            f"{name}.md" for name in INDEX_NOTES
+        )
+        return rel.parts[0] in allowed
+    if len(rel.parts) == 2:
+        pattern = NOTE_STEM_PATTERNS.get(rel.parts[0])
+        return (
+            pattern is not None
+            and rel.suffix == ".md"
+            and pattern.match(rel.stem) is not None
+        )
+    return False
 
 
 def _index_note_contents(conn: sqlite3.Connection, aos_root: Path) -> dict[str, str]:
