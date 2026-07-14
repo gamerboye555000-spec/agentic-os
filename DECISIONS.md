@@ -1,3 +1,429 @@
+# DECISIONS — Agentic OS v0.2 U-C4 Windows read-only export run
+
+This section continues the `D-v0.2.*` series for the U-C4 pass executed per
+`agentic-os-v0.2-u-c4-windows-export-contract.md` on branch
+`v0.2-u-c4-windows-export` (2026-07-13). Prepended per the established
+precedent (D-W0.4, reaffirmed in D-v0.2.7); everything below stays
+byte-identical.
+
+## D-v0.2 decisions (U-C4)
+
+- **D-v0.2.27 — U-C4 sixth corrective pass (rollback identity guard R1,
+  2026-07-14).** A sixth review confirmed one remaining defect of the
+  fourth/fifth passes' own class: the rollback rename (`PREV → AOS`) —
+  reached when the post-move-aside fsync or the promotion rename
+  fails — renamed whatever sat at the previous name onto the
+  AUTHORITATIVE name with no identity proof, although the run already
+  held the PREV identity pinned right after the move-aside. A racer
+  substituting PREV inside the promotion window therefore had its
+  never-validated tree promoted to `PATH/AOS`, the validated staging
+  was then discarded, and the failure reported "the previous
+  generation was restored and the destination is unchanged" — false on
+  every count (witnessed on the production path before the fix).
+  Corrected minimally (R1): both rollback sites pass the pinned PREV
+  identity, and the rollback rename runs only after a fresh
+  fd-relative lstat of the previous name proves exactly that identity
+  (the held PREV descriptor keeps the inode alive, so the proof cannot
+  be forged by inode recycling). A never-pinned, uninspectable (only
+  ENOENT reads as absence, per F4), or replaced PREV refuses the
+  rollback: the entry is retained untouched, the complete staged
+  generation is kept, and the export strands with the exact live state
+  and shell-quoted `mv` recovery commands; a vanished PREV strands
+  without instructing inspection of a nonexistent tree. Residue,
+  stated honestly: the guard-lstat-to-rename gap is the same
+  irreducible window as the move-aside guard's. Two regression tests
+  pin the mechanism, each written first and watched fail against the
+  unguarded rename (focused suite 213, full suite 603 green).
+
+- **D-v0.2.26 — U-C4 fifth corrective pass (race-condition corrections
+  Q1–Q5, 2026-07-14).** A fifth review confirmed five race-condition
+  defects in the uncommitted U-C4 code; all five are corrected without
+  widening scope, each pinned by regression tests proven to fail against
+  the surgically reverted mechanism (28 new tests; focused suite 211,
+  full suite 601 green). A multi-agent adversarial re-review of the
+  corrections then confirmed and closed five further defects in the new
+  code itself — an interior cleanup ENOENT masquerading as "staging
+  genuinely absent" (Python maps errno.ENOENT to FileNotFoundError at
+  construction, so absence is now signalled by a dedicated exception
+  raised only by the pre-mutation pin-open), a spurious removal WARN for
+  a PREV that had already vanished, a source-descriptor leak on the
+  os.fdopen failure path (a directory raced onto a note's name), a
+  RecursionError from a hostile deeply-nested tree escaping as an
+  exit-2 internal error that masked the original failure, and
+  replacement-retention messages omitting the exact retained quarantine
+  location — plus documentation overclaims (the rename-overwrite
+  residue also covers regular files, the staging-content window is per
+  file, child quarantine names nest inside their parent directory) and
+  test-soundness gaps (the file-level source device check was untested,
+  one alias assertion was tautological, hardlink skip guards were
+  unreachable). Where an earlier claim was too strong, it is narrowed
+  honestly rather than kept. Policies pinned:
+  (a) *Quarantine-based cleanup (Q1, amends C1).* The fourth pass still
+  deleted by NAME (lstat-classify then `unlink(name)`/`rmdir(name)`),
+  so a replacement raced in between classification and deletion was
+  deleted — that claim is retracted. Cleanup now never names a
+  meaningful entry for deletion: the identity-proven ROOT is ATOMICALLY
+  renamed to a fresh single-use private cleanup name at PATH level
+  (`PATH/.aos-export-cleanup-<pid>-<n>`); every CHILD is atomically
+  renamed to a `.aos-export-cleanup-<pid>-<n>` name INSIDE ITS OWN
+  parent directory (nested within the quarantined tree, never a direct
+  child of PATH); each captured entry is re-proven against the
+  inspected identity (roots against the HELD descriptor), a captured
+  mismatch is restored to its public name and the cleanup refuses, and
+  the final unlink/rmdir targets only the just-re-proven private name.
+  Failures restore the in-flight subtree and root toward their public
+  names (a failed intermediate restore is itself reported, never
+  silently discarded); only the initial pin-open's ENOENT reads as
+  "genuinely absent" (a dedicated exception type — errno mapping makes
+  an interior ENOENT a FileNotFoundError, which must surface as a
+  reported retention instead), a RecursionError from a hostile
+  deeply-nested tree becomes a reported retention rather than an
+  internal error, and a PREV that vanished before cleanup warns
+  accurately without instructing removal of a nonexistent tree. The
+  reserved PATH-level cleanup names join the mutation roots; a leftover
+  one (interrupted cleanup) is detected by a names-only listing of PATH
+  and refuses the next run in both modes. NARROWED GUARANTEE: stdlib
+  has no delete-by-descriptor and no no-replace rename, so an entry
+  raced onto a just-verified single-use PRIVATE name in the
+  pre-deletion syscall gap (for rmdir: only an empty directory), or a
+  TYPE-COMPATIBLE entry raced onto a probe-fresh quarantine/restore
+  target name before the rename (an empty directory for a directory
+  move; a regular file or symlink for a file move — on the restore path
+  that target is the entry's PUBLIC name), remains deletable — entries
+  at meaningful names outside those windows are never deleted without
+  an identity proof.
+  (b) *Descriptor-anchored copy source (Q2, amends C4).* The build's
+  payload copy opened an absolute source pathname (O_NOFOLLOW protects
+  only the final component; a swapped source entity directory could
+  redirect the read). The plan now records per-file source identities
+  and the source-root identity; the build pins the source root for its
+  complete run; every copy (creates, updates, unchanged fallback) opens
+  entity dirs O_DIRECTORY|O_NOFOLLOW relative to the pin, the basename
+  O_RDONLY|O_NOFOLLOW|O_NONBLOCK relative to the entity descriptor,
+  requires S_ISREG + samestat with the plan record, copies only from
+  the descriptor, and re-fstats after the copy. No absolute source open
+  remains in the copy path (regression-forbidden).
+  (c) *Final hardlink check without intermediate symlinks (Q3, amends
+  F3).* The live side of the final hardlink verification was probed via
+  "AOS/<rel>" under the destination descriptor — intermediate
+  components followed symlinks, so a moved entity directory plus a
+  symlink back to it passed samestat while retaining an external alias
+  into the promoted generation. The held aos_fd now flows into the
+  final verification; entity directories open O_DIRECTORY|O_NOFOLLOW
+  relative to it and must carry exactly the identity the pinned rescan
+  recorded; basenames are lstat'ed fd-relative; the live file must
+  samestat the staged link AND have st_nlink == 2. The staged-alias
+  tolerance probe is anchored the same way under the staging
+  descriptor.
+  (d) *Freshest-last final verification (Q4, amends F2).* A live
+  destination write through a staged hardlink could mutate staged bytes
+  after they were hashed while source verification still ran. Order is
+  now: fresh source scan+hash FIRST, complete destination recheck
+  second, complete staging rescan + content hash LAST (hardlink counts
+  and identities re-checked in that last scan), then only identity
+  lstats (structural guard, move-aside guard) and the renames — no
+  content is read or hashed after the final staging scan, and the
+  documented unobservable window is per file: from that file's read in
+  the final rescan to the renames.
+  (e) *Source mount containment (Q5).* Every source scan compares each
+  non-hidden entry's st_dev with the source root (plus the additive
+  mount probe for directories) and refuses mounted or cross-device
+  source subtrees before any copy or hash; the same-filesystem
+  bind-mount limitation of F6 applies unchanged.
+- **D-v0.2.25 — U-C4 fourth corrective pass (reliability corrections
+  C1–C6, 2026-07-14).** A fourth review confirmed six implementation
+  defects in the uncommitted U-C4 code; all six are corrected without
+  widening scope, each pinned by deterministic regression tests (31 new
+  tests; full suite 570 green). Policies pinned:
+  (a) *Identity-safe cleanup (C1).* Recursive STG/PREV cleanup runs
+  through `_rmtree_pinned`: pin the root `O_RDONLY|O_DIRECTORY|
+  O_NOFOLLOW` relative to the pinned PATH descriptor → prove the pinned
+  identity equals the identity THIS run recorded (staging at creation;
+  PREV pinned by an open descriptor taken immediately after the
+  AOS→PREV rename, chained to the verified AOS root identity) → apply
+  the C3 containment checks → delete children bottom-up with
+  descriptor-relative operations only → re-check the named root before
+  the final `os.rmdir`. `shutil.rmtree` is never used on STG or PREV,
+  and the mutable root pathname is never reopened for deletion. The
+  identity chain is descriptor-pinned end to end: staging (held from
+  creation across every discard path), the verified AOS root (pinned at
+  the recheck BEFORE its content rescan and held through promotion —
+  the move-aside guard and the PREV proof compare against this held
+  descriptor), and PREV (pinned immediately after the move-aside, held
+  until cleanup). An open descriptor keeps the inode alive, so a freed
+  inode number cannot be recycled into a foreign directory and defeat a
+  samestat proof (observed live on tmpfs during this pass — tests and
+  an adversarial reproduction caught recorded-stat versions deleting a
+  substituted tree; both closed by the held-descriptor chain). Any root
+  whose identity cannot be proven is retained byte-for-byte and
+  reported (exit-0 WARN for PREV after successful promotion).
+  (b) *Pinned hardlink source (C2).* Unchanged-file reuse links through
+  the descriptor chain PATH-fd → AOS fd → entity fd (each
+  O_DIRECTORY|O_NOFOLLOW), requires the source to be a regular file
+  whose identity equals the plan-time record (`ExportPlan.
+  base_identity`), calls `os.link(src, dst, src_dir_fd=…, dst_dir_fd=…,
+  follow_symlinks=False)`, and verifies the staged link's type AND
+  identity afterwards. `target.dest_aos / rel` is forbidden as a link
+  source; a replacement PATH never has a link count changed.
+  (c) *Cleanup-root containment (C3).* Before any deletion the pinned
+  cleanup root must sit on the pinned destination's device, must not be
+  a mount point (additive probe), and every descendant is swept for
+  device/mount transitions through the pinned descriptor; a rejected
+  root is retained with nothing beneath it modified. Same-filesystem
+  bind mounts stay a documented stdlib limitation.
+  (d) *Vetted reads (C4).* One shared reader (`_read_vetted_file`)
+  performs every enforcement-critical read: descriptor-relative
+  O_RDONLY|O_NOFOLLOW|O_NONBLOCK open, fstat of the opened descriptor,
+  S_ISREG required, samestat against the inspected identity when
+  provided, pre- and post-read fstat with identity/size stability, and
+  actionable AosError refusals. Used for plan comparison, base-snapshot
+  hashing, source scanning/hashing, and final source verification;
+  `Path.read_bytes` is regression-forbidden for these. The build's
+  payload-copy source open carries the same O_NOFOLLOW|O_NONBLOCK +
+  S_ISREG vetting (a FIFO raced into a source note cannot block the
+  copy), and the protected-root existence probe fails closed (an
+  uninspectable candidate stays protected; EACCES/EIO surface as exit-1
+  refusals, never exit-2 internal errors; an ELOOP no longer silently
+  drops repository protection) — both found by this pass's adversarial
+  review.
+  (e) *Actual execution statistics (C5).* `apply_plan` returns a frozen
+  `ApplyResult` (created/updated/deleted/unchanged, hardlinked vs
+  fallback-copied unchanged, `payload_bytes_written`, `cleanup_warning`)
+  measured during execution — copies report the fstat'ed size of the
+  flushed staged file, hardlinks contribute zero bytes, fallback copies
+  count in full; the CLI prints exclusively from it.
+  (f) *Directory-visible dry-run (C6).* `ExportPlan.dir_creates` /
+  `dir_deletes` are deterministic sorted differences; dry-run prints
+  `create-dir REL/` / `delete-dir REL/` lines and a summary that counts
+  files and directories separately, so a directory-only plan never
+  shows zero visible operations.
+- **D-v0.2.24 — U-C4 third corrective pass (filesystem-consistency
+  findings F1–F6).** A third review confirmed six local
+  filesystem-consistency issues in the uncommitted U-C4 implementation;
+  all six are fixed without widening scope, each with regression tests
+  proven to fail against the uncorrected mechanism. An adversarial
+  multi-lens re-review of the fix itself then confirmed a further round
+  of pathname/descriptor divergences and untested clauses; those are
+  folded in below and each is pinned by a mutation-verified test.
+  Policies pinned:
+  (a) *Pinned destination descriptor (F1).* Before its first mutation the
+  apply opens PATH `O_RDONLY|O_DIRECTORY|O_NOFOLLOW` (where available),
+  fstats it, and requires identity equality with the destination identity
+  recorded in the plan; the descriptor stays open for the COMPLETE apply.
+  Staging is created and opened (O_NOFOLLOW) relative to it, every
+  AOS/STG/PREV rename passes `src_dir_fd`/`dst_dir_fd`, every PATH-level
+  durability fsync syncs the pinned descriptor itself, STG/PREV cleanup
+  deletes fd-relative, and the enforcement rescans of destination and
+  staging content walk and read descriptor-anchored (`os.fwalk` with
+  `dir_fd`; per-file O_NOFOLLOW+O_NONBLOCK opens with an fstat samestat
+  against the vetted lstat). After the pin, PATH-derived pathnames are
+  consulted only to verify the pathname still reaches the pinned
+  directory, to re-derive containment refusals, and for an additive
+  best-effort mount probe — never for a mutation, an enforcement read,
+  or a cleanup. Staging is discarded only after a samestat identity
+  proof against the pinned staging descriptor; anything else at the
+  staging name is RETAINED and reported. A replaced PATH, or a staging
+  entry swapped between mkdir and open, refuses before any generated
+  entry can appear outside the originally approved destination.
+  (b) *Complete staged-generation re-verification (F2).* Validation
+  returns an immutable `StagingSnapshot` (root identity, sentinel state,
+  directory set, file set with sizes, length-framed content hash, entry
+  types enforced by the scan, recorded hardlink relationships).
+  Immediately before promotion — after the destination recheck — the
+  ENTIRE staging generation is rescanned through the pinned staging
+  descriptor and must equal the snapshot and a fresh source scan exactly;
+  any stable post-validation change (bytes, file or directory add/remove,
+  sentinel, symlink or special entry, root identity, hardlink
+  relationship) refuses. The verification ends with a structural
+  destination guard (PATH pathname identity, AOS root identity, PREV
+  absence), so the unobservable interval for staging content and
+  destination structure begins after it returns and ends at the
+  promotion rename. Precisely stated limits: a destination CONTENT
+  change during the staging verification itself is within the accepted
+  window (the full content recheck runs immediately before it), and
+  metadata-only destination changes (permissions, timestamps) are never
+  part of the base snapshot.
+  (c) *Constrained staged hardlinks (F3).* The build RECORDS which
+  unchanged rels it intentionally hardlinked (with the staged link's
+  device/inode identity); ownership is never inferred from link count.
+  Validation and the final verification require st_nlink == 1 for every
+  created, updated, or copied-unchanged staged file, and for every
+  recorded link exactly st_nlink == 2 with the recorded identity — plus,
+  at the final verification, `os.path.samestat` against the corresponding
+  CURRENT AOS file. Any extra link, wrong identity, or missing expected
+  source refuses; the pre-promotion destination rescan tolerates the
+  staged alias only for rels the build recorded.
+  (d) *Inspection errors are errors (F4).* One explicit `_lstat_or_absent`
+  helper replaces `os.path.lexists` for the initial STG/PREV stale checks,
+  the mutation-root probes, and the final PREV/STG verification:
+  FileNotFoundError means absent; every other OSError (EIO, EACCES,
+  EPERM, ...) produces an actionable refusal naming the path and cause.
+  An uninspectable STG at the final recheck is additionally RETAINED —
+  it is no longer provably ours.
+  (e) *Sentinel durability (F5).* The ownership-sentinel directory is
+  opened O_NOFOLLOW relative to the pinned staging descriptor and fsynced
+  under the existing directory-fsync errno policy. Durability order:
+  staged file writes (flush+fsync) → staging root → sentinel → entity
+  directories → the PATH-level rename fsyncs.
+  (f) *Mount containment (F6).* Mounted or cross-device subtrees inside
+  AOS or STG refuse before adoption, validation, or promotion (per-entry
+  st_dev vs the root device, plus `os.path.ismount` for directories; the
+  AOS root itself must sit on PATH's filesystem), and every recursive
+  STG/PREV cleanup sweeps for mount boundaries first — never inspected
+  means never deleted. The sweep is descriptor-anchored (`os.fwalk` with
+  `dir_fd`), so it inspects exactly the tree the fd-relative delete
+  would recurse into; the pathname `os.path.ismount` probe is
+  additive-only (its errors read as "no extra evidence", never as
+  clearance). Documented limitation, stated wherever the claim
+  appears: a bind mount of the SAME filesystem has the same st_dev and is
+  invisible to `os.path.ismount`, so the standard library cannot
+  distinguish it from a plain directory; cross-device mounts are the
+  enforced class.
+- **D-v0.2.23 — U-C4 post-review hardening.** Independent review of the
+  D-v0.2.22 implementation confirmed four blockers and five hardening
+  gaps; all nine are fixed without widening U-C4 scope. Policies pinned:
+  (a) *Fresh plan + destination base snapshot.* check_destination's
+  adoption inspection stays the refusal-first gate before any local work,
+  but the plan is computed from a FRESH destination scan taken after the
+  mirror regenerates (dry-run prints from that fresh state), and
+  `ExportPlan` records an exact base snapshot — AOS existence and
+  directory identity, directory set, file set with sizes, sentinel
+  presence, and a length-framed content hash (relpath + NUL + length +
+  NUL + bytes per file, sha256). The pre-promotion recheck rescans and
+  requires an exact match; any addition, deletion, content edit,
+  directory change, root replacement, or identity change exits 1 with
+  "Refusing to export: destination changed during export; rerun to
+  compute a fresh plan." — a late destination file can no longer be
+  silently swept by the whole-tree swap (the rerun's fresh plan SEES it
+  as an explicit, previewable delete).
+  (b) *Ownership sentinel.* Recognized filename shape is NOT proof of
+  ownership (a human `Home.md` or `Tasks/T-9999.md` is not ours to
+  delete). `PATH/AOS/.aos-export-owned` — one exact reserved EMPTY
+  internal directory, invisible to file-based tree hashes — is created in
+  staging, required by validation, preserved through promotion, excluded
+  from note counts and comparisons, and demanded on every repeat export.
+  First exports adopt only an absent or genuinely empty AOS; a nonempty
+  AOS without the exact sentinel, any content inside it, or any other
+  hidden entry refuses.
+  (c) *Lexical workspace derivation.* The live workspace and the upward
+  `.git` search derive from `aos_dir.parent.resolve()` (lexical parent,
+  then resolve), never `aos_dir.resolve().parent`: with `repo/.agentic-os`
+  symlinked elsewhere the latter protected only the link target's parent
+  and permitted `repo/AOS` as an export root. The `.agentic-os` target,
+  database parent, vault, and source mirror stay independently resolved
+  and protected.
+  (d) *Complete final recheck with a pinned staging identity.* The
+  recheck re-lstats AOS, STG, and PREV (symlinks refuse for all three),
+  confirms `PATH` identity, requires PREV absent, repeats containment,
+  and holds AOS to the base snapshot — never resolve-and-accept of a
+  replacement real directory. STG must be the same real directory this
+  run created, verified via an O_DIRECTORY descriptor held open since
+  mkdir: the open descriptor pins the inode, closing the rmtree+mkdir
+  inode-reuse hole that defeats a samestat-only check. The STG check runs
+  first — staging is only discarded while provably ours; a removed or
+  replaced STG is RETAINED with instructions. The post-recheck/pre-rename
+  interval remains the only accepted TOCTOU exclusion.
+  (e) *Rollback durability.* `rename(PREV, AOS)` is followed by a PATH
+  fsync. If the rollback fsync fails, no durable-restoration claim is
+  made and the complete staging tree is NOT discarded: the error reports
+  the exact live state (AOS = previous generation, new generation at STG)
+  and the possible post-crash state (AOS missing, previous generation at
+  PREV — the existing drill row).
+  (f) *Reported staging cleanup.* No `ignore_errors=True`: a failed
+  staging cleanup appends "staging … could not be removed …; remove it
+  before rerunning" to the original error instead of masking either.
+  (g) *Shell-quoted recovery commands.* Every emitted `mv` recovery path
+  goes through `shlex.quote` (destination paths routinely contain
+  spaces).
+  (h) *Hardlink-alias refusal.* Adopted regular destination files must
+  have link count 1 — an alias means the bytes are shared with something
+  outside AOS, which full ownership cannot claim (and staging's own
+  `os.link` reuse would propagate the alias into every future
+  generation). During the pre-promotion rescan exactly one extra link per
+  file is tolerated: this run's own staged hardlink, verified by
+  samestat against the staged path.
+  (i) *lstat-typed staging validation.* Every staged entry is lstat'ed;
+  only real directories and regular files pass — staged symlinks (even to
+  byte-identical content) and special files refuse before any content
+  read (a FIFO must not hang validation).
+  (j) *Descriptor-anchored staging build (self-review addendum).* An
+  adversarial re-review found one build-phase escape the post-build
+  recheck could not catch: a same-user racer swapping a just-created,
+  still-empty staging entity directory for a symlink, so the subsequent
+  O_EXCL note writes land outside AOS/STG/PREV. Closed by building every
+  file through pinned directory descriptors — entity dirs created relative
+  to the pinned STG-root fd and reopened O_NOFOLLOW; files created relative
+  to those fds (O_CREAT|O_EXCL, `os.link` with `dst_dir_fd`) — so a raced
+  symlink swap is refused (ELOOP/EEXIST), never followed. The same review
+  also collapsed the plan's destination reads to one per file (the bytes
+  feed both change-detection and the base-snapshot hash) and corrected the
+  contract's tree-hash formula to record the length framing the code
+  already used.
+- **D-v0.2.22 — U-C4 implementation policies.** Baseline gate: branch
+  `v0.2-u-c4-windows-export`, HEAD `70aac05`, clean tree, 390 tests OK.
+  `aos sync --export-to PATH [--dry-run]` lands in
+  `agentic_os/mirror_export.py`; policies pinned during implementation:
+  (a) *Whole-tree generation swap, never per-file live replacement.* The
+  destination `PATH/AOS` always holds one complete generation: the next
+  generation is built and validated in `PATH/.aos-export-staging`, the
+  current one moves aside to `PATH/.aos-export-previous`, staging is
+  renamed in, and PREV is removed only after durability is confirmed.
+  A failed promotion rolls back to PREV; a failed rollback leaves both
+  complete generations with exact `mv` recovery commands. Per-file
+  replacement of a live tree was REJECTED: an interruption would leave a
+  mixed-generation mirror, which the contract forbids outright. The
+  update path has a two-rename window with no `PATH/AOS`; the first
+  export is a single atomic rename.
+  (b) *Full ownership of `PATH/AOS`.* Nothing inside it is preserved —
+  adoption refuses any hidden, symlinked, non-regular, or unrecognized
+  entry (the doctor note-recognizer doubles as the provenance test, and
+  the export refuses to ship anything the recognizer would not
+  re-accept). Preservation applies only outside the three mutation roots;
+  docs direct Obsidian at PATH as the vault root, never PATH/AOS.
+  (c) *Copy-if-changed.* An identical source (file set, bytes, dir set)
+  performs zero mutation — no staging, no rename, no write. Changed
+  exports hardlink unchanged destination files into staging and copy only
+  changed/new files; `os.link` falls back to copying ONLY on the
+  recognized unsupported-link errnos {EPERM, EACCES, EOPNOTSUPP/ENOTSUP,
+  ENOSYS, EXDEV, EMLINK} — any other errno (EIO, …) aborts with the old
+  generation intact. Change detection is size-then-byte, never mtime.
+  (d) *Existence-aware mutation-root containment.* Only the three
+  mutation roots are checked (PATH may be an ancestor of the repository):
+  PATH resolves strictly first; each root, when present, is lstat'ed
+  (symlink ⇒ refusal) and strictly resolved, and when absent its
+  candidate is the resolved parent plus the fixed child name. Overlap
+  with the independently resolved protected set (workspace, .agentic-os,
+  db parent, vault, source mirror, enclosing git root — a `.git` file
+  counts, for worktrees) uses normalized equal/inside/contains always
+  plus `os.path.samestat` whenever both sides exist; the checks repeat
+  immediately before promotion.
+  (e) *Durability.* Staged copied files are flushed+fsynced; staged
+  directories and PATH (after each rename and after PREV cleanup) are
+  fsynced with directory-fsync failures skipped ONLY for {EINVAL,
+  ENOTSUP/EOPNOTSUPP, ENOSYS} (9P/DrvFS reject directory fsync); any
+  other errno is fatal and lands in the documented recovery state for
+  that phase. File-fsync failures are always fatal.
+  (f) *Stale state refuses in dry-run too.* Existing staging or previous
+  directories mean an interrupted or concurrent export — both modes exit
+  1 with the recovery instructions and compute no plan; nothing is ever
+  auto-cleaned (it could be a live run's staging or the only last-good
+  copy).
+  (g) *Windows representability, deterministic on all platforms.*
+  Refusals for reserved device stems, illegal characters, control
+  characters, trailing dot/space, source casefold collisions (mixed-case
+  agent names are the only generated source), and components above 255
+  UTF-16 code units — the accurate NTFS limit; no invented total-path
+  limit, and source-side POSIX limits surface as the real OS error.
+  (h) *Boundaries.* The export is EVENTLESS (extends D-P0.6/D-W7.1);
+  nonexistent PATH refuses (typo protection); `sync --export-to`
+  regenerates the local mirror first in both modes — dry-run purity
+  protects the destination only.
+  (i) *Shared rules extraction.* The note-recognizer, hidden-entry rule,
+  and wikilink regex moved from doctor privates to public
+  `obsidian.recognized_note_rel` / `obsidian.is_hidden_rel` /
+  `obsidian.WIKILINK_RE` (doctor keeps thin aliases), so doctor and the
+  export consume one definition of "a file sync generates".
+
 # DECISIONS — Agentic OS v0.2 U-C3 secret warn-on-write run
 
 This section continues the `D-v0.2.*` series for the U-C3 pass executed per

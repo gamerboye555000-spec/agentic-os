@@ -698,10 +698,101 @@ def cmd_backup_restore(args) -> int:
 
 
 def cmd_sync(args) -> int:
+    export_to = getattr(args, "export_to", None)
+    if getattr(args, "dry_run", False) and export_to is None:
+        raise AosError("--dry-run requires --export-to. See: python aos.py --help")
     with _ledger(args) as (aos_dir, conn):
+        if export_to is not None:
+            from . import mirror_export
+
+            # Refusals fire before any local work; stale destination state
+            # refuses in dry-run too (no plan against an ambiguous
+            # authoritative generation).
+            target = mirror_export.check_destination(aos_dir, export_to)
         total, written = obsidian.sync_vault(conn, aos_dir)
         print(f"Synced {total} notes ({written} written, {total - written} unchanged).")
+        if export_to is None:
+            return 0
+        plan = mirror_export.compute_plan(aos_dir, target)
+        if args.dry_run:
+            _print_export_dry_run(plan)
+        else:
+            _apply_export(plan)
     return 0
+
+
+def _export_byte_totals(plan) -> tuple[int, int, int]:
+    return (
+        sum(size for _, size in plan.creates),
+        sum(size for _, size in plan.updates),
+        sum(size for _, size in plan.deletes),
+    )
+
+
+def _count(n: int, noun: str) -> str:
+    return f"{n} {noun}{'' if n == 1 else 's'}"
+
+
+def _print_export_dry_run(plan) -> None:
+    print(f"Export destination: {plan.target.dest_aos}")
+    if plan.is_noop:
+        print(
+            f"Dry run: destination already matches the source "
+            f"({plan.note_total} notes); nothing to do."
+        )
+        return
+    # Deterministic order: file operations by verb (each list is sorted
+    # by relpath), then directory operations (sorted). A directory-only
+    # plan is non-noop, so it always shows its create-dir/delete-dir
+    # lines — never zero visible operations.
+    for verb, entries in (
+        ("create", plan.creates),
+        ("update", plan.updates),
+        ("delete", plan.deletes),
+    ):
+        for rel, size in entries:
+            print(f"{verb} {rel} ({size} bytes)")
+    for rel in plan.dir_creates:
+        print(f"create-dir {rel}/")
+    for rel in plan.dir_deletes:
+        print(f"delete-dir {rel}/")
+    create_bytes, update_bytes, delete_bytes = _export_byte_totals(plan)
+    print(
+        f"Dry run: {_count(len(plan.creates), 'file create')} "
+        f"({create_bytes} bytes), "
+        f"{_count(len(plan.updates), 'file update')} "
+        f"({update_bytes} bytes), "
+        f"{_count(len(plan.deletes), 'file delete')} "
+        f"({delete_bytes} bytes), "
+        f"{_count(len(plan.dir_creates), 'directory create')}, "
+        f"{_count(len(plan.dir_deletes), 'directory delete')}, "
+        f"{_count(len(plan.unchanged), 'unchanged file')}. "
+        "Nothing was written."
+    )
+
+
+def _apply_export(plan) -> None:
+    from . import mirror_export
+
+    if plan.is_noop:
+        print(
+            f"Destination {plan.target.dest_aos} already matches the source "
+            f"({plan.note_total} notes); nothing written."
+        )
+        return
+    result = mirror_export.apply_plan(plan)
+    print(
+        f"Exported to {plan.target.dest_aos}: "
+        f"{result.created_files} created, "
+        f"{result.updated_files} updated, "
+        f"{result.deleted_files} deleted, "
+        f"{result.unchanged_files} unchanged "
+        f"({result.unchanged_hardlinked_files} hardlinked, "
+        f"{result.unchanged_fallback_copied_files} copied) "
+        f"({result.payload_bytes_written} bytes written)."
+    )
+    if result.cleanup_warning is not None:
+        print(result.cleanup_warning, file=sys.stderr)
 
 
 def cmd_doctor(args) -> int:
@@ -1050,6 +1141,18 @@ def build_parser() -> _Parser:
     p_backup_restore.set_defaults(func=cmd_backup_restore)
 
     p_sync = sub.add_parser("sync", help="regenerate the Obsidian mirror")
+    p_sync.add_argument(
+        "--export-to", metavar="PATH", default=None,
+        help="one-way export of the generated AOS/ mirror to PATH/AOS "
+        "(PATH is the Obsidian vault root; destination edits are never "
+        "ingested)",
+    )
+    p_sync.add_argument(
+        "--dry-run", action="store_true",
+        help="with --export-to: preview create/update/delete and byte "
+        "totals without touching the destination (the local mirror is "
+        "still regenerated — that is what sync means)",
+    )
     p_sync.set_defaults(func=cmd_sync)
 
     p_log = sub.add_parser("log", help="event journal")
