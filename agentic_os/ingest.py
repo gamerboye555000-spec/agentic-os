@@ -183,7 +183,9 @@ def secret_findings(doc: dict) -> list[str]:
     the ingest refusal below and the U-H1 hook's pre-staging scan, so both
     boundaries judge dropfile content with exactly the same posture."""
     findings = []
-    targets = [("summary", doc["summary"])]
+    # The agent name is scanned too: it is model-controlled and lands in
+    # hook diagnostics and the published dropfile filename (U-H1).
+    targets = [("agent", doc["agent"]), ("summary", doc["summary"])]
     for index, (kind, ref, claim) in enumerate(doc["evidence"], start=1):
         targets.append((f"evidence row {index} ref", ref))
         targets.append((f"evidence row {index} claim", claim))

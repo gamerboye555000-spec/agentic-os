@@ -113,17 +113,22 @@ Optional bridge: a Claude Code session can hand its write-back to the
 dropfile path without running the CLI. Two AOS-owned command hooks do it in
 two deterministic stages:
 
-- **Stop (capture):** when Claude's final response contains exactly one
+- **Stop (capture):** when Claude's final response ends with exactly one
   fenced ```` ```aos-dropfile ```` block — whose content is exactly the
   dropfile format above — the hook validates it with the same parser, size
   caps, and secret scanner as `ingest dropfile` and stages it under
   `.agentic-os/exports/hook-staging/`, bound to the session id and a sha256
   digest. At most one staged record per session; a later envelope replaces
-  it. No envelope, or a session outside an AOS workspace, is a silent no-op.
-  The hook never blocks Claude from stopping.
+  it, and a later envelope attempt that is refused (malformed, multiple,
+  unterminated, oversized, secret-shaped) invalidates it — a superseded
+  write-back is never published. No envelope at all, or a session outside
+  an AOS workspace, is a silent no-op. The hook never blocks Claude from
+  stopping.
 - **SessionEnd (publish):** the hook re-validates its own session's staged
   record and publishes at most one dropfile at a deterministic,
-  collision-safe name (`dropfile-<task>-<agent>-hook-<session8>-<sha12>.md`)
+  collision-safe name (`dropfile-<task>-<agent>-hook-<session8>-<sha12>.md`;
+  a task/agent component longer than 40 chars is replaced by a bounded
+  digest-tagged form so the name stays far below filesystem limits)
   under `.agentic-os/exports/`. Publication is atomic and idempotent — a
   retried SessionEnd never creates a duplicate. Refusals (tampered staging,
   secret-shaped content, name collisions) leave no partial file and retain

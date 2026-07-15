@@ -117,8 +117,12 @@ Current official schema only; no invented fields, no transcript parsing:
   malformed, or uninspectable staged record refuses with the record
   retained; only ENOENT reads as absence.
 - Publishes at most one dropfile at the deterministic, collision-safe name
-  `dropfile-<task>-<agent>-hook-<session8>-<sha12>.md`; the sha256 of the
-  published bytes is the dedupe identity (the same hash ingest journals).
+  `dropfile-<task>-<agent>-hook-<session8>-<sha12>.md`; a task/agent
+  component longer than 40 chars is replaced by a bounded, deterministic
+  digest-tagged form (prefix plus sha256 tag of the full value) so the
+  name stays far below filesystem NAME_MAX independently of
+  model-controlled field lengths; the sha256 of the published bytes is the
+  dedupe identity (the same hash ingest journals).
 - Publication is atomic (same-directory temp file + `os.link`, which never
   overwrites) and idempotent: a retry that finds identical published bytes
   succeeds without a duplicate; a different file at the name refuses.

@@ -5,24 +5,31 @@ Two deterministic stages carry an agent's write-back from a Claude Code
 session to the MANUAL dropfile ingest path — and no further:
 
 * The **Stop** handler reads the official hook JSON from stdin, looks for
-  exactly one fenced ``aos-dropfile`` envelope in ``last_assistant_message``
-  (the only session text it ever sees — transcripts are never opened), and
-  validates it with the SAME parser, size caps, and secret scanner the manual
-  ingest path uses (``ingest.parse_dropfile`` / ``MAX_DROPFILE_BYTES`` /
-  U-C3). A valid envelope is staged atomically — bound to the session id and
-  a sha256 content digest — under ``.agentic-os/exports/hook-staging/``.
-  At most one staged record exists per session; a later envelope in the same
-  session replaces it (the last envelope before the session ends wins).
-  No envelope, or a session outside any AOS workspace, is a clean exit-0
-  no-op. The handler NEVER blocks the stop: stdout stays empty in every
-  outcome (so no decision JSON can exist) and exit code 2 — the Stop-hook
-  blocking signal — is never used; refusals are exit 1 diagnostics.
+  exactly one fenced ``aos-dropfile`` envelope ENDING
+  ``last_assistant_message`` (the only session text it ever sees —
+  transcripts are never opened; matching is one linear pass, never a
+  backtracking scan), and validates it with the SAME parser, size caps, and
+  secret scanner the manual ingest path uses (``ingest.parse_dropfile`` /
+  ``MAX_DROPFILE_BYTES`` / U-C3). A valid envelope is staged atomically —
+  bound to the session id and a sha256 content digest — under
+  ``.agentic-os/exports/hook-staging/``. At most one staged record exists
+  per session; a later envelope in the same session replaces it, and a later
+  envelope ATTEMPT that is refused (multiple/incomplete/trailing fences,
+  malformed, oversized, secret-bearing, non-UTF-8) invalidates it — the last
+  attempt before the session ends wins, and a superseded write-back is never
+  published. No envelope at all, or a session outside any AOS workspace, is
+  a clean exit-0 no-op. The handler NEVER blocks the stop: stdout stays
+  empty in every outcome (so no decision JSON can exist) and exit code 2 —
+  the Stop-hook blocking signal — is never used; refusals are exit 1
+  diagnostics.
 
 * The **SessionEnd** handler locates only its own session's staged record,
   re-validates it in full (format marker, session binding, digest, dropfile
   parse, size caps, secret scan), and publishes at most one protocol-valid
   dropfile under ``.agentic-os/exports/`` with a deterministic,
-  collision-safe name that carries the dedupe digest. Publication is atomic
+  collision-safe name that carries the dedupe digest (task/agent name
+  components are length-bounded, so the name stays below NAME_MAX no
+  matter what the envelope carries). Publication is atomic
   (same-directory temp file + ``os.link``, which never overwrites) and
   idempotent: a duplicate/retry SessionEnd finds either no staged record
   (clean no-op) or identical already-published bytes (success, no second
@@ -48,11 +55,16 @@ The installer half (``plan_install`` / ``plan_uninstall`` / ``apply_plan`` /
 ``status``) edits the documented Claude Code user settings file
 (``~/.claude/settings.json`` unless ``--settings`` overrides it): dry-run by
 default with an exact deterministic diff, explicit confirmation plus a
-timestamped backup before any rewrite, a same-directory temp file with
-atomic replacement, validation of the JSON before and after, and
-marker-based ownership (the ``aos_hooks.py`` runner token) so only the exact
-AOS-owned Stop/SessionEnd entries are ever added, healed, or removed —
-unrelated settings and hooks pass through the JSON round-trip untouched.
+timestamped backup before any rewrite, a lost-update guard that re-reads
+the file immediately before mutation and refuses unless its bytes still
+equal the planned baseline (a concurrent edit survives untouched and the
+backup always equals the exact bytes replaced), a same-directory temp file
+with atomic replacement, validation of the JSON before and after, and
+exact-command ownership (an entry is AOS-owned only when its command is
+exactly the generated ``python3 <checkout>/aos_hooks.py stop|session-end``
+shape — never a substring match) so only the exact AOS-owned
+Stop/SessionEnd entries are ever added, healed, or removed — unrelated
+settings and hooks pass through the JSON round-trip untouched.
 Compatibility is capability-based, not version-pinned: the handlers need a
 Claude Code that provides Stop/SessionEnd command hooks with JSON on stdin
 and ``last_assistant_message`` in the Stop input.
@@ -80,12 +92,11 @@ from .utils import AosError
 #: schema, two transports (agent-written file, or hook-published envelope).
 ENVELOPE_FENCE = "aos-dropfile"
 
-#: Opening fence at column 0, envelope body, closing fence at column 0.
-#: Strict by design: an indented or unterminated fence is "no envelope".
-_ENVELOPE_RE = re.compile(
-    r"^```aos-dropfile[ \t]*\n(.*?)\n```[ \t]*$",
-    re.MULTILINE | re.DOTALL,
-)
+#: Fence LINES, each matched against one line only (anchored, no
+#: backtracking — extraction is a single linear pass over the message).
+#: Strict by design: an indented fence is not a fence at all.
+_FENCE_OPEN_RE = re.compile(rf"^```{ENVELOPE_FENCE}[ \t]*\Z")
+_FENCE_CLOSE_RE = re.compile(r"^```[ \t]*\Z")
 
 #: Hook stdin is bounded like every other untrusted input (U-C1 posture).
 #: Official Stop payloads carry one assistant message plus small metadata;
@@ -192,25 +203,67 @@ def _find_workspace(data: dict) -> Path | None:
 
 
 def _extract_envelope(message: str) -> str | None:
-    """Exactly one fenced aos-dropfile block, or None when there is none.
-    Two or more refuse: with one staged record per session, publishing an
-    arbitrary winner would silently drop the others."""
+    """Exactly one complete fenced aos-dropfile envelope ENDING the
+    message, or None when no opening fence exists at all (no attempt).
+
+    A single linear pass over the lines — never a backtracking scan, so a
+    flood of unterminated fences costs O(message), not O(message^2). An
+    ATTEMPTED envelope that is not exactly right refuses loudly:
+
+    * two or more opening fences (with one staged record per session,
+      publishing an arbitrary winner would silently drop the others);
+    * an opening fence whose closing fence never arrives (a truncated
+      write-back must never be dropped silently);
+    * content after the closing fence — the envelope must end the message
+      (closing fence at end-of-string or before one final newline).
+    """
     normalized = message.replace("\r\n", "\n").replace("\r", "\n")
-    blocks = _ENVELOPE_RE.findall(normalized)
-    if not blocks:
+    lines = normalized.split("\n")
+    opens = [
+        index for index, line in enumerate(lines)
+        if _FENCE_OPEN_RE.match(line)
+    ]
+    if not opens:
         return None
-    if len(blocks) > 1:
+    if len(opens) > 1:
         raise HookRefusal(
-            f"found {len(blocks)} {ENVELOPE_FENCE} envelopes in the final "
+            f"found {len(opens)} {ENVELOPE_FENCE} envelopes in the final "
             "message (exactly one is required); nothing was staged."
         )
-    return blocks[0] + "\n"
+    start = opens[0]
+    close = None
+    for index in range(start + 1, len(lines)):
+        if _FENCE_CLOSE_RE.match(lines[index]):
+            close = index
+            break
+    if close is None:
+        raise HookRefusal(
+            f"the {ENVELOPE_FENCE} envelope's opening fence is never "
+            "closed (incomplete envelope); nothing was staged."
+        )
+    at_end = close == len(lines) - 1
+    before_final_newline = close == len(lines) - 2 and lines[-1] == ""
+    if not (at_end or before_final_newline):
+        raise HookRefusal(
+            f"content follows the {ENVELOPE_FENCE} envelope's closing "
+            "fence (the envelope must end the final message); "
+            "nothing was staged."
+        )
+    return "\n".join(lines[start + 1 : close]) + "\n"
 
 
 def _validate_envelope(envelope: str) -> dict:
     """The manual-ingest validators, applied before a byte is staged or
     published: U-C1 size cap, the strict dropfile parser, the U-C3 scanner."""
-    raw = envelope.encode("utf-8")
+    try:
+        raw = envelope.encode("utf-8")
+    except UnicodeEncodeError:
+        # JSON may decode a "\ud800" escape into a lone surrogate; refuse
+        # deterministically instead of falling into the internal-error path.
+        raise HookRefusal(
+            "the envelope contains an unpaired Unicode surrogate (not "
+            "valid UTF-8 text); nothing was staged or published."
+        )
     if len(raw) > ingest.MAX_DROPFILE_BYTES:
         raise HookRefusal(
             f"envelope is {len(raw)} bytes "
@@ -355,6 +408,31 @@ def _staged_record_bytes(session_id: str, envelope: str) -> bytes:
     ).encode("utf-8")
 
 
+def _discard_superseded_staging(aos_dir: Path, session_id: str) -> str | None:
+    """A refused envelope ATTEMPT supersedes this session's previously
+    staged envelope — SessionEnd must never publish a result the session
+    itself tried to replace. Deterministic owned-state handling: the staged
+    record is unlinked whole (no partial files ever exist at the staging
+    name); only ENOENT reads as 'nothing was staged'. Returns the
+    diagnostic suffix describing the outcome (None: no record existed)."""
+    staged = _staged_path(aos_dir, session_id)
+    try:
+        os.unlink(staged)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return (
+            "WARNING: the previously staged envelope for this session is "
+            f"superseded but could not be invalidated "
+            f"({exc.__class__.__name__}); inspect and remove it manually: "
+            f"{staged}"
+        )
+    return (
+        "The previously staged envelope for this session was invalidated "
+        "(superseded by this refused attempt); nothing will be published."
+    )
+
+
 def _run_stop(data: dict) -> int:
     if data.get("hook_event_name") != "Stop":
         raise HookRefusal(
@@ -372,10 +450,19 @@ def _run_stop(data: dict) -> int:
     aos_dir = _find_workspace(data)
     if aos_dir is None:
         return 0  # not an AOS workspace — the hook has no business here
-    envelope = _extract_envelope(message)
-    if envelope is None:
-        return 0  # clean no-op: sessions without a write-back are normal
-    doc = _validate_envelope(envelope)
+    try:
+        envelope = _extract_envelope(message)
+        if envelope is None:
+            return 0  # clean no-op: sessions without a write-back are normal
+        doc = _validate_envelope(envelope)
+    except HookRefusal as exc:
+        # The message ATTEMPTED an envelope and the attempt was refused:
+        # the previously staged envelope (if any) is superseded and must
+        # not be published by SessionEnd.
+        note = _discard_superseded_staging(aos_dir, session_id)
+        if note is not None:
+            raise HookRefusal(f"{exc} {note}") from None
+        raise
 
     exports = aos_dir / "exports"
     _require_owned_dir(exports, create=True)
@@ -401,8 +488,8 @@ def _run_stop(data: dict) -> int:
         staged, MAX_STAGED_RECORD_BYTES, "the staged record"
     ) == record:
         print(
-            f"aos-hook[stop]: write-back for {doc['task']} already staged "
-            "(identical envelope); SessionEnd publishes it.",
+            f"aos-hook[stop]: write-back for {_name_component(doc['task'])} "
+            "already staged (identical envelope); SessionEnd publishes it.",
             file=sys.stderr,
         )
         return 0
@@ -414,21 +501,47 @@ def _run_stop(data: dict) -> int:
             f"could not stage the envelope "
             f"({exc.__class__.__name__}); no partial record was left."
         )
+    # Diagnostics never echo raw model-controlled values: the task is
+    # reported in its bounded name-component form (charset-fenced by the
+    # parser, secret-scanned, length-bounded); the agent value is not
+    # echoed at all — the sha identifies the envelope exactly.
     print(
-        f"aos-hook[stop]: staged write-back envelope for {doc['task']} "
-        f"(agent {doc['agent']}, sha256 "
+        f"aos-hook[stop]: staged write-back envelope for "
+        f"{_name_component(doc['task'])} (sha256 "
         f"{utils.sha256_text(envelope)[:12]}); SessionEnd publishes it.",
         file=sys.stderr,
     )
     return 0
 
 
+#: Model-controlled name components (task, agent) are parser-validated to a
+#: filename-safe ASCII charset but NOT to a length; a component longer than
+#: this is replaced by a bounded digest-tagged form so the published name
+#: stays far below any supported filesystem's NAME_MAX (255 bytes) no
+#: matter what the envelope carries.
+MAX_NAME_COMPONENT_CHARS = 40
+
+
+def _name_component(value: str) -> str:
+    """`value` verbatim when short (the documented, human-readable format);
+    otherwise a deterministic bounded form: a prefix plus a digest tag of
+    the FULL value, exactly MAX_NAME_COMPONENT_CHARS long. ASCII in, ASCII
+    out — chars are bytes here."""
+    if len(value) <= MAX_NAME_COMPONENT_CHARS:
+        return value
+    prefix = value[: MAX_NAME_COMPONENT_CHARS - 9]
+    return f"{prefix}-{utils.sha256_text(value)[:8]}"
+
+
 def dropfile_name(doc: dict, session_id: str, digest: str) -> str:
     """Deterministic, collision-safe published name. Every component is
-    validated (task/agent by the dropfile parser, session id by charset) and
-    the digest is the dedupe identity — the same sha256 ingest records."""
+    validated (task/agent by the dropfile parser and secret scan, session
+    id by charset), task/agent are length-bounded via ``_name_component``,
+    and the digest is the dedupe identity — the same sha256 ingest records.
+    Worst case is ~120 bytes, independent of the envelope's field lengths."""
     return (
-        f"dropfile-{doc['task']}-{doc['agent']}-hook-"
+        f"dropfile-{_name_component(doc['task'])}-"
+        f"{_name_component(doc['agent'])}-hook-"
         f"{session_id[:8]}-{digest[:12]}.md"
     )
 
@@ -439,6 +552,14 @@ def _run_session_end(data: dict) -> int:
             "expected a SessionEnd event (official hook_event_name "
             "mismatch); nothing was published."
         )
+    session_id = _validated_session_id(data)
+    aos_dir = _find_workspace(data)
+    if aos_dir is None:
+        # The workspace no-op gate fires BEFORE workspace-specific content
+        # validation: outside any initialized workspace the hook has no
+        # business judging the event — even an unknown reason is a clean
+        # silent no-op.
+        return 0
     reason = data.get("reason")
     if not isinstance(reason, str) or reason not in SESSION_END_REASONS:
         raise HookRefusal(
@@ -446,10 +567,6 @@ def _run_session_end(data: dict) -> int:
             + "|".join(SESSION_END_REASONS)
             + "); nothing was published."
         )
-    session_id = _validated_session_id(data)
-    aos_dir = _find_workspace(data)
-    if aos_dir is None:
-        return 0
     # The owned directories are checked BEFORE the staged path is even
     # stat'ed — a symlinked exports/ or hook-staging/ must not be traversed.
     exports = aos_dir / "exports"
@@ -458,6 +575,10 @@ def _run_session_end(data: dict) -> int:
     if _owned_dir_state(exports / STAGING_DIR_NAME) == "absent":
         return 0
     staged = _staged_path(aos_dir, session_id)
+    # Every refusal caused by the staged record itself carries the SAME
+    # recovery pointer (TROUBLESHOOTING drills it): the record is retained
+    # byte-for-byte and named, so the operator can inspect and remove it.
+    recovery = f"Inspect and remove it manually: {staged}"
     try:
         st = os.lstat(staged)
     except FileNotFoundError:
@@ -465,7 +586,7 @@ def _run_session_end(data: dict) -> int:
     except OSError as exc:
         raise HookRefusal(
             f"cannot inspect the staged record "
-            f"({exc.__class__.__name__}); nothing was published."
+            f"({exc.__class__.__name__}); nothing was published. {recovery}"
         )
     if not stat.S_ISREG(st.st_mode):
         raise HookRefusal(
@@ -473,7 +594,14 @@ def _run_session_end(data: dict) -> int:
             f"Inspect and remove it manually: {staged}"
         )
 
-    raw = _read_regular_file(staged, MAX_STAGED_RECORD_BYTES, "the staged record")
+    try:
+        raw = _read_regular_file(
+            staged, MAX_STAGED_RECORD_BYTES, "the staged record"
+        )
+    except HookRefusal as exc:
+        # Open/oversize/irregular-read failures retain the record too —
+        # same pointer as every other staged-record refusal.
+        raise HookRefusal(f"{exc} {recovery}") from None
     try:
         record = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
@@ -498,7 +626,17 @@ def _run_session_end(data: dict) -> int:
             "the staged record has no envelope text; refusing to publish. "
             f"Inspect and remove it manually: {staged}"
         )
-    digest = utils.sha256_text(envelope)
+    try:
+        digest = utils.sha256_text(envelope)
+    except UnicodeEncodeError:
+        # A tampered record can smuggle a "\ud800" JSON escape past
+        # decoding; refuse deterministically, never via the internal-error
+        # fallback.
+        raise HookRefusal(
+            "the staged record's envelope is not valid UTF-8 text "
+            "(unpaired Unicode surrogate); refusing to publish. "
+            f"Inspect and remove it manually: {staged}"
+        )
     if record.get("envelope_sha256") != digest:
         raise HookRefusal(
             "the staged record's content digest does not match its "
@@ -507,7 +645,11 @@ def _run_session_end(data: dict) -> int:
         )
     # Full re-validation immediately before publication: the staged file
     # sat on disk between the two hooks and is treated as untrusted again.
-    doc = _validate_envelope(envelope)
+    # A re-validation refusal retains the record — same recovery pointer.
+    try:
+        doc = _validate_envelope(envelope)
+    except HookRefusal as exc:
+        raise HookRefusal(f"{exc} {recovery}") from None
 
     final = exports / dropfile_name(doc, session_id, digest)
     payload = envelope.encode("utf-8")
@@ -601,12 +743,16 @@ def _remove_staged(staged: Path) -> None:
 HOOK_PROTOCOL_VERSION = "u-h1/1"
 HOOK_EVENTS = ("Stop", "SessionEnd")
 
-#: Ownership marker: an entry is AOS-owned iff its command carries the
-#: runner filename. Deterministic and documented — do not name your own
-#: hooks after it.
+#: The runner filename ownership is anchored on. An entry is AOS-owned only
+#: when its command is EXACTLY the shape `hook_command` generates —
+#: `python3 <path ending in aos_hooks.py> stop|session-end` — for SOME
+#: checkout (so healing converges moved/old checkouts). A command that
+#: merely mentions the filename is never claimed.
 RUNNER_FILENAME = "aos_hooks.py"
 
 _EVENT_ARGS = {"Stop": "stop", "SessionEnd": "session-end"}
+
+_OWNED_STAGE_ARGS = frozenset(_EVENT_ARGS.values())
 
 
 def default_runner_path() -> Path:
@@ -629,11 +775,26 @@ def owned_entry(event: str, runner: Path | None = None) -> dict:
 
 
 def is_owned(entry) -> bool:
-    return (
+    """Exact-shape ownership: `python3 <runner> stop|session-end [args…]`
+    where <runner>'s basename is exactly `aos_hooks.py` (any checkout path,
+    so install healing converges old/moved checkouts; trailing extra args
+    still read as ours, so `status` reports drift instead of absence). A
+    user command that merely contains the substring is never claimed."""
+    if not (
         isinstance(entry, dict)
         and entry.get("type") == "command"
         and isinstance(entry.get("command"), str)
-        and RUNNER_FILENAME in entry["command"]
+    ):
+        return False
+    try:
+        tokens = shlex.split(entry["command"])
+    except ValueError:  # unbalanced quoting is never an AOS command
+        return False
+    return (
+        len(tokens) >= 3
+        and tokens[0] == "python3"
+        and os.path.basename(tokens[1]) == RUNNER_FILENAME
+        and tokens[2] in _OWNED_STAGE_ARGS
     )
 
 
@@ -657,10 +818,14 @@ def _validate_settings_shape(doc, path: Path) -> None:
             f"Unsupported settings structure in {path}: the root is not a "
             "JSON object. Nothing was changed."
         )
-    hooks = doc.get("hooks")
-    if hooks is None:
+    if "hooks" not in doc:
         return
+    hooks = doc["hooks"]
     if not isinstance(hooks, dict):
+        # An explicit `"hooks": null` lands here too — the documented
+        # behavior is to refuse it like every other non-object value
+        # (consistently for install, status, and uninstall), never to
+        # crash on it or silently reinterpret it as absent.
         raise AosError(
             f"Unsupported settings structure in {path}: 'hooks' is not a "
             "JSON object. Nothing was changed."
@@ -847,6 +1012,31 @@ def _backup_path(path: Path) -> Path:
     return candidate
 
 
+def _current_settings_bytes(path: Path) -> bytes | None:
+    """The exact bytes at `path` right now (None: absent), inspected with
+    the same symlink/regular-file posture as `_load_settings`."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise AosError(
+            f"Cannot inspect settings file {path} "
+            f"({exc.__class__.__name__}). Nothing was changed."
+        )
+    if stat.S_ISLNK(st.st_mode):
+        raise AosError(
+            f"Settings path {path} is a symlink; refusing to modify it. "
+            "Point --settings at the real file. Nothing was changed."
+        )
+    if not stat.S_ISREG(st.st_mode):
+        raise AosError(
+            f"Settings path {path} is not a regular file. "
+            "Nothing was changed."
+        )
+    return path.read_bytes()
+
+
 def apply_plan(plan: SettingsPlan) -> Path | None:
     """Back up, validate, and atomically replace. Returns the backup path
     (None when the file did not exist). Assumes plan.changed."""
@@ -855,6 +1045,17 @@ def apply_plan(plan: SettingsPlan) -> Path | None:
         raise AosError(
             f"Settings directory {parent} does not exist; create it first "
             "(is Claude Code set up?). Nothing was changed."
+        )
+    # Lost-update guard: the plan (and its backup source) is plan.original.
+    # Prove the file still carries exactly those bytes immediately before
+    # ANY mutation — a concurrent edit made while the confirmation prompt
+    # was pending is never overwritten, and the backup therefore always
+    # equals the exact bytes actually replaced.
+    if _current_settings_bytes(plan.path) != plan.original:
+        raise AosError(
+            f"Settings file {plan.path} changed while confirmation was "
+            "pending; refusing to overwrite the concurrent edit. Re-run "
+            "to plan against the current contents. Nothing was changed."
         )
     new_text = plan.new_text
     # Validate the exact bytes that will land before anything is touched.

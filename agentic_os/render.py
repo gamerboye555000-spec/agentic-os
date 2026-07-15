@@ -494,13 +494,17 @@ exactly the dropfile format above, starting at `# AOS DROPFILE`:
     - <anything the next run must know>
     ```
 
-Rules: at most one envelope per response (two or more refuse; both fences
-must start at column 0); a new envelope in a later response replaces the
-earlier one — the last envelope before the session ends wins. The same size
-caps and secret refusals as dropfile ingest apply. On Stop the hook stages
-the envelope; on SessionEnd it publishes at most one dropfile under
-`.agentic-os/exports/`. Ingest stays manual: the human runs
-`python aos.py ingest dropfile <path>` to accept it into the ledger.
+Rules: exactly one envelope per response (two or more refuse; both fences
+must start at column 0); the envelope must END the response — the closing
+fence is the last line (at most one final newline may follow) and an
+unterminated opening fence refuses; a new envelope in a later response
+replaces the earlier one, and a refused envelope attempt invalidates it —
+the last attempt before the session ends wins, so a superseded write-back
+is never published. The same size caps and secret refusals as dropfile
+ingest apply. On Stop the hook stages the envelope; on SessionEnd it
+publishes at most one dropfile under `.agentic-os/exports/`.
+Ingest stays manual: the human runs `python aos.py ingest dropfile <path>`
+to accept it into the ledger.
 """
 }
 

@@ -322,10 +322,22 @@ envelope content (it could be exactly the secret the scanner refused).
 - **"staged write-back envelope for T-XXXX …"** The Stop capture worked;
   SessionEnd will publish it when the session ends.
 - **"found N aos-dropfile envelopes (exactly one is required) …"** The
-  final response carried more than one envelope; with one staged record per
-  session, publishing an arbitrary winner would drop the others silently.
-  Nothing was staged. Ask the agent to emit exactly one, or write the
-  dropfile manually.
+  final response carried more than one envelope (or opening fence); with
+  one staged record per session, publishing an arbitrary winner would drop
+  the others silently. Nothing was staged. Ask the agent to emit exactly
+  one, or write the dropfile manually.
+- **"… opening fence is never closed (incomplete envelope) …" / "content
+  follows the … closing fence (the envelope must end the final
+  message) …"** The final response ATTEMPTED an envelope whose shape is
+  not exactly right — a truncated fence, or commentary after the closing
+  fence. Nothing was staged. Ask the agent to end the response with one
+  complete fenced envelope, or write the dropfile manually.
+- **"The previously staged envelope for this session was invalidated
+  (superseded by this refused attempt) …"** appended to a Stop refusal: an
+  earlier message of this session had staged a valid envelope and a later
+  message tried to replace it with one that was refused. The stale record
+  was removed — SessionEnd never publishes a superseded write-back. Have
+  the agent re-emit a valid envelope, or write the dropfile manually.
 - **"envelope is not a valid dropfile: Malformed dropfile at line N …"**
   The fenced content deviates from the protocol format (the line is named
   by number, never echoed). Nothing was staged. Fix the format or write the
@@ -343,11 +355,13 @@ envelope content (it could be exactly the secret the scanner refused).
   file. The hook refuses to read or write through a path the workspace
   does not really own. Replace it with a real directory and rerun the
   session write-back (or write the dropfile manually).
-- **"the staged record … refusing to publish. Inspect and remove it
-  manually: <path>"** The staged record is malformed, carries the wrong
-  format marker, is not bound to this session, or fails its digest —
-  something replaced or edited it between Stop and SessionEnd. Nothing was
-  published; the record is retained byte-for-byte so you can look at it.
+- **"… the staged record … Inspect and remove it manually: <path>"** The
+  staged record is unreadable, oversized, malformed, not valid UTF-8,
+  carries the wrong format marker, is not bound to this session, fails its
+  digest, or fails re-validation — something replaced or edited it between
+  Stop and SessionEnd. Every such refusal carries this same recovery
+  pointer. Nothing was published; the record is retained byte-for-byte so
+  you can look at it.
   Inspect it (`cat <path>`); if the envelope inside is good, publish it
   yourself by copying the envelope text into a
   `.agentic-os/exports/dropfile-…-1.md` file and ingesting that; then
@@ -377,8 +391,14 @@ envelope content (it could be exactly the secret the scanner refused).
   `cp <backup> <settings>`.
 - **"Settings file … is not valid UTF-8 JSON …" / "Unsupported settings
   structure …"** The installer refuses to touch a file it cannot fully
-  parse and re-render safely. Fix the JSON (or move the file) and rerun.
+  parse and re-render safely (an explicit `"hooks": null` counts: it is
+  refused like every other non-object value, consistently by install,
+  status, and uninstall). Fix the JSON (or move the file) and rerun.
   Nothing was changed.
+- **"Settings file … changed while confirmation was pending …"** The file
+  was rewritten between the printed diff and your `yes`. The concurrent
+  edit was preserved untouched (no rewrite, no backup); re-run to plan
+  against the current contents.
 - **"Settings path … is a symlink; refusing to modify it."** Point
   `--settings` at the real file; an atomic replace through a symlink would
   strand the link.
@@ -389,6 +409,8 @@ envelope content (it could be exactly the secret the scanner refused).
   not match what this checkout installs (moved checkout, edited command,
   half-removed pair). `hooks install --dry-run` shows the exact healing
   diff; `--apply` converges to exactly one AOS-owned entry per event.
-- Uninstall removes ONLY entries whose command carries the `aos_hooks.py`
-  marker and only drops an event array its own removal emptied; your other
-  hooks are untouched.
+- Uninstall removes ONLY entries whose command is exactly the
+  AOS-generated shape (`python3 <checkout>/aos_hooks.py stop|session-end`)
+  and only drops an event array its own removal emptied; your other hooks
+  are untouched — including commands that merely mention the
+  `aos_hooks.py` filename.

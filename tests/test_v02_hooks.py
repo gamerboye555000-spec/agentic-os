@@ -24,6 +24,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -236,14 +237,12 @@ class TestStopCapture(HookWorkspaceCase):
         self.assertEqual((code, out, err), (0, "", ""))
         self.assertEqual(tree_snapshot(self.project), before)
 
-    def test_unterminated_or_indented_fence_is_no_envelope(self):
-        for message in (
-            "```aos-dropfile\n# AOS DROPFILE\nnever closed",
-            "  ```aos-dropfile\n# AOS DROPFILE\n  ```",
-        ):
-            with self.subTest(message=message[:20]):
-                code, out, err = run_hook(["stop"], self.stop_data(message))
-                self.assertEqual((code, out, err), (0, "", ""))
+    def test_indented_fence_is_no_envelope(self):
+        # An indented fence is not a fence per the protocol (column 0 is
+        # required), so this is no envelope attempt at all: silent no-op.
+        message = "  ```aos-dropfile\n# AOS DROPFILE\n  ```"
+        code, out, err = run_hook(["stop"], self.stop_data(message))
+        self.assertEqual((code, out, err), (0, "", ""))
         self.assertFalse(self.staged.exists())
 
     def test_no_workspace_is_clean_noop(self):
@@ -321,6 +320,95 @@ class TestStopRefusals(HookWorkspaceCase):
             data=self.stop_data(message), expect="2 aos-dropfile envelopes"
         )
 
+    def test_unterminated_fence_is_a_refused_attempt(self):
+        # A column-0 opening fence with no closing fence is an ATTEMPTED
+        # envelope (e.g. a truncated write-back) — a loud refusal, never a
+        # silent no-op that would drop the write-back on the floor.
+        self.assert_refused_nothing_staged(
+            data=self.stop_data("```aos-dropfile\n# AOS DROPFILE\nnever closed"),
+            expect="never closed",
+        )
+
+    def test_content_after_closing_fence_refused(self):
+        # The envelope must END the final message: closing fence at
+        # end-of-string or before one final newline, nothing after it.
+        for trailing in ("P.S. one more thing\n", "\n"):
+            with self.subTest(trailing=trailing[:6]):
+                self.assert_refused_nothing_staged(
+                    data=self.stop_data(fenced(VALID_DROPFILE) + trailing),
+                    expect="must end the final message",
+                )
+
+    def test_unterminated_fence_flood_refuses_in_bounded_time(self):
+        # Adversarial input: many opening fences, none closed. Semantically
+        # this is a refused multi-fence attempt (never a silent no-op) …
+        message = "```aos-dropfile\n" * 5000
+        code, out, err = run_hook(["stop"], self.stop_data(message))
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("5000 aos-dropfile envelopes", err)
+        self.assertFalse(self.staged.exists())
+        # … and processing must stay LINEAR in the input size: at 16x the
+        # size the old quadratic regex scan needed minutes; the ceiling
+        # below is a deliberately loose upper bound (~1000x the observed
+        # linear-scan time), not a tight timing assertion.
+        flood = "```aos-dropfile\n" * 80000
+        started = time.perf_counter()
+        code, out, err = run_hook(["stop"], self.stop_data(flood))
+        elapsed = time.perf_counter() - started
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("80000 aos-dropfile envelopes", err)
+        self.assertLess(elapsed, 10.0)
+
+    def test_refused_attempt_invalidates_previous_staging(self):
+        # A later message that ATTEMPTS an envelope and is refused must
+        # supersede the earlier staged envelope: SessionEnd never publishes
+        # a result the session itself tried to replace.
+        cases = {
+            "malformed": fenced("# AOS DROPFILE\nbroken\n"),
+            "secret": fenced(dropfile(summary=f"leak {FAKE_TOKEN}")),
+            "multiple": fenced(VALID_DROPFILE) + "\nx\n" + fenced(VALID_DROPFILE),
+            "incomplete": "```aos-dropfile\n# AOS DROPFILE\nnever closed",
+            "oversized": fenced(
+                dropfile(summary="a" * (ingest.MAX_DROPFILE_BYTES + 10))
+            ),
+        }
+        for name, message in cases.items():
+            with self.subTest(case=name):
+                self.stage_valid()
+                code, out, err = run_hook(["stop"], self.stop_data(message))
+                self.assertEqual((code, out), (1, ""))
+                self.assertIn("previously staged envelope", err)
+                self.assertIn("invalidated", err)
+                self.assertFalse(self.staged.exists())
+                # The superseded envelope is never published:
+                code, out, err = run_hook(["session-end"], self.end_data())
+                self.assertEqual((code, out, err), (0, "", ""))
+                self.assertEqual(self.exports_files(), [])
+
+    def test_envelope_free_later_message_preserves_staging(self):
+        # NO envelope in a later message stays a clean no-op — only an
+        # attempted-and-refused (or valid) envelope supersedes the record.
+        self.stage_valid()
+        code, out, err = run_hook(
+            ["stop"], self.stop_data("Just narration, no envelope at all.")
+        )
+        self.assertEqual((code, out, err), (0, "", ""))
+        self.assertTrue(self.staged.is_file())
+        code, _, err = run_hook(["session-end"], self.end_data())
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.exports_files(), [EXPECTED_NAME])
+
+    def test_unpaired_surrogate_envelope_refused_as_diagnostic(self):
+        # json may decode "\ud800" into a lone surrogate: the refusal must
+        # be a deterministic HookRefusal, not an internal-error fallback.
+        body = dropfile(summary="bad \ud800 char")
+        err = self.assert_refused_nothing_staged(
+            data=self.stop_data(fenced(body)),
+            expect="unpaired Unicode surrogate",
+        )
+        self.assertNotIn("internal error", err)
+        self.assertNotIn("Traceback", err)
+
     def test_malformed_stdin_refused(self):
         self.assert_refused_nothing_staged(raw=b"{ not json")
         self.assert_refused_nothing_staged(raw=b"\xff\xfe{}")
@@ -366,6 +454,23 @@ class TestStopRefusals(HookWorkspaceCase):
         )
         self.assertIn("github-token", err)  # pattern NAME only
         self.assertNotIn(FAKE_TOKEN, err)
+
+    def test_secret_shaped_agent_refused_by_both_boundaries(self):
+        # The agent field lands in diagnostics and the published filename,
+        # so it gets the same secret-shape judgment as every other
+        # model-controlled field — at the hook AND at manual ingest (shared
+        # secret_findings), so everything ingest accepts still publishes.
+        body = dropfile().replace("agent: claude-code", f"agent: {FAKE_TOKEN}")
+        err = self.assert_refused_nothing_staged(
+            data=self.stop_data(fenced(body)), expect="secret-shaped"
+        )
+        self.assertIn("in agent", err)
+        self.assertNotIn(FAKE_TOKEN, err)  # named by field, never by value
+        # Manual-ingest parity: the same document is refused there too.
+        doc = ingest.parse_dropfile(body)
+        self.assertTrue(
+            any("in agent" in finding for finding in ingest.secret_findings(doc))
+        )
 
     def test_secret_in_evidence_and_question_refused(self):
         for body in (
@@ -478,6 +583,27 @@ class TestSessionEndPublish(HookWorkspaceCase):
         )
         self.assertEqual((code, out, err), (0, "", ""))
 
+    def test_outside_workspace_unknown_reason_is_clean_noop(self):
+        # The workspace no-op gate fires BEFORE workspace-specific content
+        # validation: outside any initialized workspace, even an unknown
+        # reason is a clean silent no-op.
+        outside = self.tmp / "plain"
+        outside.mkdir()
+        for reason in ("shutdown-xyzzy", "", None, 5):
+            with self.subTest(reason=reason):
+                code, out, err = run_hook(
+                    ["session-end"],
+                    self.end_data(cwd=str(outside), reason=reason),
+                )
+                self.assertEqual((code, out, err), (0, "", ""))
+        self.assertEqual(list(outside.rglob("*")), [])
+        # Reason validation is NOT weakened for initialized workspaces:
+        code, _, err = run_hook(
+            ["session-end"], self.end_data(reason="shutdown-xyzzy")
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("unsupported SessionEnd reason", err)
+
     def test_duplicate_retry_is_idempotent(self):
         self.stage_valid()
         self.assertEqual(run_hook(["session-end"], self.end_data())[0], 0)
@@ -504,6 +630,60 @@ class TestSessionEndPublish(HookWorkspaceCase):
         # Same session + same envelope in a fresh workspace → same name.
         doc = ingest.parse_dropfile(VALID_DROPFILE)
         self.assertEqual(hooks.dropfile_name(doc, SID, digest), EXPECTED_NAME)
+
+    def test_overlong_task_and_agent_publish_bounded_names_without_echo(self):
+        # Protocol-valid envelopes with very long task/agent values (the
+        # parser bounds their charset, not their length) must publish at a
+        # deterministic name bounded far below filesystem NAME_MAX, and the
+        # raw values must never be echoed in diagnostics.
+        long_agent = "a" * 300
+        long_task = "T-" + "0" * 300 + "9"
+        cases = (
+            ("agent", "T-0009", long_agent, long_agent),
+            ("task", long_task, "claude-code", long_task),
+        )
+        for label, task, agent, overlong in cases:
+            with self.subTest(component=label):
+                body = (
+                    "# AOS DROPFILE\n"
+                    f"task: {task}\n"
+                    f"agent: {agent}\n"
+                    "outcome: success\n"
+                    "summary: Bounded published-name regression.\n"
+                    "\n## evidence\n\n## open questions\n"
+                )
+                code, _, err = run_hook(["stop"], self.stop_data(fenced(body)))
+                self.assertEqual(code, 0, err)
+                self.assertNotIn(overlong, err)  # raw value never echoed
+                code, _, err = run_hook(["session-end"], self.end_data())
+                self.assertEqual(code, 0, err)
+                self.assertNotIn(overlong, err)
+                digest = utils.sha256_text(body)
+                doc = ingest.parse_dropfile(body)
+                name = hooks.dropfile_name(doc, SID, digest)
+                # Deterministic, bounded independently of field lengths,
+                # still carrying the session and dedupe identities:
+                self.assertLessEqual(len(name.encode("utf-8")), 160)
+                self.assertIn(SID[:8], name)
+                self.assertIn(digest[:12], name)
+                final = self.exports / name
+                self.assertTrue(final.is_file(), name)
+                self.assertEqual(final.read_bytes(), body.encode("utf-8"))
+                self.assertFalse(self.staged.exists())
+                # Idempotent retry at the same deterministic name:
+                code, _, err = run_hook(["stop"], self.stop_data(fenced(body)))
+                self.assertEqual(code, 0, err)
+                code, _, err = run_hook(["session-end"], self.end_data())
+                self.assertEqual(code, 0, err)
+                self.assertIn("already published", err)
+
+    def test_short_names_keep_the_documented_format(self):
+        # The visible format is unchanged for every normal-length value:
+        # dropfile-<task>-<agent>-hook-<session8>-<sha12>.md
+        doc = ingest.parse_dropfile(VALID_DROPFILE)
+        self.assertEqual(
+            hooks.dropfile_name(doc, SID, VALID_SHA), EXPECTED_NAME
+        )
 
     def test_success_with_zero_evidence_still_publishes(self):
         # U-H2 is excluded: no new evidence-for-success rule exists here.
@@ -641,6 +821,23 @@ class TestSessionEndRefusals(HookWorkspaceCase):
         err = self.assert_refused_retained(expect="secret-shaped")
         self.assertNotIn(FAKE_TOKEN, err)
 
+    def test_surrogate_in_staged_envelope_refused_with_recovery_pointer(self):
+        # A tampered staged record can smuggle a "\ud800" JSON escape past
+        # decoding; the SessionEnd re-validation must refuse it as a
+        # deterministic diagnostic (never an internal-error traceback),
+        # retain the record, and point at it for manual recovery.
+        self.stage_valid()
+        record = self.staged_record()
+        record["envelope"] = "# AOS DROPFILE\nbad \ud800\n"
+        self.staged.write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        err = self.assert_refused_retained(expect="unpaired Unicode surrogate")
+        self.assertIn(f"Inspect and remove it manually: {self.staged}", err)
+        self.assertNotIn("internal error", err)
+        self.assertNotIn("Traceback", err)
+
     def test_staged_symlink_refused(self):
         target = self.tmp / "outside.json"
         target.write_text("{}")
@@ -648,15 +845,77 @@ class TestSessionEndRefusals(HookWorkspaceCase):
         self.staged.symlink_to(target)
         self.assert_refused_retained(expect="not a regular file")
 
+    def recovery_pointer(self) -> str:
+        return f"Inspect and remove it manually: {self.staged}"
+
     def test_uninspectable_staging_refuses_not_noop(self):
+        # The failure is injected for the STAGED RECORD's path only — the
+        # owned exports/hook-staging directories still inspect fine, so
+        # this exercises the staged-record ENOENT-versus-other-error branch
+        # itself (a wholesale os.lstat patch would trip the exports
+        # directory check first and never reach that branch).
         self.stage_valid()
-        with mock.patch(
-            "os.lstat", side_effect=PermissionError("denied")
-        ):
+        real_lstat = os.lstat
+
+        def lstat_denying_staged(path, *args, **kwargs):
+            if os.fsdecode(path) == str(self.staged):
+                raise PermissionError(13, "denied")
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch("os.lstat", side_effect=lstat_denying_staged):
             code, out, err = run_hook(["session-end"], self.end_data())
         self.assertEqual((code, out), (1, ""))
-        self.assertIn("cannot inspect", err)
+        self.assertIn("cannot inspect the staged record", err)
+        self.assertIn(self.recovery_pointer(), err)
+        self.assertTrue(self.staged.is_file())  # retained
+        self.assertEqual(
+            self.exports_files(), [f"hook-staging/stop-{SID}.json"]
+        )  # no dropfile was published
+
+        # Only ENOENT reads as absence — that branch stays a clean no-op:
+        def lstat_vanishing_staged(path, *args, **kwargs):
+            if os.fsdecode(path) == str(self.staged):
+                raise FileNotFoundError(2, "gone")
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch("os.lstat", side_effect=lstat_vanishing_staged):
+            code, out, err = run_hook(["session-end"], self.end_data())
+        self.assertEqual((code, out, err), (0, "", ""))
+        self.assertTrue(self.staged.is_file())  # untouched either way
+
+    def test_unopenable_staged_record_refuses_with_recovery_pointer(self):
+        # A staged-record OPEN failure retains the record and must carry
+        # the same recovery pointer as every other staged-record refusal.
+        self.stage_valid()
+        real_os_open = os.open
+
+        def open_denying_staged(path, *args, **kwargs):
+            if not isinstance(path, int) and os.fsdecode(path) == str(self.staged):
+                raise PermissionError(13, "denied")
+            return real_os_open(path, *args, **kwargs)
+
+        with mock.patch("os.open", side_effect=open_denying_staged):
+            code, out, err = run_hook(["session-end"], self.end_data())
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("cannot open the staged record", err)
+        self.assertIn(self.recovery_pointer(), err)
         self.assertTrue(self.staged.is_file())
+        self.assertEqual(
+            self.exports_files(), [f"hook-staging/stop-{SID}.json"]
+        )
+
+    def test_oversized_staged_record_refuses_with_recovery_pointer(self):
+        # A staged-record OVERSIZE failure likewise retains and points.
+        self.staging.mkdir(parents=True, exist_ok=True)
+        self.staged.write_bytes(b"x" * (hooks.MAX_STAGED_RECORD_BYTES + 1))
+        code, out, err = run_hook(["session-end"], self.end_data())
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("byte cap", err)
+        self.assertIn(self.recovery_pointer(), err)
+        self.assertTrue(self.staged.is_file())
+        self.assertEqual(
+            self.exports_files(), [f"hook-staging/stop-{SID}.json"]
+        )
 
     def test_atomic_write_failure_leaves_no_partial_dropfile(self):
         self.stage_valid()
@@ -974,6 +1233,136 @@ class TestInstallerUninstall(InstallerCase):
         self.assertEqual(self.settings.read_bytes(), original)
 
 
+class TestInstallerOwnership(InstallerCase):
+    """F12: ownership is the exact AOS-generated command shape
+    (`python3 <path>/aos_hooks.py stop|session-end`), never a substring —
+    user commands that merely mention the filename are never claimed."""
+
+    LOOKALIKES = [
+        {"type": "command", "command": "python3 /home/user/my-aos_hooks.py stop"},
+        {"type": "command", "command": "echo aos_hooks.py run finished"},
+    ]
+
+    def lookalike_settings(self) -> dict:
+        return {"hooks": {"Stop": [{"hooks": [dict(e) for e in self.LOOKALIKES]}]}}
+
+    def test_ownership_requires_the_exact_generated_command_shape(self):
+        self.assertTrue(hooks.is_owned(hooks.owned_entry("Stop")))
+        self.assertTrue(hooks.is_owned(hooks.owned_entry("SessionEnd")))
+        # A moved/old checkout is still ours: healing must converge it.
+        self.assertTrue(hooks.is_owned(
+            {"type": "command",
+             "command": "python3 /old/checkout/aos_hooks.py stop"}
+        ))
+        # A drifted-but-ours command (extra args) is still recognized, so
+        # `status` can report drift instead of misreading it as absent.
+        self.assertTrue(hooks.is_owned(
+            {"type": "command",
+             "command": hooks.hook_command("Stop") + " --extra-flag"}
+        ))
+        for command in (
+            "echo aos_hooks.py run finished",
+            "echo remember aos_hooks.py stop",
+            "python3 /home/user/my-aos_hooks.py stop",
+            "bash aos_hooks.py stop",
+            "python3 /x/aos_hooks.py",
+            "python3 /x/aos_hooks.py backup",
+            "python3 'unterminated quote aos_hooks.py stop",
+            "",
+        ):
+            with self.subTest(command=command):
+                self.assertFalse(
+                    hooks.is_owned({"type": "command", "command": command})
+                )
+
+    def test_install_healing_preserves_lookalike_user_commands(self):
+        self.write_settings(self.lookalike_settings())
+        code, _, err = self.hooks_cmd(
+            "hooks", "install", "--apply", stdin_reply="yes"
+        )
+        self.assertEqual(code, 0, err)
+        merged = self.parsed()
+        kept = [
+            entry["command"]
+            for group in merged["hooks"]["Stop"]
+            for entry in group["hooks"]
+        ]
+        for entry in self.LOOKALIKES:
+            self.assertIn(entry["command"], kept)
+        owned = [
+            command for command in kept
+            if hooks.is_owned({"type": "command", "command": command})
+        ]
+        self.assertEqual(owned, [hooks.hook_command("Stop")])
+
+    def test_uninstall_preserves_lookalike_user_commands(self):
+        original = self.lookalike_settings()
+        self.write_settings(original)
+        self.hooks_cmd("hooks", "install", "--apply", stdin_reply="yes")
+        code, _, err = self.hooks_cmd(
+            "hooks", "uninstall", "--apply", stdin_reply="yes"
+        )
+        self.assertEqual(code, 0, err)
+        # Semantic round-trip: the lookalike user commands are untouched.
+        self.assertEqual(self.parsed(), original)
+
+    def test_status_reads_lookalike_user_commands_as_absent(self):
+        self.write_settings(self.lookalike_settings())
+        code, out, _ = self.hooks_cmd("hooks", "status")
+        self.assertEqual(code, 0)
+        self.assertIn("state: absent", out)
+
+
+class TestInstallerConcurrentEdit(InstallerCase):
+    """F2: the plan's bytes must still be the file's bytes immediately
+    before any mutation — a concurrent edit made while the confirmation
+    prompt was pending survives untouched (no rewrite, no backup)."""
+
+    CONCURRENT = json.dumps({"model": "haiku"}, indent=2) + "\n"
+
+    def edit_then_confirm(self, prompt=""):
+        self.settings.write_text(self.CONCURRENT, encoding="utf-8")
+        return "yes"
+
+    def test_concurrent_edit_during_install_confirmation_survives(self):
+        self.write_settings(self.BASE_SETTINGS)
+        with mock.patch("builtins.input", side_effect=self.edit_then_confirm):
+            code, out, err = self.hooks_cmd("hooks", "install", "--apply")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("changed while confirmation was pending", err)
+        self.assertIn("Nothing was changed", err)
+        self.assertEqual(
+            self.settings.read_text(encoding="utf-8"), self.CONCURRENT
+        )
+        self.assertEqual(self.backups(), [])  # zero mutation: no backup
+
+    def test_concurrent_edit_during_uninstall_confirmation_survives(self):
+        self.write_settings(self.BASE_SETTINGS)
+        self.hooks_cmd("hooks", "install", "--apply", stdin_reply="yes")
+        for stale in self.backups():
+            stale.unlink()
+        with mock.patch("builtins.input", side_effect=self.edit_then_confirm):
+            code, out, err = self.hooks_cmd("hooks", "uninstall", "--apply")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("changed while confirmation was pending", err)
+        self.assertEqual(
+            self.settings.read_text(encoding="utf-8"), self.CONCURRENT
+        )
+        self.assertEqual(self.backups(), [])
+
+    def test_file_created_while_confirmation_pending_refused(self):
+        # The plan was computed against an ABSENT file; a file that appears
+        # before 'yes' lands must not be clobbered.
+        with mock.patch("builtins.input", side_effect=self.edit_then_confirm):
+            code, out, err = self.hooks_cmd("hooks", "install", "--apply")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("changed while confirmation was pending", err)
+        self.assertEqual(
+            self.settings.read_text(encoding="utf-8"), self.CONCURRENT
+        )
+        self.assertEqual(self.backups(), [])
+
+
 class TestInstallerRefusals(InstallerCase):
     MALFORMED = (
         b"{ not json",
@@ -999,6 +1388,29 @@ class TestInstallerRefusals(InstallerCase):
                     self.assertIn("Nothing was changed", err)
                 self.assertEqual(self.settings.read_bytes(), raw)
                 self.assertEqual(self.backups(), [])
+
+    def test_explicit_hooks_null_refused_without_mutation(self):
+        # F5: `"hooks": null` is an unsupported settings shape — refused
+        # exactly like every other non-object value (documented choice:
+        # refuse, never crash, never reinterpret), consistently across
+        # install, status, and uninstall.
+        raw = b'{"model": "opus", "hooks": null}\n'
+        self.settings.write_bytes(raw)
+        for argv in (
+            ("hooks", "install"),
+            ("hooks", "install", "--apply"),
+            ("hooks", "uninstall"),
+            ("hooks", "uninstall", "--apply"),
+            ("hooks", "status"),
+        ):
+            with self.subTest(argv=argv):
+                code, out, err = self.hooks_cmd(*argv, stdin_reply="yes")
+                self.assertEqual(code, 1, f"{argv}: {out}{err}")
+                self.assertIn("Unsupported settings structure", err)
+                self.assertIn("Nothing was changed", err)
+                self.assertNotIn("Traceback", err)
+        self.assertEqual(self.settings.read_bytes(), raw)
+        self.assertEqual(self.backups(), [])
 
     def test_symlinked_settings_refused(self):
         real = self.tmp / "real-settings.json"
@@ -1034,11 +1446,9 @@ class TestAdapterProtocolParity(unittest.TestCase):
 
     def test_documented_fence_is_what_the_handler_accepts(self):
         # The protocol's own example block shape must round-trip through
-        # the extraction regex the Stop handler uses.
+        # the exact extraction the Stop handler uses.
         message = fenced(VALID_DROPFILE)
-        self.assertEqual(
-            hooks._ENVELOPE_RE.findall(message), [VALID_DROPFILE[:-1]]
-        )
+        self.assertEqual(hooks._extract_envelope(message), VALID_DROPFILE)
 
 
 # ---------------------------------------------------------------------------

@@ -123,13 +123,23 @@ byte-identical.
   before merge. The matrix also proves the ledger's own sha256 dedupe
   refuses a second ingest of the same published bytes.
 
-- **D-v0.2.34 — Gate U-H1 result.** Focused suite
-  (`tests/test_v02_hooks.py`) 67 green; full suite 670 green (603
+- **D-v0.2.34 — Gate U-H1 result (audit-corrected 2026-07-15).** Focused
+  suite (`tests/test_v02_hooks.py`) 91 green; full suite 694 green (603
   pre-existing, none weakened or deleted); `compileall` clean;
-  `git diff --check` clean. Renderer and checked-in
-  `adapters/claude-code/PROTOCOL.md` stay byte-identical (existing U-C3
-  parity test now also covers the envelope section); codex/gemini/generic
-  adapters unchanged.
+  `git diff --check` clean. Audit correction, history preserved: this
+  entry originally recorded 67 focused / 670 full, but the branch as
+  shipped before the 2026-07-15 bounded corrective pass actually carried
+  70 focused / 673 full; the totals above add that pass's 21 regression
+  tests (superseded-staging invalidation, linear envelope scanner with
+  end-of-message fence rule, bounded published-name components, agent
+  secret-shape scan shared with manual ingest, settings lost-update
+  guard, exact-command hook ownership, `"hooks": null` refusal,
+  SessionEnd workspace-gate-before-reason ordering, unpaired-surrogate
+  refusals on both validation paths, and uniform staged-record recovery
+  pointers — including the retargeted uninspectable-staging test).
+  Renderer and checked-in `adapters/claude-code/PROTOCOL.md` stay
+  byte-identical (existing U-C3 parity test now also covers the envelope
+  section); codex/gemini/generic adapters unchanged.
 
 # DECISIONS — Agentic OS v0.2 U-C4 Windows read-only export run
 
