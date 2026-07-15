@@ -14,7 +14,7 @@ import sys
 import traceback
 from pathlib import Path
 
-from . import db, ids, obsidian, ops, utils
+from . import db, ids, obsidian, ops, power, utils
 from .utils import AosError
 
 
@@ -69,7 +69,12 @@ def cmd_init(args) -> int:
     root = Path(chosen).expanduser().resolve() if chosen else Path.cwd()
     if not root.is_dir():
         raise AosError(f"Root is not an existing directory: {root}")
-    aos_dir, created = ops.init_workspace(root)
+    # U-E2 eco: the one implicit, optional derived refresh in the baseline —
+    # re-healing the mirror on an already-initialized workspace, while init
+    # reports "nothing to do". Eco defers it and says so; `sync` regenerates
+    # it on demand. A fresh workspace always heals (see ops.init_workspace).
+    eco = power.mode_of(args) == power.ECO
+    aos_dir, created = ops.init_workspace(root, refresh_mirror=not eco)
     if created:
         print(f"Initialized Agentic OS workspace at {aos_dir}")
     else:
@@ -77,6 +82,11 @@ def cmd_init(args) -> int:
             f"Already initialized at {aos_dir} "
             f"(schema_version {db.SCHEMA_VERSION}); nothing to do."
         )
+        if eco:
+            print(
+                "eco: deferred the idempotent Obsidian mirror refresh. "
+                "Regenerate it anytime: python aos.py sync"
+            )
     return 0
 
 
@@ -998,6 +1008,60 @@ def cmd_hooks_uninstall(args) -> int:
     )
 
 
+# ---------------------------------------------------------------------------
+# Power modes (U-E2)
+#
+# These three deliberately resolve the workspace WITHOUT db.open_db(): the
+# schema-version gate would make recovery control unreachable on exactly the
+# databases that need it. `power status` needs no database at all.
+
+def cmd_power_status(args) -> int:
+    aos_dir = _resolve_aos_dir(args)
+    try:
+        state = power.read_state(aos_dir)
+    except power.PowerStateError as exc:
+        # Reporting the problem IS this command's job, so it prints rather
+        # than raising — but it still exits 1: the state is not usable.
+        print("runtime power mode: unknown — malformed or unsafe configuration")
+        for line in power.matrix_lines(None):
+            print(line)
+        print(str(exc), file=sys.stderr)
+        return 1
+    source = "configured" if state.configured else "default"
+    print(f"runtime power mode: {state.mode} ({source})")
+    for line in power.matrix_lines(state.mode):
+        print(line)
+    return 0
+
+
+def cmd_power_suggest(args) -> int:
+    aos_dir = _resolve_aos_dir(args)
+    result = power.suggest(aos_dir)
+    print(f"suggestion: {result['mode']}")
+    print(f"signal:     {result['signal']} ({result['count']})")
+    print(
+        "Advice only — nothing was changed. Only you change the mode: "
+        f"python aos.py power set {result['mode']}"
+    )
+    return 0
+
+
+def cmd_power_set(args) -> int:
+    aos_dir = _resolve_aos_dir(args)
+    result = power.set_mode(aos_dir, args.mode)
+    if not result["changed"]:
+        print(f"Already in '{result['mode']}'; nothing changed.")
+        return 0
+    print(f"Power mode: {result['previous']} → {result['mode']}")
+    if result["mode"] == power.RECOVERY:
+        print(
+            "Authoritative and derived writes are now refused. Read-only and "
+            "recovery-safe commands still work. Leaving recovery requires "
+            "every hard doctor check to pass."
+        )
+    return 0
+
+
 def cmd_doctor(args) -> int:
     with _ledger(args) as (aos_dir, conn):
         from . import doctor
@@ -1408,6 +1472,35 @@ def build_parser() -> _Parser:
     p_doctor = sub.add_parser("doctor", help="health checks")
     p_doctor.set_defaults(func=cmd_doctor)
 
+    p_power = sub.add_parser(
+        "power",
+        help="runtime power modes (U-E2): eco / standard / deep / recovery. "
+        "Local execution policy only — never picks a model, runs anything in "
+        "the background, or switches mode on its own.",
+    )
+    power_sub = p_power.add_subparsers(
+        dest="subcommand", metavar="SUBCOMMAND", required=True
+    )
+    p_power_status = power_sub.add_parser(
+        "status",
+        help="print the current mode and the degradation matrix (read-only; "
+        "never creates power.json)",
+    )
+    p_power_status.set_defaults(func=cmd_power_status)
+    p_power_suggest = power_sub.add_parser(
+        "suggest",
+        help="print a deterministic, advisory mode suggestion (read-only; "
+        "never switches the mode)",
+    )
+    p_power_suggest.set_defaults(func=cmd_power_suggest)
+    p_power_set = power_sub.add_parser(
+        "set",
+        help="set the mode (the only command that writes power.json). "
+        "recovery is always available; leaving it needs a clean doctor.",
+    )
+    p_power_set.add_argument("mode", choices=list(power.MODES))
+    p_power_set.set_defaults(func=cmd_power_set)
+
     p_hooks = sub.add_parser(
         "hooks",
         help="Claude Code session hooks (U-H1): previewable, reversible "
@@ -1462,7 +1555,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         parser = build_parser()
         args = parser.parse_args(argv)
-        return args.func(args)
+        # U-E2: the ONE place runtime power policy is applied. Recovery
+        # refusals and deep preflights fire before args.func runs, so stdout
+        # stays empty and no mutation can have happened; deep
+        # post-verification runs after a successful authoritative write.
+        return power.dispatch(args)
     except AosError as exc:
         print(str(exc), file=sys.stderr)
         return exc.exit_code

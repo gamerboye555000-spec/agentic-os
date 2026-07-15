@@ -657,7 +657,11 @@ class TestDoctorHardening(Night1BackCompatCase):
         code, out = self.doctor()
         self.assertEqual(code, 0, out)
         lines = [l for l in out.strip().splitlines() if l]
-        self.assertEqual(len(lines), 20)
+        # 20 → 21: the mandated U-E2 runtime power state check joined the
+        # set (D-W8.1 pattern — the pin moves UP with a mandated new
+        # check). It reports [PASS] "standard (default)" here: this
+        # workspace has no power.json, and doctor must never create one.
+        self.assertEqual(len(lines), 21)
         warn_lines = [l for l in lines if l.startswith("[WARN]")]
         self.assertEqual(len(warn_lines), 1)
         self.assertIn("T-0001", warn_lines[0])

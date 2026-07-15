@@ -819,13 +819,15 @@ class TestDoctor(CliTestCase):
         lines = [l for l in out.strip().splitlines() if l]
         # 6 Night-1 + 6 Weekend + 4 complete-today checks + 4 warn-only
         # lines (commit evidence + the U-C3 secret sweep + the two U-H2
-        # checks; D-W8.1 pattern: the pin moves UP with mandated new
-        # checks). The demo closes a code task with note evidence, so the
-        # warn-only commit-evidence line fires — [WARN], never [FAIL],
-        # exit stays 0 — while the secret sweep and both U-H2 checks stay
-        # [PASS] on this fixture (R-0001's evidence is attributable and
-        # no ref is blank).
-        self.assertEqual(len(lines), 20)
+        # checks) + the U-E2 runtime power state line (D-W8.1 pattern: the
+        # pin moves UP with mandated new checks; 20 → 21). The demo closes
+        # a code task with note evidence, so the warn-only commit-evidence
+        # line fires — [WARN], never [FAIL], exit stays 0 — while the
+        # secret sweep and both U-H2 checks stay [PASS] on this fixture
+        # (R-0001's evidence is attributable and no ref is blank). The
+        # power line is [PASS] "standard (default)": this fixture never
+        # writes power.json, and reading it must not create it.
+        self.assertEqual(len(lines), 21)
         warn_lines = [l for l in lines if l.startswith("[WARN]")]
         self.assertEqual(len(warn_lines), 1)
         self.assertIn("code tasks done without commit evidence", warn_lines[0])
