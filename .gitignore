@@ -6,6 +6,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Build artifacts (aos.pyz is generated from source; never committed)
+dist/
+build/
+*.pyz
+*.egg-info/
+
 # Local environments / caches
 .venv/
 venv/

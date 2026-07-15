@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-os"
+dynamic = ["version"]
+description = "Local-first system of record for coordinating AI agents."
+readme = "README.md"
+requires-python = ">=3.12"
+# Zero runtime dependencies: the CLI runs on a stock Python standard library.
+dependencies = []
+
+[project.scripts]
+# Delegates to the one canonical CLI shared by aos.py, `python -m agentic_os`,
+# and aos.pyz.
+aos = "agentic_os.cli:main"
+
+[tool.setuptools]
+# Explicit allowlist, not auto-discovery: tests, ledger data, backups,
+# exports, caches, and repository-only files are never swept in.
+packages = ["agentic_os"]
+
+[tool.setuptools.dynamic]
+version = { attr = "agentic_os.__version__" }
