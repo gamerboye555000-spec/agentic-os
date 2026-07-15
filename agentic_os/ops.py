@@ -310,20 +310,28 @@ def initialize(conn: sqlite3.Connection, root: Path) -> None:
         )
 
 
-def init_workspace(root: Path) -> tuple[Path, bool]:
+def init_workspace(root: Path, *, refresh_mirror: bool = True) -> tuple[Path, bool]:
     """Create (or heal) the .agentic-os workspace under `root`.
 
     Idempotent: re-running on the same schema version re-creates any missing
     folders/templates and changes nothing else.
+
+    `refresh_mirror=False` (U-E2 eco) skips the idempotent mirror re-heal on
+    an ALREADY-initialized workspace — the one piece of implicit, optional
+    derived work in the baseline, and fully regenerable with `sync`. A
+    freshly created workspace always heals regardless: a new workspace that
+    has no mirror is not usable. Default True keeps every existing caller on
+    the baseline path byte-for-byte.
     """
     aos_dir = root / utils.AOS_DIR_NAME
     conn, created = db.init_db(aos_dir / utils.DB_FILENAME)
     try:
         if created:
             initialize(conn, root)
-        obsidian.ensure_layout(aos_dir)
-        obsidian.write_adapter_templates(aos_dir)
-        obsidian.write_home_and_conventions(conn, aos_dir)
+        if created or refresh_mirror:
+            obsidian.ensure_layout(aos_dir)
+            obsidian.write_adapter_templates(aos_dir)
+            obsidian.write_home_and_conventions(conn, aos_dir)
     finally:
         conn.close()
     return aos_dir, created

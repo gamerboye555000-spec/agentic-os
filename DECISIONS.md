@@ -2249,3 +2249,124 @@ rewriting prior entries.
   hardest to act on. The rule's intent (no tracebacks, no walls of text for
   ordinary failures) holds: the message is bounded, fixed-shape, and carries
   no SQL, row values, or secrets.
+
+- **D-v0.2.51 — The runtime power mode lives in an operational sidecar, not
+  the schema or `meta`.** `.agentic-os/power.json` is a small file beside the
+  ledger, deliberately outside it. Recovery control must be reachable when the
+  database is unopenable, version-mismatched, or corrupt — that is precisely
+  when a human reaches for `power set recovery`. Storing the mode in `meta`
+  would make the control depend on the very thing it exists to recover:
+  `db.open_db` refuses any `schema_version` other than the build's, so a
+  version-mismatched database would lock the human out of the escape hatch. No
+  `power` command calls `open_db`, no schema version changed, and no migration
+  was registered.
+
+- **D-v0.2.52 — A missing `power.json` means `standard`, and reading it never
+  creates it.** Absence is a valid, expected state, not an error and not a
+  first-run initialization step. `status`, `suggest`, `doctor`, and every other
+  read-only command leave the workspace byte-identical; only `power set`
+  creates or replaces the file. The alternative — writing a default on first
+  read — would make every read-only command a writer, and would silently take
+  a position (`configured standard`) the human never took.
+
+- **D-v0.2.53 — Command classification is an explicit allowlist, walked and
+  enforced by a test.** Every CLI leaf is classified `read_only`,
+  `derived_write`, `recovery_safe`, or `authoritative_write` in one table in
+  `power.py`, keyed by its argparse path. Mutability is never inferred from a
+  command's name or help prose — `backup create` sounds read-ish and writes an
+  event; `review build` sounds derived and is. A test walks the LIVE argparse
+  tree and fails on any unclassified leaf and on any stale entry, so a new
+  command cannot inherit a permissive default by being forgotten. An
+  unclassified path fails closed to `authoritative_write` at runtime.
+
+- **D-v0.2.54 — Suggestions never auto-apply.** `power suggest` prints advice
+  and exits; it never writes `power.json`, and no command switches modes on its
+  own. The degradation matrix reports `auto-switch: no` for all four modes, by
+  construction. A system that quietly downgraded itself into `recovery`, or
+  quietly left it, would make the mode a thing that happens to the human rather
+  than a thing the human decides — and leaving `recovery` is exactly the
+  decision that must not be automatic.
+
+- **D-v0.2.55 — Recovery is fail-closed for authoritative and derived change.**
+  Only `read_only` and `recovery_safe` commands run. The refusal fires in
+  `power.dispatch` BEFORE `args.func`, so stdout stays empty and no partial
+  mutation is possible; it names the command path and the mode, and echoes no
+  payload, row, secret, path, or exception text. Entering recovery works while
+  doctor has hard failures (and while the database cannot be opened at all);
+  leaving it requires every hard check to pass. Warn-only checks never gate a
+  transition — a warning is not a reason to trap someone in recovery.
+
+- **D-v0.2.56 — Deep verifies around authoritative writes and never rolls
+  back.** Before each authoritative ledger write, a bounded read-only preflight
+  runs `PRAGMA integrity_check` and the existing U-C3 secret sweep through the
+  same primitives doctor uses; a hard failure refuses the write before anything
+  is written. After a successful write the same checks re-run, and on failure
+  the command reports — honestly — that it ALREADY COMMITTED and that
+  verification failed, recommends recovery, and exits 1. It never claims a
+  rollback and never performs one: automatically undoing a committed, journaled
+  write is the opposite of what an append-only system of record is for.
+  Diagnostics name check names and counts only; `doctor` remains the place that
+  shows the (already bounded, already value-free) detail.
+
+- **D-v0.2.57 — No model calls, no host-resource heuristics.** The suggestion
+  is a fixed four-step priority over signals the system already computes:
+  hard doctor failure → `recovery`; warning → `deep`; active runs → `standard`;
+  clean and idle → `eco`. No LLM call, no scoring model, no natural-language
+  heuristic over ledger content, no CPU/RAM/battery probing, no environment
+  telemetry. Identical ledger state yields an identical suggestion, and the
+  output carries a fixed signal phrase plus a bounded count — never a title,
+  summary, ref, claim, path, or secret. "Power mode" here means local execution
+  policy; it never chooses a model or starts anything.
+
+- **D-v0.2.58 — U-E1 pack effort tiers stay separate and deferred.** Context
+  packs keep their own `--for` / `--budget-kb` knobs. Runtime power modes govern
+  CLI execution policy for a workspace; pack effort tiers govern what goes into
+  one artifact. Fusing the two vocabularies because both say "power" would tie
+  an unrelated future decision to this one.
+
+- **D-v0.2.59 — `power set` emits no ledger event.** Every other mutation in
+  this tree journals one. This cannot: it must work when the database is
+  unopenable, which is exactly when `recovery` is set — emitting an event would
+  reintroduce the dependency D-v0.2.51 exists to remove. The cost is real and
+  accepted: mode changes have no audit trail. `doctor` and `power status` report
+  the CURRENT mode and whether it was configured, so the state is always
+  visible even though its history is not.
+
+- **D-v0.2.60 — `backup create` and `snapshot` are blocked in recovery.** Both
+  write their file and then emit a ledger audit event inside `db.transaction`,
+  so both mutate the live database and fail the "reads without mutating" test
+  that would have made them recovery-safe. `backup verify` and `backup restore`
+  remain available — they never touch the live ledger, and restore writes a
+  distinct NEW path (U-C2). `backup.write_backup_pair()` is eventless but has
+  no CLI surface; exposing one to soften this would be scope creep, and the
+  honest answer is that a recovery-mode backup is not currently available.
+
+- **D-v0.2.61 — Eco defers exactly one site, and none was invented.** An audit
+  of every command path found one piece of implicit, optional derived work in
+  the baseline: `init` re-heals the Obsidian mirror on an ALREADY-initialized
+  workspace while reporting "nothing to do". Eco defers that and says so;
+  `sync` regenerates it. Everything else the mirror/review/pack code does is
+  explicitly requested by the human, and a freshly created workspace always
+  heals (a new workspace with no mirror is not usable). Inventing automatic
+  refresh work purely so eco could visibly differ from standard would have made
+  the system do MORE by default in order to advertise doing less.
+
+- **D-v0.2.62 — A malformed power state fails closed for writers and open for
+  readers.** A power state that does not parse means the mode is UNKNOWN, and
+  an unknown mode could be hiding a configured `recovery` — so
+  `authoritative_write` and `derived_write` commands refuse. `read_only` and
+  `recovery_safe` commands proceed, because reporting the problem is how the
+  human sees it: `doctor` FAILs its power line rather than crashing, and
+  `power status` prints it. Nothing repairs the file automatically — silent
+  repair would resolve an ambiguity in the writer's favor. The documented way
+  out is manual: delete it (absence means `standard`) and re-set the mode.
+
+- **D-v0.2.63 — No lock file; `os.replace` is the serialization point.**
+  `power set MODE` is an absolute assignment, not a read-modify-write delta, so
+  concurrent setters cannot interleave: each writes a complete, already-valid
+  temp file and atomically renames it, and the result is always exactly one
+  valid state. A lock file would add its own staleness, its own symlink
+  surface, and its own recovery story to protect an operation that is already
+  atomic. One bounded consequence is documented rather than papered over: an
+  idempotent no-op reports the state it observed, and a concurrent set may land
+  after it — the file is still one complete valid state.

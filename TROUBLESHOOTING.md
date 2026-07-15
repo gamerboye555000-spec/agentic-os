@@ -777,3 +777,165 @@ actually are. Setting it to `"1"` to make a refusal go away tells every
 protection in the system to trust a database it has no reason to trust —
 including `backup verify`, which will then happily certify a lie. If you
 are tempted, restore a verified backup instead.
+
+## Runtime power modes (U-E2)
+
+Power modes are local CLI execution policy: `eco`, `standard` (the default),
+`deep`, `recovery`. Nothing here picks a model, runs background work, or
+changes mode on its own — only you do, with `power set`.
+
+### "The runtime power state … is unusable"
+
+`.agentic-os/power.json` exists but is not a power state this build accepts:
+malformed JSON, duplicate keys, an unknown field, a wrong `version`, an unknown
+mode, a non-string mode, invalid UTF-8, oversized, trailing data — or the path
+is not a regular file (a symlink, directory, FIFO, socket, or device).
+
+While it stands:
+
+- `doctor` and `power status` still run and **report** the problem (that is how
+  you see it) — doctor's `runtime power state` line FAILs;
+- every authoritative and derived command **refuses**. This is deliberate: an
+  unparseable state means the mode is unknown, and an unknown mode could be
+  hiding a configured `recovery`, so nothing that writes may proceed
+  (D-v0.2.62);
+- **every** `power set` refuses too, including the one that would overwrite the
+  bad file. Nothing repairs it automatically — silent repair would resolve the
+  ambiguity in the writer's favor.
+
+The way out is manual and deliberate. Look at the file first — it is one short
+line, and if it is not yours, that is worth knowing:
+
+```bash
+cat .agentic-os/power.json          # expected: {"version":1,"mode":"standard"}
+rm .agentic-os/power.json           # absence means standard
+python aos.py power status          # confirm: standard (default)
+python aos.py power set deep        # re-pin the mode you wanted
+```
+
+Deleting it is safe: `power.json` holds no ledger data, and its absence is a
+valid state meaning `standard`. If the path is a **symlink or a directory**,
+that is not something this tool created — inspect it before removing it. The
+state file is never followed through a symlink, so nothing on the other end was
+read or written.
+
+### Entering recovery when doctor is failing
+
+That is what recovery is for, and it always works:
+
+```bash
+python aos.py power set recovery
+```
+
+It does not consult the ledger and never calls `open_db`, so it works while
+`doctor` reports hard failures, while the database is corrupt, and even when
+`schema_version` is unsupported — the states that hard-stop every other
+command (D-v0.2.51). The only requirements are an initialized workspace and a
+safely inspectable `power.json` path.
+
+In recovery you keep `doctor`, `status`, `log`, `search`, the `show`/`list`
+commands, `migrate status`/`plan`, `backup verify`, and `backup restore` (which
+writes a distinct new path and never touches the live database). Refusals fire
+before the command runs, so stdout stays empty and nothing is half-written.
+
+**`backup create` and `snapshot` are blocked in recovery.** Both emit a ledger
+audit event, so both write to the database that recovery exists to protect
+(D-v0.2.60). To archive a damaged ledger, copy `.agentic-os/aos.db` (and its
+`-wal`) with your own tools, or leave recovery first.
+
+### Leaving recovery
+
+```bash
+python aos.py doctor                # fix every [FAIL]
+python aos.py power set standard
+```
+
+Refused with "entering 'standard' requires every hard doctor check to pass"?
+Then a hard check is still failing, and the message names them. Warn-only
+(`[WARN]`) checks never block a transition — a warning is not a reason to trap
+you in recovery. If `doctor` itself cannot complete (an unreadable database),
+that counts as a hard failure by design: you cannot leave recovery by breaking
+the thing that would have told you not to. Restore a verified backup
+(RECOVERY.md), then leave.
+
+#### When the only fix is a command recovery blocks
+
+There is one shape of stall worth naming, because you will not guess your way
+out of it. Recovery blocks `sync`, and `sync` is what regenerates the Obsidian
+mirror — so if the failing hard checks are mirror-level (`Home.md exists`,
+`wikilinks resolve to generated notes`, `required folders exist`), you cannot
+repair them from inside recovery, and you cannot leave recovery until they are
+repaired:
+
+```
+Refused: `sync` is blocked in recovery mode (derived_write).
+Refused: entering 'standard' requires every hard doctor check to pass;
+         2 still fail: Home.md exists, wikilinks resolve to generated notes.
+```
+
+Both refusals are correct and both are deliberate. The way out is the same
+manual step as for a malformed state — the mode file is yours to remove:
+
+```bash
+rm .agentic-os/power.json      # absence means standard
+python aos.py sync             # heals the mirror
+python aos.py doctor           # confirm clean
+python aos.py power set deep   # re-pin the mode you wanted
+```
+
+This is safe. `power.json` holds no ledger data — it is one line naming a mode
+— and deleting it cannot lose anything the database has. The mirror is
+generated, so `sync` rebuilds it from the ledger. Nothing about your data
+depended on being in recovery; recovery only stopped you writing while things
+were broken, and you are deliberately, knowingly stepping out to fix the
+generated layer.
+
+If instead the failing check is `database integrity_check` or
+`schema_version supported`, do **not** do this. That is real ledger damage, and
+`sync` will not fix it: stay in recovery and restore a verified backup
+(RECOVERY.md).
+
+### Deep verification failed AFTER a command committed
+
+```
+`task edit` COMMITTED, and deep verification then FAILED: ledger secret sweep
+(2 finding(s)). The change is committed and was NOT rolled back …
+```
+
+Read it literally. The command **did** commit; its write is in the ledger and
+in the journal. Deep re-ran its bounded integrity + secret checks afterwards
+and something did not pass. Nothing was rolled back, and nothing will be: this
+system does not silently undo a committed, journaled write (D-v0.2.56).
+
+Do this, in order:
+
+```bash
+python aos.py power set recovery    # stop further writes first
+python aos.py doctor                # the full, bounded detail
+```
+
+The deep message names the check and a count only — `doctor` is where you see
+which rows are involved (it names IDs and pattern names, never values). Two
+common causes:
+
+- **secret sweep** — you just wrote something credential-shaped. The write was
+  accepted with a warning (the ledger is never silently falsified) and the
+  event payload was redacted. Rotate the credential, then decide what to do
+  with the row. `doctor`'s U-C3 line lists what to look at.
+- **integrity_check** — real database damage. Do not keep writing. See
+  RECOVERY.md and restore a verified backup.
+
+A clean preflight followed by a failed post-verification is not a
+contradiction: the write you just made is the difference between them.
+
+### `power status` and `doctor` disagree with what I set
+
+They read the same file, so they cannot — unless you have more than one
+workspace. The mode is **per-workspace**: `.agentic-os/power.json` under the
+root you are targeting. If `--root` (or cwd-upward discovery) is finding a
+different workspace than you think, `power status` is reporting that one.
+Check with:
+
+```bash
+python aos.py --root /path/to/workspace power status
+```

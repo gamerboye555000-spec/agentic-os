@@ -39,7 +39,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import db, ids, obsidian, secretscan, utils
+from . import db, ids, obsidian, power, secretscan, utils
 from .models import AGENT_KINDS, AGENT_NAME_RE, TASK_STATUSES
 
 # Shared generated-layout rules live in obsidian.py (public, also consumed
@@ -64,6 +64,15 @@ SECRET_SWEEP_DISPLAY_LIMIT = 10
 
 #: Offender IDs shown per U-H2 warn line (checks 19/20); the rest is a count.
 UH2_DISPLAY_LIMIT = 10
+
+#: The concise degradation summary per mode for check 21 (U-E2). Fixed
+#: strings: the full matrix lives in `power status`, not in every doctor run.
+_POWER_SUMMARY = {
+    power.ECO: "implicit derived refresh deferred",
+    power.STANDARD: "baseline behavior",
+    power.DEEP: "integrity + secret preflight around authoritative writes",
+    power.RECOVERY: "authoritative writes blocked",
+}
 
 
 def _bounded_ids(offenders: list[str], noun: str) -> str:
@@ -267,6 +276,17 @@ def _secret_sweep_findings(conn: sqlite3.Connection) -> list[str]:
     # produce identical finding lines; report each distinct finding once,
     # in first-seen order — deterministic for identical ledgers.
     return list(dict.fromkeys(findings))
+
+
+def secret_sweep_findings(conn: sqlite3.Connection) -> list[str]:
+    """Public name for the U-C3 ledger sweep.
+
+    The U-E2 deep preflight runs the SAME sweep the doctor line runs — one
+    detector, one answer to "is this secret-shaped?" everywhere (D-v0.2.15).
+    Deep reports only the COUNT of these findings; `doctor` remains the place
+    that shows them (already bounded, already value-free).
+    """
+    return _secret_sweep_findings(conn)
 
 
 #: Entity folders whose notes carry frontmatter (Reviews and the top-level
@@ -702,5 +722,33 @@ def run_checks(conn: sqlite3.Connection, aos_dir: Path) -> list[Check]:
             warn_only=True,
         )
     )
+
+    # 21. U-E2 runtime power state: which mode governs this workspace, where
+    #     that came from (the missing-file default vs power.json), and what
+    #     it degrades. A malformed or unsafe state FAILS here rather than
+    #     crashing doctor — reporting the problem is the whole point, since
+    #     a malformed state refuses every mode transition until a human
+    #     resolves it. Never prints raw JSON, the file's bytes, or a path.
+    try:
+        state = power.read_state(aos_dir)
+    except power.PowerStateError:
+        checks.append(
+            Check(
+                "runtime power state",
+                False,
+                "malformed or unsafe configuration — run: "
+                "python aos.py power status",
+            )
+        )
+    else:
+        source = "configured" if state.configured else "default"
+        summary = _POWER_SUMMARY[state.mode]
+        checks.append(
+            Check(
+                "runtime power state",
+                True,
+                f"{state.mode} ({source}; {summary})",
+            )
+        )
 
     return checks

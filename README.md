@@ -366,6 +366,84 @@ compatible; it is a claim about what the bytes on disk look like. Editing it
 makes the ledger lie to every check that protects it. If `migrate status`
 refuses, read TROUBLESHOOTING.md.
 
+## Runtime power modes (U-E2)
+
+Power modes govern **local CLI execution policy** for one workspace. They never
+choose an LLM, call a model, start a daemon, run anything in the background, or
+grant autonomy — "power" here means how careful the CLI is, not how much
+compute anything gets.
+
+```bash
+python aos.py power status      # current mode + the degradation matrix
+python aos.py power suggest     # deterministic advice; changes nothing
+python aos.py power set eco
+python aos.py power set standard
+python aos.py power set deep
+python aos.py power set recovery
+```
+
+### The four modes
+
+| mode | what it does |
+|---|---|
+| `eco` | Everything you ask for still runs — authoritative writes, explicit `sync`/`review`/`backup`. Only *implicit, optional* derived refresh is deferred. In this build that is exactly one thing: `init` re-healing the Obsidian mirror on an already-initialized workspace. It says so, and `sync` regenerates it. |
+| `standard` | **The default.** Baseline behavior, byte for byte. No preflight, no automatic doctor after commands. |
+| `deep` | Before each authoritative ledger write, a bounded read-only preflight runs `PRAGMA integrity_check` and the U-C3 secret sweep, and refuses the write if either fails. After a successful write the same checks re-run; if they fail, the command tells you it **already committed** and points you at `recovery`. It never rolls anything back. |
+| `recovery` | Fail-closed. Read-only and recovery-safe commands work; every authoritative and derived mutation is refused **before it runs**, so nothing is half-written. |
+
+### Default and state
+
+A workspace with no `.agentic-os/power.json` is in `standard`. That is a real,
+expected state — `power status`, `power suggest`, and `doctor` all report it
+and **never create the file**. Only `power set` writes it, and the whole file
+is one line:
+
+```json
+{"version":1,"mode":"standard"}
+```
+
+It lives beside the ledger rather than inside it on purpose: `power set
+recovery` has to work when the database is corrupt or its `schema_version` is
+unsupported — which is exactly when you need it (D-v0.2.51). The mode is
+per-workspace: two workspaces on one machine have independent modes.
+
+### Suggestions are advice, never action
+
+`power suggest` never switches anything. It applies a fixed priority — no
+model call, no heuristics over your text, no CPU/RAM probing (D-v0.2.57):
+
+1. any hard doctor failure → `recovery`
+2. else any doctor warning → `deep`
+3. else any active (unended) run → `standard`
+4. else clean and idle → `eco`
+
+It prints the signal category and a count — never a title, ref, claim, path, or
+secret. Applying it is your call:
+
+```
+suggestion: deep
+signal:     doctor warning (1)
+Advice only — nothing was changed. Only you change the mode: python aos.py power set deep
+```
+
+### Entering and leaving recovery
+
+`power set recovery` always works while the workspace and the state file are
+safely inspectable — including while `doctor` is failing, and including when
+the database will not open at all. **Leaving** recovery (to `eco`, `standard`,
+or `deep`) requires every hard doctor check to pass; warn-only checks never
+block a transition. `doctor` reports the mode as its own check:
+
+```
+[PASS] runtime power state — standard (default)
+[PASS] runtime power state — recovery (configured; authoritative writes blocked)
+[FAIL] runtime power state — malformed or unsafe configuration
+```
+
+Nothing here switches modes on its own, in any mode. See TROUBLESHOOTING.md for
+a malformed `power.json`, and for what to do when deep verification fails after
+a command already committed.
+
 ## Targeting a workspace (--root)
 
 Every command accepts a global `--root PATH` placed **before** the command:
@@ -536,10 +614,10 @@ change, no migration; `schema_version` stays `"1"`). This phase closed the
 coordinate-and-audit loop: task lifecycle (`assign`/`edit`/`status` + list
 filters), dropfile ingest, verified commit evidence (`evidence git`), the
 agent registry with vault notes, richer daily/weekly/project reviews, Home
-dashboard + index notes, and doctor hardening (now 20 checks incl. the
-non-fatal commit-evidence warning, the U-C3 secret sweep, and the two
-U-H2 warn-only lines: success runs without attributable evidence, and
-legacy blank-ref evidence rows).
+dashboard + index notes, and doctor hardening (now 21 checks incl. the
+non-fatal commit-evidence warning, the U-C3 secret sweep, the two
+U-H2 warn-only lines — success runs without attributable evidence, and
+legacy blank-ref evidence rows — and the U-E2 runtime power state line).
 
 U-M1 adds the migration kit (`migrate status` / `plan` / `apply`) and no
 schema change: the registry is empty, `schema_version` stays `"1"`, and
