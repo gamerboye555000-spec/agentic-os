@@ -1115,6 +1115,17 @@ def add_evidence(
 ) -> Evidence:
     validate_enum(kind, EVIDENCE_KINDS, "evidence kind")
     validate_provenance(provenance)
+    # U-H2 (D-v0.2.36): a blank ref proves nothing and a blank supplied
+    # claim asserts nothing — both refuse before any lookup, hashing,
+    # mutation, or event. Python str.strip() judges blankness, so NBSP /
+    # U+3000 padding counts as whitespace. claim=None (omitted) stays legal.
+    if not ref.strip():
+        raise AosError("Evidence --ref must not be blank.")
+    if claim is not None and not claim.strip():
+        raise AosError(
+            "Evidence --claim must not be blank when supplied; "
+            "omit --claim entirely instead."
+        )
     task = get_task(conn, task_id)
     sha = None
     if kind == "file":

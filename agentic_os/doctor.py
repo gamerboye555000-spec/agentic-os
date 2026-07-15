@@ -23,6 +23,12 @@ covered twice: the safe secret_warning/secret_fields/secret_patterns
 metadata (redacted post-U-C3 events carry nothing else) and a raw scan of
 legacy payload strings via the shared detector. The events.actor column
 is raw-scanned too (fixed label `actor`) for legacy pre-redaction rows.
+
+U-H2 adds two more WARN-ONLY lines: ended success runs with no acceptable
+evidence attributable inside the run-bounded recovery window
+(D-v0.2.37), and legacy evidence rows whose ref is blank after
+normalization (D-v0.2.36) — both name bounded run/evidence IDs and counts
+only, never a ref, claim, summary, or agent value.
 """
 
 from __future__ import annotations
@@ -55,6 +61,25 @@ class Check:
 #: Secret-sweep findings shown per doctor run; the rest is a count. Keeps
 #: large ledgers from producing unbounded terminal output (U-C3.5).
 SECRET_SWEEP_DISPLAY_LIMIT = 10
+
+#: Offender IDs shown per U-H2 warn line (checks 19/20); the rest is a count.
+UH2_DISPLAY_LIMIT = 10
+
+
+def _bounded_ids(offenders: list[str], noun: str) -> str:
+    """Total count plus at most the first UH2_DISPLAY_LIMIT rendered IDs —
+    output derived from ledger rows stays bounded, and only IDs are ever
+    shown, never a stored value."""
+    if not offenders:
+        return ""
+    detail = (
+        f"{len(offenders)} {noun}(s): "
+        + ", ".join(offenders[:UH2_DISPLAY_LIMIT])
+    )
+    extra = len(offenders) - UH2_DISPLAY_LIMIT
+    if extra > 0:
+        detail += f" (+{extra} more)"
+    return detail
 
 #: (entity, table, (field label, column)) — the canonical human-text
 #: fields the U-C3 sweep scans; the entity name is also the render_id key.
@@ -602,6 +627,78 @@ def run_checks(conn: sqlite3.Connection, aos_dir: Path) -> list[Check]:
             "secret-shaped text in ledger rows or event payloads",
             not secret_findings,
             detail,
+            warn_only=True,
+        )
+    )
+
+    # 19 (WARN, never fatal). U-H2 (D-v0.2.37): ended runs claiming
+    #     outcome 'success' with no acceptable evidence attributable to
+    #     them. Attribution is the run-bounded recovery window: same task,
+    #     non-blank ref (Python whitespace semantics), created_at >= the
+    #     run's started_at, and — when a later run exists for the task,
+    #     ordered by (started_at, id) — created_at strictly before that
+    #     next run's started_at. The strict bound makes the shared-second
+    #     boundary conservative: evidence at the shared timestamp never
+    #     heals the earlier run once the later one exists. evidence.run_id
+    #     is deliberately not consulted or populated. The detail names run
+    #     IDs and counts only — never a ref, claim, summary, or agent.
+    unproven_runs: list[str] = []
+    for run_row in conn.execute(
+        "SELECT id, task_id, started_at FROM runs "
+        "WHERE ended_at IS NOT NULL AND outcome = 'success' ORDER BY id"
+    ).fetchall():
+        next_row = conn.execute(
+            "SELECT started_at FROM runs WHERE task_id = ? "
+            "AND (started_at > ? OR (started_at = ? AND id > ?)) "
+            "ORDER BY started_at, id LIMIT 1",
+            (
+                run_row["task_id"],
+                run_row["started_at"],
+                run_row["started_at"],
+                run_row["id"],
+            ),
+        ).fetchone()
+        window_end = next_row["started_at"] if next_row else None
+        proven = False
+        for ev in conn.execute(
+            "SELECT ref, created_at FROM evidence "
+            "WHERE task_id = ? AND created_at >= ? ORDER BY id",
+            (run_row["task_id"], run_row["started_at"]),
+        ).fetchall():
+            if not (ev["ref"] or "").strip():
+                continue
+            if window_end is not None and ev["created_at"] >= window_end:
+                continue
+            proven = True
+            break
+        if not proven:
+            unproven_runs.append(ids.render_id("run", run_row["id"]))
+    checks.append(
+        Check(
+            "success runs without attributable evidence",
+            not unproven_runs,
+            _bounded_ids(unproven_runs, "run"),
+            warn_only=True,
+        )
+    )
+
+    # 20 (WARN, never fatal). U-H2 (D-v0.2.36): legacy evidence rows whose
+    #     ref is blank after normalization (admitted through the pre-U-H2
+    #     regex hole). Rows are named by bounded E-XXXX IDs and counts
+    #     only, and are never rewritten or deleted — the done gate still
+    #     counts them exactly as before.
+    blank_ref_rows = [
+        ids.render_id("evidence", row["id"])
+        for row in conn.execute(
+            "SELECT id, ref FROM evidence ORDER BY id"
+        ).fetchall()
+        if not (row["ref"] or "").strip()
+    ]
+    checks.append(
+        Check(
+            "evidence rows with blank refs",
+            not blank_ref_rows,
+            _bounded_ids(blank_ref_rows, "row"),
             warn_only=True,
         )
     )

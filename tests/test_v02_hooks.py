@@ -1564,7 +1564,15 @@ class TestDogfoodMatrix(unittest.TestCase):
                 self.assertNotIn(FAKE_TOKEN.encode(), path.read_bytes())
 
     def test_scenario_5_duplicate_retry_never_double_publishes(self):
-        body = dropfile(task="T-0001", summary="Retry scenario.")
+        # U-H2 boundary edit (D-v0.2.35): the scenario's identity is the
+        # duplicate/retry publish + ledger dedupe, so the success body now
+        # carries one evidence row — the ingest success gate would refuse
+        # the old success/empty-evidence shape (that refusal is pinned in
+        # tests/test_v02_success_proof.py, not here).
+        body = dropfile(
+            task="T-0001", summary="Retry scenario.",
+            evidence=["- kind: note | ref: retry-proof | claim: retried"],
+        )
         stop_code, end_code = self.run_session(fenced(body))
         self.assertEqual((stop_code, end_code), (0, 0))
         # SessionEnd retries (hook re-fired) and a full re-staged replay:

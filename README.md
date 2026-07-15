@@ -106,6 +106,19 @@ dropfile PATH` reads it back into the ledger:
   dropfile outcome; zero or several open runs ingest evidence only and say so.
 - Dedupe by file sha256 (recorded in the ingest event): re-ingesting the same
   bytes is refused. The dropfile itself is never modified or deleted.
+- **Success needs proof (U-H2).** A dropfile declaring `outcome: success`
+  must carry at least one evidence row with a non-blank ref in that same
+  file, or the whole ingest refuses atomically (exit 1, nothing written,
+  no dedupe marker — a corrected retry is never "duplicate"). Evidence
+  presence is enforced, never truth: no ref target is opened or verified.
+  `partial`, `fail`, and `unknown` remain valid with no evidence — the
+  recovery for an over-claiming agent is an honest outcome, not fabricated
+  proof. Blank evidence refs and blank claims refuse as malformed lines
+  (Unicode whitespace counts as blank), at the parser and at
+  `evidence add` alike. `run end --outcome success` stays accepted without
+  an evidence check — it is the human recovery path — and `doctor` warns
+  (never fails) about ended success runs that no non-blank evidence can be
+  attributed to between that run's start and the next run's start.
 
 ## Claude Code session hooks (U-H1)
 
@@ -136,7 +149,10 @@ two deterministic stages:
 
 **Ingest stays manual.** The hooks never run `aos`, never open the ledger,
 never read transcripts or workspace files, never call git or the network —
-they only write the two owned exports paths. You review and ingest:
+they only write the two owned exports paths. The hooks are transport-only:
+a structurally valid success envelope with an empty evidence section still
+publishes, and the U-H2 success gate then refuses it at ingest — the
+boundary where the ledger is actually written. You review and ingest:
 
 ```bash
 python aos.py ingest dropfile .agentic-os/exports/dropfile-T-XXXX-claude-code-hook-*.md
@@ -399,8 +415,10 @@ change, no migration; `schema_version` stays `"1"`). This phase closed the
 coordinate-and-audit loop: task lifecycle (`assign`/`edit`/`status` + list
 filters), dropfile ingest, verified commit evidence (`evidence git`), the
 agent registry with vault notes, richer daily/weekly/project reviews, Home
-dashboard + index notes, and doctor hardening (now 18 checks incl. the
-non-fatal commit-evidence warning and the U-C3 secret sweep).
+dashboard + index notes, and doctor hardening (now 20 checks incl. the
+non-fatal commit-evidence warning, the U-C3 secret sweep, and the two
+U-H2 warn-only lines: success runs without attributable evidence, and
+legacy blank-ref evidence rows).
 
 Deliberately deferred (unchanged triggers, see `agentic-os-two-week-plan.md`
 §4): MCP server, Obsidian plugin, vector search, background runs, two-way
