@@ -1084,6 +1084,107 @@ def cmd_doctor(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Protocol spine (U-X1) — five read-only leaves.
+#
+# Every one of these is inert: it parses bytes and compares them to an
+# embedded schema. None opens SQLite, creates power.json or workspace state,
+# emits an event, or requires an initialized workspace — so none of them uses
+# _ledger() or _resolve_aos_dir(). None follows a reference found inside an
+# artifact (D-v0.3.7).
+
+def cmd_protocol_list(args) -> int:
+    from . import protocols
+
+    entries = protocols.list_entries()
+    if args.json:
+        _print_json(
+            [
+                {
+                    "schema": entry.identity,
+                    "name": entry.name,
+                    "major": entry.major,
+                    "status": entry.status,
+                    "sha256": entry.digest,
+                }
+                for entry in entries
+            ]
+        )
+        return 0
+    width = max(len(entry.name) for entry in entries)
+    for entry in entries:
+        print(
+            f"{entry.name:<{width}}  v{entry.major}  {entry.status:<10}  "
+            f"{entry.digest}"
+        )
+    return 0
+
+
+def cmd_protocol_show(args) -> int:
+    from . import protocols
+
+    entry = protocols.get_entry(args.schema)
+    # The exact canonical representation, byte-identical to the checked-in
+    # protocols/<name>/v<major>.schema.json.
+    sys.stdout.write(entry.canonical_bytes.decode("utf-8") + "\n")
+    return 0
+
+
+def cmd_protocol_validate(args) -> int:
+    from . import protocols
+
+    document, entry = protocols.load_artifact_file(args.file)
+    # Success prints the identity and the verified digest — nothing else from
+    # the document reaches stdout.
+    print(f"{entry.identity} {document[protocols.CONTENT_HASH_FIELD]}")
+    return 0
+
+
+def cmd_protocol_digest(args) -> int:
+    from . import protocols
+
+    document = protocols.parse_canonical(protocols.read_artifact_bytes(args.file))
+    # The source file is read and never rewritten.
+    print(protocols.content_digest(document))
+    return 0
+
+
+def cmd_protocol_verify_registry(args) -> int:
+    from . import protocols
+
+    problems = protocols.verify_registry_digests()
+    entries = protocols.list_entries()
+    print(f"embedded registry: {len(entries)} schema(s)")
+    for entry in entries:
+        print(f"  {entry.identity}  {entry.status}  {entry.digest}")
+
+    source = protocols.source_artifacts_dir()
+    if source is None:
+        # A zipapp legitimately has no protocols/ directory (D-v0.3.2).
+        # Failing here would train people to ignore this command.
+        print(
+            "checked-in artifacts: comparison unavailable — no source checkout "
+            "(expected when running from aos.pyz; the embedded registry above "
+            "is the canonical definition)"
+        )
+    else:
+        source_problems = protocols.verify_source_artifacts(source)
+        problems += source_problems
+        if source_problems:
+            print(f"checked-in artifacts: {len(source_problems)} problem(s)")
+        else:
+            print("checked-in artifacts: match the embedded definitions byte-for-byte")
+
+    if problems:
+        print(
+            "Registry verification failed: " + "; ".join(problems) + ". Regenerate "
+            "with: python3 tools/gen_protocols.py",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Parser
 
 def build_parser() -> _Parser:
@@ -1500,6 +1601,54 @@ def build_parser() -> _Parser:
     )
     p_power_set.add_argument("mode", choices=list(power.MODES))
     p_power_set.set_defaults(func=cmd_power_set)
+
+    p_protocol = sub.add_parser(
+        "protocol",
+        help="protocol spine (U-X1): inspect and validate inert WorkSpec / "
+        "Result Envelope / Interrupt artifacts (read-only)",
+    )
+    protocol_sub = p_protocol.add_subparsers(
+        dest="subcommand", metavar="SUBCOMMAND", required=True
+    )
+
+    p_protocol_list = protocol_sub.add_parser(
+        "list",
+        help="list registered schemas with their digests (no workspace or "
+        "database required)",
+    )
+    p_protocol_list.add_argument("--json", action="store_true")
+    p_protocol_list.set_defaults(func=cmd_protocol_list)
+
+    p_protocol_show = protocol_sub.add_parser(
+        "show", help="print one schema's exact canonical representation"
+    )
+    p_protocol_show.add_argument(
+        "schema", metavar="SCHEMA", help="full identity, e.g. beast.work-spec/v1"
+    )
+    p_protocol_show.set_defaults(func=cmd_protocol_show)
+
+    p_protocol_validate = protocol_sub.add_parser(
+        "validate",
+        help="validate an artifact's syntax, bounds, identity, content hash "
+        "and cross-field invariants (never executes or imports it)",
+    )
+    p_protocol_validate.add_argument("file", metavar="FILE")
+    p_protocol_validate.set_defaults(func=cmd_protocol_validate)
+
+    p_protocol_digest = protocol_sub.add_parser(
+        "digest",
+        help="print an artifact's canonical content digest (never rewrites "
+        "the source file)",
+    )
+    p_protocol_digest.add_argument("file", metavar="FILE")
+    p_protocol_digest.set_defaults(func=cmd_protocol_digest)
+
+    p_protocol_verify = protocol_sub.add_parser(
+        "verify-registry",
+        help="verify the embedded registry, and the checked-in protocols/ "
+        "artifacts when running from a source checkout",
+    )
+    p_protocol_verify.set_defaults(func=cmd_protocol_verify_registry)
 
     p_hooks = sub.add_parser(
         "hooks",

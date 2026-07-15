@@ -444,6 +444,102 @@ Nothing here switches modes on its own, in any mode. See TROUBLESHOOTING.md for
 a malformed `power.json`, and for what to do when deep verification fails after
 a command already committed.
 
+## Protocol spine (U-X1)
+
+The protocol spine is the versioned, local vocabulary that Agentic OS and a
+future agent runtime will use to talk about work: what was *asked for*, what
+*came back*, and where a human needs to be *interrupted*. It is a wire format
+and nothing else — a spine to hang later integration on, built and pinned
+before there is anything on the other end of the wire.
+
+```bash
+# What schemas does this build know about, and at what digest?
+python aos.py protocol list
+
+# The exact schema, canonically serialized (identical bytes from any entrypoint):
+python aos.py protocol show beast.work-spec/v1
+
+# Validate an artifact: syntax, bounds, identity, content hash, cross-field rules.
+# On success it prints only the schema and the digest it verified.
+python aos.py protocol validate ./work-spec.json
+#> beast.work-spec/v1 357b140bfca6029f5b3311ac3764962a2f3ddd259cedd164362a951aac6d2984
+
+# What does this document's body hash to? (Reads only; never rewrites the file.)
+python aos.py protocol digest ./work-spec.json
+
+# Are the embedded definitions and the checked-in protocols/ still in agreement?
+python aos.py protocol verify-registry
+```
+
+### The artifacts are inert
+
+Three schemas, all of them declarations rather than actions:
+
+| Schema | What it is |
+|---|---|
+| `beast.work-spec/v1` | An inert declaration of requested work: goal, acceptance criteria, constraints, declared input references, the expected result contract. |
+| `beast.result-envelope/v1` | An inert, proof-carrying report bound to the exact WorkSpec content hash: honest outcome, evidence references, bounded errors, retryability. |
+| `beast.interrupt/v1` | An inert request to pause, ask, seek approval, cancel, or resume — bound to an exact artifact hash. |
+
+**Validation does not execute or import anything, and it does not import
+results into the ledger.** That is the whole boundary, and it is worth stating
+plainly:
+
+- A WorkSpec cannot carry executable Python or shell, a connection string, a
+  credential, or an environment map. These are not discouraged — every object
+  in every schema is closed, so they are *unrepresentable*.
+- A WorkSpec has no `approved: true`. It can carry an opaque `approval_ref`
+  pointing at an approval record owned by some other system, which is a
+  reference, not a claim. No artifact in this protocol can authorize itself.
+- A Result Envelope does not mark a task done, end a run, create evidence,
+  authorize spend, or mutate SQLite. Something reporting `outcome: success` is
+  a claim by a party you have not yet decided to trust. Importing and replaying
+  envelopes into the ledger is deliberately a later unit.
+- An `input` reference, a `url`, or a declared `sha256` is never opened,
+  fetched, stat'd or hashed. Hashing a path that an untrusted artifact chose
+  would be a read primitive handed to whoever wrote the artifact.
+- `protocol validate` on a hostile file is safe in the way `cat` is safe. It
+  reads bytes and compares them to a schema.
+
+### Canonical hashing
+
+Every artifact carries `content_sha256` over its own body. The rule is exact:
+serialize the document in **`aos-canonical-json/v1`** (UTF-8, no BOM, no
+insignificant whitespace, keys sorted by code point, no floats, no duplicate
+keys, bounded everywhere) with **only the top-level `content_sha256` member
+removed**, then take lowercase SHA-256. Nothing else is excluded, and the body
+being hashed never contains the hash.
+
+That makes the digest independent of how the file is laid out — a
+pretty-printed and a compact copy of the same artifact hash identically — and
+makes tampering with the payload, the metadata, the schema identity, or the
+hash itself all fail the same check. `aos-canonical-json/v1` is a local format;
+it is deliberately **not** claimed to be RFC 8785, and the four divergences are
+listed in the contract.
+
+Bounds are pinned, not tuned: 256 KiB per artifact, depth 32, 256 object
+members, 256 array items, 8192-character strings, and integers restricted to
+the ±(2⁵³−1) range that survives a consumer whose JSON parser has no integer
+type.
+
+### Where the definitions live
+
+The embedded Python definitions in `agentic_os/protocols.py` are canonical, so
+`aos.pyz` carries the whole registry in one file with no data directory. The
+checked-in JSON under `protocols/` is a deterministic projection of them, kept
+for review and future vendoring, and verified byte-for-byte — never a second
+place to edit. To regenerate it after changing a schema:
+
+```bash
+python3 tools/gen_protocols.py            # verify (default; writes nothing)
+python3 tools/gen_protocols.py --write    # regenerate
+```
+
+All five `protocol` commands are `read_only`: none opens SQLite, creates
+`power.json` or workspace state, emits a ledger event, or needs an initialized
+workspace. They work from an empty directory, and from `aos.pyz` with no
+checkout at all.
+
 ## Targeting a workspace (--root)
 
 Every command accepts a global `--root PATH` placed **before** the command:

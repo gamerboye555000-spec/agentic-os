@@ -194,6 +194,14 @@ COMMAND_POLICY: dict[tuple[str, ...], CommandPolicy] = {
     ("migrate", "plan"): _p(READ_ONLY),
     ("power", "status"): _p(READ_ONLY),
     ("power", "suggest"): _p(READ_ONLY),
+    # U-X1 protocol spine. Inert by construction: each parses bytes and
+    # compares them to an embedded schema. No SQLite, no power.json, no
+    # workspace state, no events, no execution of artifact content.
+    ("protocol", "list"): _p(READ_ONLY),
+    ("protocol", "show"): _p(READ_ONLY),
+    ("protocol", "validate"): _p(READ_ONLY),
+    ("protocol", "digest"): _p(READ_ONLY),
+    ("protocol", "verify-registry"): _p(READ_ONLY),
 
     # Explicitly safe under recovery: never mutates the live ledger.
     # backup verify reads a backup copy; backup restore writes a distinct
