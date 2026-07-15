@@ -939,3 +939,126 @@ Check with:
 ```bash
 python aos.py --root /path/to/workspace power status
 ```
+
+## Protocol spine (U-X1)
+
+Every `protocol` command is read-only. None of them opens the ledger, creates
+`power.json`, writes workspace state, or needs an initialized workspace — so
+nothing in this section can have damaged anything. Diagnostics here name a
+**reason code** in brackets and a schema-safe field path, and never echo the
+value that failed: if you need to see the value, look at your file.
+
+### `[hash_mismatch] at /content_sha256`
+
+The document's `content_sha256` does not match what its body actually hashes
+to. Exactly one of two things happened: the body was modified after the hash
+was written, or the hash was substituted. There is no third possibility, and
+the check cannot tell you which — that is what makes it useful.
+
+What it is **not**: a formatting problem. The digest is taken over the
+canonical serialization, so re-indenting, reordering keys, or switching between
+compact and pretty-printed JSON does not change it. Check with:
+
+```bash
+# What does the body actually hash to?
+python aos.py protocol digest ./artifact.json
+
+# What does the file claim? (Compare the two.)
+grep content_sha256 ./artifact.json
+```
+
+If the digest command prints the value you expected, the `content_sha256` field
+is wrong; fix the field. If it prints something else, the body changed — the
+artifact is not the one that was signed. Do not "fix" it by pasting in the
+computed digest unless you know why the body differs: that turns a detected
+tamper into an undetected one.
+
+Producers must compute the hash the same way: canonicalize the document with
+the top-level `content_sha256` member **removed** (and nothing else removed),
+then SHA-256 those bytes. A nested `content_sha256` inside a sub-object is
+ordinary body content and stays in.
+
+### `[unsupported_major]` or `[unknown_schema]` at `/schema`
+
+- `unsupported_major` — the schema *name* is known but this build does not
+  support that major version, e.g. `beast.work-spec/v2` against a v1-only
+  build. Majors are never auto-upgraded and there is no `latest` alias: a
+  version you did not ask for is a schema you did not review. Upgrade the
+  build, or ask the producer for the major you support.
+- `unknown_schema` — the name itself is unknown. Check spelling against
+  `python aos.py protocol list`, and note that a **full identity is required**:
+  `beast.work-spec` is refused, `beast.work-spec/v1` is accepted.
+
+```bash
+python aos.py protocol list      # names, majors, digests, status
+```
+
+### `[unknown_hash_alg] at /content_hash_alg`
+
+The artifact was produced with a hashing version this build does not know. Only
+`aos-sha256-canonical/v1` exists today. This is a producer mismatch, not a
+corrupt file — do not edit the field to make the message go away, because the
+field is describing how the digest you are about to trust was computed.
+
+### `[unsafe_input]` — "Only a regular file is accepted here"
+
+The path is a symlink, directory, FIFO, socket, or device. Protocol commands
+`lstat` first and never follow: a symlink is *seen* as a symlink rather than
+resolved to whatever it points at, and a FIFO would otherwise block forever.
+The diagnostic names the object kind and the file's **basename only** — never
+an absolute path.
+
+Pass the real regular file. If you meant to follow the link, resolve it
+yourself and pass the target, deliberately:
+
+```bash
+python aos.py protocol validate "$(readlink -f ./link.json)"
+```
+
+Related: `[unreadable]` is a missing file or a permissions problem;
+`[file_changed_during_read]` means the file's identity or size changed between
+the safety check and the read (something is writing it while you validate);
+`[too_large]` means it exceeds the 256 KiB bound, which is checked *before* the
+file is opened.
+
+### `verify-registry` says source comparison is unavailable
+
+```
+checked-in artifacts: comparison unavailable — no source checkout
+```
+
+Expected, and not a failure — the exit code is 0. You are running from
+`aos.pyz`, which carries the embedded definitions but no `protocols/`
+directory. The embedded registry (printed above that line, with digests) is
+canonical; the checked-in files are only a projection of it, and there is
+nothing to compare against because nothing is missing. Run the command from a
+source checkout if you want the comparison.
+
+### Regenerating or verifying the checked-in `protocols/` artifacts
+
+The Python definitions in `agentic_os/protocols.py` are the single source of
+truth. `protocols/*.json` is generated from them. Never edit the JSON by hand —
+`verify-registry` and the focused tests both compare it byte-for-byte, so a
+hand edit fails immediately and a *matching* hand edit to both places is just a
+schema change wearing a disguise.
+
+```bash
+# Verify (default — writes nothing, exits 1 on drift):
+python3 tools/gen_protocols.py
+
+# Regenerate after changing a schema definition in agentic_os/protocols.py:
+python3 tools/gen_protocols.py --write
+
+# Confirm, including the embedded digests:
+python aos.py protocol verify-registry
+```
+
+If `verify-registry` reports `does not match the embedded definition`, the
+checkout drifted: regenerate with `--write` and commit the result together with
+the Python change that caused it. If it reports `not a projection of any
+embedded schema`, there is a stray `.json` under `protocols/` that no schema
+generates — delete it, or add the schema it was meant to project.
+
+Changing a schema changes its digest, and the digest is what a future consumer
+vendors. A digest change is a protocol change: if consumers already exist, mint
+a new major rather than editing a published one in place.

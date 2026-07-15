@@ -2370,3 +2370,117 @@ rewriting prior entries.
   atomic. One bounded consequence is documented rather than papered over: an
   idempotent no-op reports the state it observed, and a concurrent set may land
   after it — the file is still one complete valid state.
+
+## v0.3 — U-X1: WorkSpec and Result Envelope protocol spine
+
+- **D-v0.3.1 — Agentic OS owns the initial protocol registry.** The registry
+  ships in this repository, not in AICompany and not in a shared package. AOS is
+  the system of record, and the protocol spine is part of that record. Consumers
+  vendor it by digest later; nothing in U-X1 reaches across a repository
+  boundary. Building the registry where the first consumer happens to live would
+  have made the second consumer a fork.
+
+- **D-v0.3.2 — The Python embedded definitions are canonical.** `aos.pyz` is one
+  file with no data directory, so a registry that lived in `protocols/*.json`
+  would make the zipapp non-functional the moment it left the checkout. The
+  embedded definitions in `agentic_os/protocols.py` are the single source of
+  truth, and `agentic_os/protocols.py` enters the archive through the existing
+  U-P1 allowlist with no packaging change at all — the allowlist design working
+  as intended.
+
+- **D-v0.3.3 — Checked-in JSON artifacts are deterministic projections.**
+  `protocols/` exists so the schemas are reviewable in a diff and vendorable by a
+  future consumer. It is a projection, never a second editable source:
+  `protocol verify-registry` and a focused test compare it byte-for-byte against
+  the embedded definitions, and `verify_source_artifacts` additionally refuses a
+  stray `.json` under `protocols/` that projects no embedded schema. Editing
+  `protocols/` without editing the Python fails both.
+
+- **D-v0.3.4 — No general-purpose JSON Schema claim.** The validator supports an
+  explicit, small, enumerated subset, and every unsupported keyword is named. The
+  registry lint refuses a schema that uses any of them, so the guarantee is
+  structural rather than aspirational: the registry cannot drift into relying on
+  a keyword the engine silently ignores. A partial implementation that quietly
+  skips `oneOf` is worse than no claim at all, because it validates less than a
+  reader believes it does.
+
+- **D-v0.3.5 — No floats in protocol v1.** Floating point has no canonical
+  decimal form that survives a round trip across languages, so a float field
+  would make the content hash unstable by construction. Numbers are integers in
+  the IEEE-754 safe range (±(2⁵³−1)) — the range that survives a consumer whose
+  JSON parser has no integer type. Durations, budgets and sizes are integers in
+  explicit units.
+
+- **D-v0.3.6 — The content hash excludes exactly its own field.** The digest is
+  computed over the canonical serialization of the document with the *top-level*
+  `content_sha256` member removed and nothing else removed. A `content_sha256`
+  nested inside a sub-object is ordinary body content and stays in. No recursive
+  self-hashing, no placeholder value, no ordering dependence: what gets hashed
+  never contains the hash.
+
+- **D-v0.3.7 — Protocol validation is inert and read-only.** Validation parses
+  bytes and compares them to a schema. It never executes, imports, evals,
+  resolves, fetches, opens or stats anything an artifact *references*. A `sha256`
+  inside a WorkSpec is a declared reference, and the validator does not go hash
+  the file it names — hashing a path an untrusted artifact chose is a read
+  primitive handed to the artifact's author. All five leaves are `read_only` and
+  open no SQLite connection.
+
+- **D-v0.3.8 — AICompany vendoring and cross-repository replay are deferred.** A
+  Result Envelope is a report produced by a party whose claims are not yet
+  trusted, not an instruction. Nothing in U-X1 marks a task done, ends a run,
+  creates evidence or authorizes spend. Import and replay are a later bounded
+  unit, and the honest place to draw that line is before the ledger, not inside
+  it.
+
+- **D-v0.3.9 — v1 reserves no extension object.** The unit's brief permitted one
+  bounded extension object; v1 declines it. Every schema rejects unknown
+  top-level fields with no exceptions. An extension object would be an
+  unvalidated pocket inside a signed body — the one region of the document where
+  "we bound everything" stops being true. Forward compatibility is bought by
+  minting `/v2`, which the registry is already built to carry.
+
+- **D-v0.3.10 — Existing vocabularies are reused exactly, or not at all.** The
+  Result Envelope `outcome` enum IS `models.RUN_OUTCOMES` and evidence `kind` IS
+  `models.EVIDENCE_KINDS` — asserted by test against the production tuples rather
+  than copied, so the two cannot drift apart silently. Protocol-only concepts
+  (data classification, permitted destinations, compensation state) get new
+  closed vocabularies. No existing domain vocabulary is broadened.
+
+- **D-v0.3.11 — Key ordering is by Unicode code point, and that is stated rather
+  than dressed up as RFC 8785.** RFC 8785 sorts by UTF-16 code unit; the two
+  orders differ for non-BMP keys. AOS sorts by code point because that is what
+  Python's native string comparison already does, and hand-rolling a UTF-16
+  re-implementation would be a correctness risk taken purely to earn a compliance
+  badge this unit does not claim. The format is named `aos-canonical-json/v1`,
+  and all four known divergences from RFC 8785 are written down.
+
+- **D-v0.3.12 — Generation lives in `tools/`, never in the CLI.** The CLI is
+  read-only by classification, so it cannot regenerate `protocols/`.
+  `tools/gen_protocols.py` writes the projection (and verifies it by default,
+  writing only with `--write`), mirroring the existing `tools/build_zipapp.py`
+  convention. It is excluded from the zipapp for free, because `tools/` is not
+  under the package allowlist.
+
+- **D-v0.3.13 — Schema patterns anchor with `^…$` and are applied with
+  `fullmatch`: a deliberate, narrow departure from D-v0.2.3.** The existing rule
+  ("anchor with `\Z`, never `$`") exists because Python's `$` also matches
+  *before* a trailing newline, so `^slug$` would accept `"proj\n"`. That hole is
+  closed here by a different mechanism: `re.fullmatch` requires the pattern to
+  consume the whole string, so `fullmatch(r"^abc$", "abc\n")` fails — `$` consumes
+  nothing and the `\n` is left over. The reason to prefer `$` is that these
+  patterns are *exported* in `protocols/*.schema.json` for future consumers, and
+  `\Z` is not ECMA-262: a JavaScript-side validator would read it as a literal
+  `Z` and silently enforce the wrong grammar. `^…$` means exactly fullmatch in
+  ECMA-262. So: `$` in the artifact, `fullmatch` in the engine, D-v0.2.3's
+  guarantee intact, and a focused test pinning the trailing-newline refusal.
+
+- **D-v0.3.14 — The protocol id grammar is a strict narrowing of the ledger's
+  parser, not a copy of it.** `ids.parse_id()` is deliberately lenient at the CLI
+  boundary: it upper-cases the prefix and strips surrounding whitespace, so
+  `t-0002`, `T-0002 ` and `\tT-0002\n` all mean task 2 to a human typing at a
+  terminal. The protocol accepts only `T-0002`. Leniency is right for a human
+  boundary and wrong for a wire format, where two spellings of one id are two
+  idempotency keys, two correlation targets and two audit trails. Narrowing stays
+  compatible (every id the protocol accepts, `parse_id` accepts identically);
+  broadening would not have.
