@@ -307,6 +307,65 @@ Memory in context packs: the pack MEMORY section carries live rows only
 project. Retired and superseded rows stay in the ledger and in
 `memory list` forever — they only stop being fed to agents.
 
+## Schema migrations (U-M1)
+
+**Today there is nothing to migrate.** The schema is at version 1, this
+build supports version 1, and the migration registry is deliberately empty.
+U-M1 ships the machinery — backup-first, transactional, forward-only —
+*before* the first schema change exists, so no schema change ever has to
+invent its own safety net. U-M2 (memory v2) stays blocked until U-M1 merges.
+
+```bash
+# Where am I, what does this build support, is anything pending?
+python aos.py migrate status
+
+# What exactly would run, in order? (read-only; writes nothing)
+python aos.py migrate plan
+
+# Run it. No-op today.
+python aos.py migrate apply
+```
+
+`status` and `plan` are read-only *byte-for-byte*: they open the database
+through a connection SQLite itself refuses writes on, and leave no `-wal`,
+`-shm`, or temporary file behind. With nothing pending, `apply` is a
+successful no-op that never opens the database read-write at all — no
+backup, no event, not one byte changed.
+
+**Nothing auto-migrates.** No normal command will ever quietly change your
+schema. A database at an unsupported version is refused by every command
+exactly as it always was; `migrate apply` is the only door, and you open it
+deliberately. That refusal is a feature — an unexpected version means
+something is wrong, and guessing is how data dies.
+
+**Backup first, always.** Before the first schema change of a real
+migration, `apply` acquires the SQLite write lock, re-confirms the version
+*under that lock*, takes a snapshot through the same U-C2 backup machinery
+`backup create` uses, and verifies it (sha256 + `integrity_check`). Only
+then does the first step run. If the snapshot cannot be written or cannot be
+verified, nothing is migrated. The lock is held from the snapshot through
+the first step's commit, so the snapshot is provably the pre-migration state
+— no other writer can slip in between.
+
+**Every step is one transaction** carrying three things together: the schema
+change, the exact version bump, and one `system/migrate` event naming the
+transition, the migration id, and the snapshot. They commit together or they
+all disappear. A failed step rolls back completely and no later step runs.
+
+**Rollback is restore.** There is no automatic un-migration across committed
+steps — a step that committed is a fact, and reversing schema changes
+programmatically is how backups get quietly bypassed. If a later step fails
+after an earlier one committed, `apply` says so plainly ("PARTIALLY
+ADVANCED"), tells you the version you are actually at, and prints the exact
+`backup restore` command for the pre-migration snapshot. Fixing the
+migration and re-running resumes from the version actually committed —
+completed steps never replay. See RECOVERY.md.
+
+**Never hand-edit `schema_version`.** It is not a dial that makes a database
+compatible; it is a claim about what the bytes on disk look like. Editing it
+makes the ledger lie to every check that protects it. If `migrate status`
+refuses, read TROUBLESHOOTING.md.
+
 ## Targeting a workspace (--root)
 
 Every command accepts a global `--root PATH` placed **before** the command:
@@ -481,6 +540,13 @@ dashboard + index notes, and doctor hardening (now 20 checks incl. the
 non-fatal commit-evidence warning, the U-C3 secret sweep, and the two
 U-H2 warn-only lines: success runs without attributable evidence, and
 legacy blank-ref evidence rows).
+
+U-M1 adds the migration kit (`migrate status` / `plan` / `apply`) and no
+schema change: the registry is empty, `schema_version` stays `"1"`, and
+every database from every earlier build still works unmodified. U-M2 (memory
+v2) is blocked until U-M1 is merged — the framework lands first, so the
+first real schema change arrives into something that already snapshots,
+verifies, and refuses.
 
 Deliberately deferred (unchanged triggers, see `agentic-os-two-week-plan.md`
 §4): MCP server, Obsidian plugin, vector search, background runs, two-way

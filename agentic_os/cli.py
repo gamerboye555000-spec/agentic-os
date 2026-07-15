@@ -697,6 +697,98 @@ def cmd_backup_restore(args) -> int:
     return 0
 
 
+def _migrate_db_path(args) -> Path:
+    """The live ledger path for a migrate subcommand.
+
+    Deliberately not `_ledger`: db.open_db() refuses any version !=
+    SCHEMA_VERSION, and a database pending migration is by definition at a
+    lower version — the gate migration must be able to walk through. The
+    gate stays in force for every other command.
+    """
+    return _resolve_aos_dir(args) / utils.DB_FILENAME
+
+
+def cmd_migrate_status(args) -> int:
+    from . import migrations
+
+    report = migrations.status(_migrate_db_path(args))
+    if args.json:
+        _print_json(report)
+        return 0
+    print(f"database:        {report['db_path']}")
+    print(f"schema version:  {report['current_version']}")
+    print(f"build supports:  {report['latest_version']}")
+    if report["pending"]:
+        print(f"pending:         yes ({len(report['plan'])} migration(s))")
+        print("Run: python aos.py migrate plan")
+    else:
+        print("pending:         no — the database is up to date")
+    return 0
+
+
+def cmd_migrate_plan(args) -> int:
+    from . import migrations
+
+    report = migrations.plan_report(_migrate_db_path(args), target=args.target)
+    if args.json:
+        _print_json(report)
+        return 0
+    print(f"database:        {report['db_path']}")
+    print(f"schema version:  {report['current_version']}")
+    print(f"target version:  {report['target_version']}")
+    if not report["steps"]:
+        print("No migrations pending. Nothing would run.")
+        return 0
+    print(f"{len(report['steps'])} migration(s) would run, in order:")
+    for step in report["steps"]:
+        print(f"  {step['from']} → {step['to']}  {step['migration_id']}")
+    print(
+        "A verified snapshot is taken before the first change. "
+        "Run: python aos.py migrate apply"
+    )
+    return 0
+
+
+def cmd_migrate_apply(args) -> int:
+    from . import migrations
+
+    aos_dir = _resolve_aos_dir(args)
+    try:
+        result = migrations.apply_migrations(aos_dir, target=args.target)
+    except migrations.MigrationStepError as exc:
+        # Partial advancement is the one failure a human must be told how to
+        # get out of; everything else left the database untouched.
+        lines = [str(exc)]
+        if exc.applied:
+            last = exc.applied[-1]
+            lines.append(
+                f"The database is PARTIALLY ADVANCED: {len(exc.applied)} "
+                f"migration(s) committed, and it is now at version "
+                f"{last['to']}. This is a real state, not a broken one — "
+                "`migrate status` reports it, and a corrected retry resumes "
+                "from there without replaying committed steps."
+            )
+        if exc.snapshot is not None:
+            lines.append(
+                migrations.restore_hint(
+                    exc.snapshot, aos_dir / utils.DB_FILENAME
+                )
+            )
+        raise AosError("\n".join(lines))
+    if not result["migrated"]:
+        print(
+            f"No migrations pending (schema version "
+            f"{result['current_version']}); nothing to do."
+        )
+        print("No snapshot was taken and no event was written.")
+        return 0
+    print(f"Snapshot: {result['snapshot']}")
+    for step in result["applied"]:
+        print(f"  applied {step['from']} → {step['to']}  {step['migration_id']}")
+    print(f"Schema version is now {result['current_version']}.")
+    return 0
+
+
 def cmd_sync(args) -> int:
     export_to = getattr(args, "export_to", None)
     if getattr(args, "dry_run", False) and export_to is None:
@@ -1250,6 +1342,47 @@ def build_parser() -> _Parser:
         help="target database file path; must not exist yet",
     )
     p_backup_restore.set_defaults(func=cmd_backup_restore)
+
+    p_migrate = sub.add_parser(
+        "migrate",
+        help="schema migrations (U-M1): status / plan / apply. Nothing else "
+        "ever migrates — normal commands refuse an unsupported version "
+        "rather than silently changing your database.",
+    )
+    migrate_sub = p_migrate.add_subparsers(
+        dest="subcommand", metavar="SUBCOMMAND", required=True
+    )
+
+    p_migrate_status = migrate_sub.add_parser(
+        "status",
+        help="report current/supported schema version and whether "
+        "migrations are pending (read-only)",
+    )
+    p_migrate_status.add_argument("--json", action="store_true")
+    p_migrate_status.set_defaults(func=cmd_migrate_status)
+
+    p_migrate_plan = migrate_sub.add_parser(
+        "plan",
+        help="print the ordered version transitions that would run "
+        "(read-only; writes nothing)",
+    )
+    p_migrate_plan.add_argument(
+        "--target", type=int, default=None, metavar="N",
+        help="stop at version N (must be supported and not below current)",
+    )
+    p_migrate_plan.add_argument("--json", action="store_true")
+    p_migrate_plan.set_defaults(func=cmd_migrate_plan)
+
+    p_migrate_apply = migrate_sub.add_parser(
+        "apply",
+        help="run pending migrations, taking a verified snapshot before the "
+        "first change (no-op when nothing is pending)",
+    )
+    p_migrate_apply.add_argument(
+        "--target", type=int, default=None, metavar="N",
+        help="stop at version N (must be supported and not below current)",
+    )
+    p_migrate_apply.set_defaults(func=cmd_migrate_apply)
 
     p_sync = sub.add_parser("sync", help="regenerate the Obsidian mirror")
     p_sync.add_argument(

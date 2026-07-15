@@ -24,6 +24,13 @@ to the backup.
 `restore` verifies first, then copies to a NEW path only (open(..., "xb"));
 there is no overwrite flag by design (v0.2). Adopting the restored file as
 the live ledger is the human's move, mirroring human-controlled git.
+
+U-M1 split `create_backup` into `write_backup_pair` (files + manifest, no
+event) plus the event, and gave `verify_backup` an `expected_schema_version`
+override. Both exist so migrations can reuse this machinery verbatim rather
+than growing a second copy of it; see the U-M1 contract (M1.7) for why a
+pre-migration snapshot must be eventless and must verify against the version
+it was taken at. `backup create`/`verify` behavior is unchanged.
 """
 
 from __future__ import annotations
@@ -95,8 +102,15 @@ def _open_ro(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def create_backup(conn: sqlite3.Connection, aos_dir: Path) -> dict:
-    """Back up the live ledger into <aos_dir>/backups/ with a manifest.
+def write_backup_pair(conn: sqlite3.Connection, aos_dir: Path) -> dict:
+    """Write the backup + manifest pair. Files only — emits NO event.
+
+    The eventless half of `create_backup`, exposed for U-M1: a migration
+    takes its pre-migration snapshot while holding the write lock, and
+    emitting an event here would require a commit that releases that lock
+    and reopens the very race the lock closes. The migration records the
+    snapshot inside its own `system/migrate` event instead, committed
+    atomically with the step it protects.
 
     Returns {"path", "manifest_path", "manifest"}. The backups folder is
     created lazily on first use — it is not part of the required workspace
@@ -133,6 +147,21 @@ def create_backup(conn: sqlite3.Connection, aos_dir: Path) -> dict:
     }
     manifest_path = manifest_path_for(backup_path)
     utils.write_text_lf(manifest_path, utils.json_dumps(manifest))
+    return {"path": backup_path, "manifest_path": manifest_path,
+            "manifest": manifest}
+
+
+def create_backup(conn: sqlite3.Connection, aos_dir: Path) -> dict:
+    """Back up the live ledger into <aos_dir>/backups/ with a manifest, and
+    record the audit event.
+
+    The event is emitted AFTER the files are written, so the backup never
+    contains its own event (same rule as `snapshot`).
+    """
+    result = write_backup_pair(conn, aos_dir)
+    backup_path = result["path"]
+    manifest_path = result["manifest_path"]
+    manifest = result["manifest"]
     with db.transaction(conn):
         events.emit(
             conn,
@@ -144,8 +173,8 @@ def create_backup(conn: sqlite3.Connection, aos_dir: Path) -> dict:
                 "filename": backup_path.name,
                 "path": f"{BACKUPS_DIRNAME}/{backup_path.name}",
                 "manifest": f"{BACKUPS_DIRNAME}/{manifest_path.name}",
-                "sha256": sha256,
-                "size_bytes": size_bytes,
+                "sha256": manifest["sha256"],
+                "size_bytes": manifest["size_bytes"],
                 "schema_version": manifest["schema_version"],
                 "note": (
                     "backup files were written before this event; "
@@ -153,8 +182,7 @@ def create_backup(conn: sqlite3.Connection, aos_dir: Path) -> dict:
                 ),
             },
         )
-    return {"path": backup_path, "manifest_path": manifest_path,
-            "manifest": manifest}
+    return result
 
 
 def _manifest_problem(manifest) -> str | None:
@@ -182,10 +210,19 @@ def _manifest_problem(manifest) -> str | None:
     return None
 
 
-def verify_backup(backup_path: Path) -> list[VerifyCheck]:
+def verify_backup(
+    backup_path: Path, *, expected_schema_version: str | None = None
+) -> list[VerifyCheck]:
     """Ordered checks, stopping at the first failure (each later check
     assumes the earlier ones). Read-only: never opens the live ledger,
-    never writes a byte anywhere."""
+    never writes a byte anywhere.
+
+    `expected_schema_version` defaults to this build's SCHEMA_VERSION — the
+    question `backup verify` answers is "can this build use this backup?".
+    U-M1 passes the version the snapshot was actually taken at: once a build
+    supports version N, a correct pre-migration snapshot of an N-1 database
+    would otherwise fail this check and migration could never run.
+    """
     checks: list[VerifyCheck] = []
 
     def passed(name: str, detail: str = "") -> None:
@@ -258,11 +295,18 @@ def verify_backup(backup_path: Path) -> list[VerifyCheck]:
                 f"backup says {version!r}, manifest says "
                 f"{manifest['schema_version']!r}",
             )
-        if version != db.SCHEMA_VERSION:
+        if expected_schema_version is None:
+            if version != db.SCHEMA_VERSION:
+                return failed(
+                    "schema_version supported",
+                    f"backup is schema {version!r}, this build supports "
+                    f"{db.SCHEMA_VERSION!r}",
+                )
+        elif version != expected_schema_version:
             return failed(
                 "schema_version supported",
-                f"backup is schema {version!r}, this build supports "
-                f"{db.SCHEMA_VERSION!r}",
+                f"backup is schema {version!r}, expected "
+                f"{expected_schema_version!r}",
             )
         passed("schema_version supported", str(version))
 

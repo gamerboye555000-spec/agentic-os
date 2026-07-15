@@ -116,6 +116,97 @@ Check `.agentic-os/exports/` for `events-*.jsonl` files newer than the
 backup — they list every event and can guide re-entering lost work by
 hand.
 
+## Rolling back a migration (U-M1)
+
+**Rollback IS restore.** There is no `migrate down`, no automatic
+un-migration, and there never will be one that runs on its own. Reversing a
+schema change programmatically is guesswork, and doing it automatically
+would silently bypass the snapshot taken to protect you. The snapshot is the
+rollback.
+
+Today this drill is theoretical: the migration registry is empty, so
+`migrate apply` is always a no-op and takes no snapshot. It is written now
+because the first real migration must not be the first time anyone reads it.
+
+### What `migrate apply` guarantees before it changes anything
+
+1. the whole migration path is validated (a bad registry is refused before
+   any file is written);
+2. the SQLite write lock is taken — no other writer can move underneath it;
+3. the version is re-read and re-confirmed *under that lock*;
+4. a snapshot is written into `.agentic-os/backups/` through the same
+   machinery as `backup create` (SQLite backup API + manifest);
+5. that snapshot is **verified** (sha256 + `integrity_check`);
+6. only then does the first step run — and the lock is still held, so the
+   snapshot is provably the pre-migration state.
+
+If any of 1-5 fails, nothing is migrated and the database is untouched.
+Each step then commits its schema change, its version bump, and its
+`system/migrate` event as one transaction — all three, or none.
+
+### Drill: a migration failed and you want to go back
+
+```bash
+# 0. Stop. Do not run more aos commands against the workspace.
+
+# 1. Find out where you ACTUALLY are. A failed step rolls back completely,
+#    so you may not have moved at all:
+python3 aos.py migrate status
+
+# 2. The failure message named the snapshot. Find it if you lost it — it is
+#    the newest backup, written just before the migration:
+ls -t .agentic-os/backups/*.db
+
+# 3. Verify it BEFORE trusting it:
+python3 aos.py backup verify .agentic-os/backups/aos-backup-<stamp>.db
+
+# 4. Move the migrated database aside — never delete it, and take its WAL
+#    companions with it (a stale -wal next to a restored db is poison):
+mv .agentic-os/aos.db     .agentic-os/aos.db.migrated-$(date -u +%Y%m%dT%H%M%SZ)
+mv .agentic-os/aos.db-wal .agentic-os/aos.db-wal.migrated 2>/dev/null
+mv .agentic-os/aos.db-shm .agentic-os/aos.db-shm.migrated 2>/dev/null
+
+# 5. Restore the pre-migration snapshot to the now-free live path:
+python3 aos.py backup restore .agentic-os/backups/aos-backup-<stamp>.db \
+    --to .agentic-os/aos.db
+
+# 6. Prove the patient is alive, and that you are back where you started:
+python3 aos.py doctor
+python3 aos.py migrate status      # should report the ORIGINAL version
+python3 aos.py sync
+```
+
+Anything written to the ledger *after* the snapshot — which means during the
+migration itself — is gone. That is a very short window by design: the write
+lock is held from the snapshot onward, so nothing else could have committed
+during it.
+
+### "PARTIALLY ADVANCED": an earlier step committed, a later one failed
+
+This is a **real, consistent state**, not a corrupt one. Every committed
+step was atomic; you are genuinely at the version reported. You choose:
+
+- **Fix the migration and re-run** (usually right). `migrate apply` resumes
+  from the version actually committed and never replays completed steps:
+  ```bash
+  python3 aos.py migrate status     # confirm the real version
+  python3 aos.py migrate apply
+  ```
+- **Go all the way back.** Run the drill above with the snapshot named in
+  the failure message — it is the *pre-migration* snapshot, so it returns
+  you to the version you started at, not to the half-advanced state.
+
+### Do not
+
+- **Do not** hand-edit `meta.schema_version` to "fix" a partial migration.
+  It is a claim about what the bytes on disk are, not a compatibility dial.
+  Editing it makes every later check — including `backup verify` — certify
+  a lie. The database keeps the old shape and the tool now believes the new
+  one; that is worse than the failure you started with.
+- **Do not** restore a snapshot without verifying it first (step 3).
+- **Do not** delete the migrated database before the restore is proven
+  (step 4 moves it aside for exactly this reason).
+
 ## Restoring somewhere else (inspection copy)
 
 `restore` writes to any path that does not exist yet, so you can open a

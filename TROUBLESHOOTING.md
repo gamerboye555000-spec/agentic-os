@@ -632,3 +632,148 @@ There is nothing to clean first — the rebuild replaces the destination
 atomically. If you suspect a stale copy, check what you are actually
 running (`which aos.pyz`, or the path you typed): a copy you made earlier
 somewhere else does not change when you rebuild `dist/aos.pyz`.
+
+## Schema migrations (U-M1)
+
+### The model in one paragraph
+
+The schema is at version 1, this build supports version 1, and the
+migration registry is **empty** — today `migrate status` always says
+nothing is pending, and `migrate apply` is always a no-op. U-M1 exists so
+the *first* schema change (U-M2, memory v2) arrives into a framework that
+already snapshots, verifies, and refuses, rather than inventing safety on
+the day it is needed. Three commands: `migrate status` (where am I),
+`migrate plan` (what would run), `migrate apply` (run it). `status` and
+`plan` are read-only byte-for-byte and leave no `-wal`/`-shm` behind.
+Nothing else in the system ever migrates: an unsupported version is
+refused by every normal command exactly as before. Migrations are
+forward-only and one version at a time; rollback is restoring the verified
+pre-migration snapshot (RECOVERY.md), never an automatic un-migration.
+
+### "No migrations pending" — is something broken?
+
+No. That is the correct and expected answer for every database on this
+build. `migrate apply` printing:
+
+```
+No migrations pending (schema version 1); nothing to do.
+No snapshot was taken and no event was written.
+```
+
+means exactly what it says: no backup, no event, no byte changed. The
+no-op path never even opens the database read-write.
+
+### "Database schema_version is … but this build supports '1'."
+
+A **normal** command (`status`, `task list`, `sync`, …) refusing like this
+is U-C1 behavior, unchanged by U-M1, and it is correct: this build does
+not understand that database. It will not guess, and it will not quietly
+migrate. Run `python3 aos.py migrate status` to see the version, the
+supported version, and whether a path exists.
+
+- **Version is lower and a migration exists** → `migrate plan`, then
+  `migrate apply`.
+- **Version is lower and no migration exists** (today: any version below
+  1) → this build cannot reach it. Use the build that wrote it, or restore
+  a backup that verifies.
+- **Version is higher** → see below.
+
+### "Database schema version N is newer than this build supports (1)."
+
+The database was written by a newer Agentic OS. **Upgrade the tool, do not
+touch the database.** This build refuses to migrate, read, or "fix" it, and
+the refusal changes nothing on disk — the version row is left exactly as
+found. Downgrading a schema is not supported and never will be silently
+attempted: `migrate plan --target 0` refuses too.
+
+Getting a newer version by accident usually means two builds share one
+workspace. Point them at the same version of the tool.
+
+### "Database has no schema_version row." / "no `meta` table"
+
+The database is not an Agentic OS ledger, or it is damaged. Nothing is
+assumed — a missing version is not treated as version 1, because guessing
+and then migrating is how a half-recognized file gets rewritten into
+garbage. Verify a backup and restore it (RECOVERY.md).
+
+### "Database schema_version '…' is not an integer / is not canonical"
+
+The version is stored as a canonical base-10 integer string: `"1"`. Values
+like `"01"`, `" 1"`, `"+1"`, `"1.0"`, or `"v1"` are refused rather than
+reinterpreted — a lenient parser would turn a corrupted cell into a
+plausible version and migrate from the wrong place. This almost always
+means the row was hand-edited or the file is damaged. Restore a verified
+backup.
+
+### "Database has N schema_version rows; exactly one is required."
+
+Only reachable if the `meta` table was rebuilt without its primary key.
+The version is ambiguous, so nothing is picked. Restore a verified backup.
+
+### "Migration registry is invalid: …"
+
+A build-time bug, not a database problem — the registry is a literal tuple
+in `agentic_os/migrations.py`, and it failed its own validation (gap,
+duplicate, backward step, skipped version, target beyond the supported
+latest). Validation runs **before** any snapshot or mutation, so your
+database is untouched. Nothing to do at your end; the build is broken.
+
+### "Pre-migration snapshot failed verification …; refusing to migrate."
+
+The safety net itself could not be trusted, so no migration ran and the
+database was **not changed**. Usually a full disk or a failing drive. Free
+space, run `python3 aos.py doctor`, and try again. Do not work around this
+by migrating without a snapshot — there is no flag to do so, on purpose.
+
+### "Migration '…' (N → M) failed (…) and was rolled back completely"
+
+That step's schema change, version bump, and event all disappeared
+together, and no later step ran. The database is exactly where it was, and
+the verified pre-migration snapshot is on disk. The diagnostic names only
+the transition, the migration id, and the exception's class — never SQL,
+row values, or secrets. Re-running after the bug is fixed is safe.
+
+### "The database is PARTIALLY ADVANCED: …"
+
+An earlier step committed, then a later one failed. This is a **real,
+consistent state**, not a broken one: your database is genuinely at the
+version reported, and every committed step is intact and atomic.
+
+Two ways forward:
+
+1. **Fix and re-run** (usual). `migrate apply` resumes from the version
+   actually committed — completed steps never replay:
+   ```bash
+   python3 aos.py migrate status     # confirm where you actually are
+   python3 aos.py migrate apply      # resumes; does not replay
+   ```
+2. **Go back to the start.** Restore the pre-migration snapshot named in
+   the message — the full drill is in RECOVERY.md. Restore writes to a NEW
+   path and never overwrites; adopting it is your move.
+
+There is deliberately no automatic rollback across committed steps.
+Un-applying a schema change programmatically is guesswork, and doing it
+automatically would silently bypass the very snapshot taken to protect you.
+
+### "refusing to act on a stale plan" / "another process may have migrated"
+
+Two migrations raced, or the version moved between planning and applying.
+The loser refuses; it never double-applies. The version is re-read under
+the write lock, and again by each step before it mutates, so a plan that
+has gone stale can never authorize a change. Re-run `migrate status` and
+then `migrate apply`.
+
+### "Refusing to migrate …: it is a symlink / a directory / a FIFO …"
+
+The live ledger must be a real regular file. The path is inspected with
+`lstat` (never `stat`, which would follow a symlink and defeat the check),
+and the object is left exactly as found. A symlink is refused even when it
+points at a valid database — migrate the real path.
+
+### Never hand-edit `schema_version`
+
+It is not a compatibility dial. It is a claim about what the bytes on disk
+actually are. Setting it to `"1"` to make a refusal go away tells every
+protection in the system to trust a database it has no reason to trust —
+including `backup verify`, which will then happily certify a lie. If you
+are tempted, restore a verified backup instead.
