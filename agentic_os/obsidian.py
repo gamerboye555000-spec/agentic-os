@@ -218,13 +218,20 @@ def _index_note_contents(conn: sqlite3.Connection, aos_root: Path) -> dict[str, 
     ]
     memory = []
     for row in conn.execute(
-        "SELECT id, key, scope, confidence, valid_until, superseded_by "
-        "FROM memory ORDER BY id"
+        "SELECT m.id, m.key, m.scope, m.confidence, m.valid_until, "
+        "m.superseded_by, m.status, m.pinned, "
+        "(SELECT COUNT(*) FROM memory_evidence me WHERE me.memory_id = m.id) "
+        "AS evidence_count "
+        "FROM memory m ORDER BY m.id"
     ):
         bullet = (
             f"- [[{ids.render_id('memory', row['id'])}]] {one(row['key'])} "
-            f"· {row['scope']} · [{row['confidence']}]"
+            f"· {row['scope']} · [{row['confidence']}] · {row['status']}"
         )
+        if row["pinned"]:
+            bullet += " · pinned"
+        if row["evidence_count"]:
+            bullet += f" · {row['evidence_count']} evidence"
         if row["superseded_by"]:
             bullet += (
                 f" · superseded by "
@@ -422,11 +429,25 @@ def sync_vault(conn: sqlite3.Connection, aos_dir: Path) -> tuple[int, int]:
             render.handoff_note(handoff),
         )
 
+    evidence_by_memory: dict[int, list[int]] = {}
+    for row in _rows(
+        conn,
+        "SELECT memory_id, evidence_id FROM memory_evidence "
+        "ORDER BY memory_id, evidence_id",
+    ):
+        evidence_by_memory.setdefault(row["memory_id"], []).append(
+            row["evidence_id"]
+        )
+
     for row in _rows(conn, "SELECT * FROM memory ORDER BY id"):
         item = MemoryItem.from_row(row)
         emit_note(
             aos_root / "Memory" / f"{ids.render_id('memory', item.id)}.md",
-            render.memory_note(item, slug_by_project_id.get(item.project_id)),
+            render.memory_note(
+                item,
+                slug_by_project_id.get(item.project_id),
+                evidence_by_memory.get(item.id, []),
+            ),
         )
 
     for row in _rows(conn, "SELECT * FROM agents ORDER BY name"):

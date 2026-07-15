@@ -112,7 +112,8 @@ class TestDbInvariants(CoreTestCase):
         )
 
     def test_schema_version_recorded(self):
-        self.assertEqual(db.get_meta(self.conn, "schema_version"), "1")
+        self.assertEqual(db.get_meta(self.conn, "schema_version"), db.SCHEMA_VERSION)
+        self.assertEqual(db.SCHEMA_VERSION, "2")
 
     def test_open_db_rejects_version_mismatch(self):
         with self.conn:
@@ -404,13 +405,20 @@ class TestPackCompiler(CoreTestCase):
                 "decided_at) VALUES (?, ?, 'Big decision', ?, ?)",
                 (self.task.project_id, self.task.id, "D" * 3000, now),
             )
-            self.conn.execute(
-                "INSERT INTO memory (scope, project_id, kind, key, value_md, "
-                "source, confidence, valid_from, updated_at) "
-                "VALUES ('project', ?, 'fact', 'big-memory', ?, 'test', "
-                "'confirmed', ?, ?)",
-                (self.task.project_id, "M" * 3000, now, now),
-            )
+        # Written through the production writer, not raw SQL: since U-M2 a
+        # memory row carries a claim hash, and a hand-rolled INSERT would be
+        # inventing one.
+        ops.add_memory(
+            self.conn,
+            scope="project",
+            project_slug="demo",
+            kind="fact",
+            key="big-memory",
+            value="M" * 3000,
+            source="test",
+            confidence="confirmed",
+        )
+        with self.conn:
             self.conn.execute(
                 "INSERT INTO runs (task_id, agent, started_at, ended_at, outcome, "
                 "summary_md) VALUES (?, 'claude-code', ?, ?, 'partial', ?)",

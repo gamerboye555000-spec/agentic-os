@@ -28,7 +28,7 @@ from unittest import mock
 
 from weekend_harness import Night1BackCompatCase
 
-from agentic_os import cli, db, obsidian, power, utils
+from agentic_os import cli, db, migrations, obsidian, power, utils
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -691,6 +691,11 @@ class RecoveryTests(PowerCase):
          ("memory", "add", "--scope", "global", "--kind", "fact", "--key", "k",
           "--value", "v", "--source", "human", "--confidence", "high")),
         (("memory", "retire"), ("memory", "retire", "M-0001")),
+        # U-M2 curation writes: each mutates a claim, its hash and an event.
+        (("memory", "pin"), ("memory", "pin", "M-0001")),
+        (("memory", "unpin"), ("memory", "unpin", "M-0001")),
+        (("memory", "link-evidence"),
+         ("memory", "link-evidence", "M-0001", "E-0001")),
         (("agent", "add"), ("agent", "add", "newbot")),
         (("agent", "update"), ("agent", "update", "newbot", "--notes", "n")),
         (("ingest", "dropfile"), ("ingest", "dropfile", "SELF")),
@@ -925,11 +930,12 @@ class DoctorIntegrationTests(PowerCase):
         self.assertNotIn('{"version"', line)
         self.assertNotIn(str(self.aos_dir), line)
 
-    def test_doctor_check_count_is_twenty_one(self):
-        """(25) 20 → 21: the mandated power check joined the set (the D-W8.1
-        pattern — the pin moves UP with a mandated new check)."""
+    def test_doctor_check_count_is_twenty_five(self):
+        """(25) 20 → 21 → 25: the mandated power check joined the set at
+        U-E2, and U-M2's four mandated memory-claim checks joined it after
+        (the D-W8.1 pattern — the pin moves UP with a mandated new check)."""
         out = self.aos("doctor")
-        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 21)
+        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 25)
 
     def test_doctor_still_passes_cleanly_on_the_baseline_fixture(self):
         """(25) The new check does not disturb the other twenty."""
@@ -1316,9 +1322,12 @@ class ExclusionTests(PowerCase):
         for table in tables:
             self.assertNotIn("power", table.lower())
 
-    def test_schema_version_is_unchanged(self):
-        """(25)"""
-        self.assertEqual(db.SCHEMA_VERSION, "1")
+    def test_schema_version_is_whatever_the_one_declaration_says(self):
+        """(25) U-E2 changed no schema, and must not. U-M2 owns the version:
+        this pins that power modes follow it rather than declaring their own.
+        """
+        self.assertEqual(db.SCHEMA_VERSION, "2")
+        self.assertEqual(migrations.LATEST_VERSION, int(db.SCHEMA_VERSION))
 
     def test_power_state_lives_beside_the_ledger_not_inside_it(self):
         self.set_mode_direct("deep")

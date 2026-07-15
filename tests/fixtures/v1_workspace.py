@@ -5,12 +5,31 @@ unstable across sqlite versions and page layouts, would bake in wall-clock
 timestamps from `utils.utc_now_iso()`, and would sit in the tree as exactly
 the kind of database the packaging allowlist exists to keep out of aos.pyz.
 
-Built with production CLI commands only — never raw INSERTs — so the fixture
-is a database a v1 user could actually have produced, and cannot drift from
-what v1 code writes. Every table a migration might touch carries
-representative rows: projects, tasks (all four statuses), runs, packs,
-evidence, decisions, handoffs, memory, agents, and a populated events
-journal.
+Built with production CLI commands — never raw INSERTs — so the fixture is a
+database a v1 user could actually have produced.
+
+U-M2 (contract M2.14) forces one change. Production is at schema version 2
+now, and v2 code CANNOT run against a v1 database — that is precisely what
+the version gate exists to guarantee, so no amount of patching will make
+`pack build` or `sync` read a v1 memory table. The fixture therefore builds
+in this order:
+
+1. Every non-memory command runs as production v2 code. U-M2 changed nothing
+   about those tables, their writers or their events, so the rows a v2 build
+   writes for them are identical to the rows a v1 build wrote.
+2. `sync` runs while the memory table is still EMPTY.
+3. The (still empty) v2 memory table is replaced by the HISTORICAL v1
+   definition, `memory_evidence` is dropped, and schema_version goes to "1".
+   No row is rewritten or reverse-migrated: this is pure DDL against an empty
+   table, not a downgrade.
+4. The memory rows are written by `_v1_memory_add` — a frozen replica of v1's
+   `ops.add_memory` (same INSERT, same supersede UPDATE, same event through
+   the unchanged `events.emit`). v1 is history now; a frozen replica of it
+   cannot drift, because v1 itself cannot.
+
+The mirror therefore carries no memory notes: exactly the workspace of a v1
+user who ran `memory add` after their last `sync`. It is derived state, and
+doctor is clean on it (no dangling links, no strays).
 
 `build_v1_workspace(root)` leaves:
   project `demo` (+ `legacy`)
@@ -18,7 +37,12 @@ journal.
   T-0002 in_progress — run R-0002 (open), handoff H-0001 (accepted)
   T-0003 ready     — priority 1, spec + acceptance
   T-0004 inbox     — projectless capture
-  D-0001 decision · M-0001/M-0002 memory rows · two registered agents
+  D-0001 decision · two registered agents
+  M-0001 global preference, active        → migrates to live
+  M-0002 project fact, active             → migrates to live
+  M-0003 expired (valid_until in 2020)    → migrates to retired
+  M-0004 superseded by M-0005             → migrates to retired
+  M-0005 successor, valid_until in 2099   → migrates to live
 """
 
 from __future__ import annotations
@@ -28,7 +52,7 @@ import io
 import sqlite3
 from pathlib import Path
 
-from agentic_os import cli, utils
+from agentic_os import cli, db, events, ops, utils
 
 #: Every table whose contents the preservation proof compares.
 FIXTURE_TABLES = (
@@ -45,6 +69,29 @@ FIXTURE_TABLES = (
     "agents",
 )
 
+#: The historical v1 memory table, verbatim as of 9b2f43d (the U-M2 baseline)
+#: — the ONLY table the 1→2 migration touches, and so the only one this
+#: fixture has to pin. A FROZEN COPY on purpose: it must not follow
+#: db.MEMORY_CLAIM_DDL forward, or the "v1 fixture" would silently become
+#: whatever the current schema is and every migration proof built on it would
+#: prove nothing.
+V1_SCHEMA_VERSION = "1"
+
+V1_MEMORY_SQL = """CREATE TABLE IF NOT EXISTS memory(
+  id INTEGER PRIMARY KEY,
+  scope TEXT NOT NULL,
+  project_id INTEGER,
+  kind TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value_md TEXT NOT NULL,
+  source TEXT NOT NULL,
+  confidence TEXT NOT NULL,
+  valid_from TEXT NOT NULL,
+  valid_until TEXT,
+  superseded_by INTEGER,
+  updated_at TEXT NOT NULL
+)"""
+
 
 def _run(*argv: str) -> None:
     """Run a CLI command, failing loudly. Output is a fixture artifact, not
@@ -59,6 +106,100 @@ def _run(*argv: str) -> None:
         )
 
 
+def _install_v1_memory_schema(db_path: Path) -> None:
+    """Replace the empty v2 memory table with its historical v1 definition,
+    drop the v2 link table, and set schema_version back to 1.
+
+    Runs while `memory` holds NO rows, so nothing is rewritten or
+    reverse-migrated: this is DDL on an empty table, which is why it is
+    honest. What comes out is byte-for-byte the v1 schema, and the rows that
+    follow are written by the frozen v1 writer.
+    """
+    conn = db.connect(db_path)
+    try:
+        with conn:
+            rows = conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0]
+            if rows:
+                raise AssertionError(
+                    "v1 fixture: memory must be empty when the v1 schema is "
+                    f"installed (found {rows} rows)"
+                )
+            conn.execute("DROP TABLE memory_evidence")
+            conn.execute("DROP TABLE memory")
+            conn.execute(V1_MEMORY_SQL)
+            conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (V1_SCHEMA_VERSION,),
+            )
+    finally:
+        conn.close()
+
+
+def _v1_memory_add(
+    db_path: Path,
+    *,
+    scope: str,
+    project_id: int | None,
+    kind: str,
+    key: str,
+    value: str,
+    source: str,
+    confidence: str,
+    valid_until: str | None = None,
+    supersedes_id: int | None = None,
+) -> int:
+    """v1's `memory add`, frozen.
+
+    A verbatim replica of ops.add_memory as of 9b2f43d: the same columns, the
+    same supersede UPDATE, the same event payload, through the unchanged
+    events.emit. It exists only because v2's writer cannot address a v1 table.
+    """
+    conn = db.connect(db_path)
+    try:
+        now = utils.utc_now_iso()
+        with conn:
+            cursor = conn.execute(
+                "INSERT INTO memory (scope, project_id, kind, key, value_md, "
+                "source, confidence, valid_from, valid_until, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    scope, project_id, kind, key, value, source, confidence,
+                    now, valid_until, now,
+                ),
+            )
+            memory_id = cursor.lastrowid
+            if supersedes_id is not None:
+                conn.execute(
+                    "UPDATE memory SET superseded_by = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (memory_id, now, supersedes_id),
+                )
+            events.emit(
+                conn,
+                actor=ops.ACTOR_HUMAN,
+                entity="memory",
+                entity_id=memory_id,
+                action="add",
+                payload={
+                    "memory": f"M-{memory_id:04d}",
+                    "scope": scope,
+                    "project": None,
+                    "kind": kind,
+                    "key": key,
+                    "confidence": confidence,
+                    "valid_until": valid_until,
+                    "supersedes": (
+                        f"M-{supersedes_id:04d}" if supersedes_id else None
+                    ),
+                },
+            )
+        if memory_id is None:
+            raise AssertionError("v1 fixture: memory INSERT returned no rowid")
+        return memory_id
+    finally:
+        conn.close()
+
+
 def build_v1_workspace(root: Path) -> Path:
     """Build the v1 fixture workspace under `root`. Returns its aos.db path."""
     root = Path(root).resolve()
@@ -68,6 +209,9 @@ def build_v1_workspace(root: Path) -> Path:
     legacy_repo.mkdir(parents=True, exist_ok=True)
 
     with contextlib.chdir(root):
+        # Steps 1-2: production commands, real code, no patching. None of
+        # these tables changed at U-M2, so a v2 build writes exactly the rows
+        # and events a v1 build wrote.
         _run("init")
         _run("project", "add", "demo", "--name", "Demo", "--repo", str(repo))
         _run(
@@ -109,17 +253,60 @@ def build_v1_workspace(root: Path) -> Path:
              "--decision", "SQLite is the system of record",
              "--alternatives", "Postgres; flat files", "--task", "T-0001")
 
-        _run("memory", "add", "--scope", "global", "--kind", "preference",
-             "--key", "commit-style", "--value", "conventional commits",
-             "--source", "human", "--confidence", "confirmed")
-        _run("memory", "add", "--scope", "project", "-p", "demo",
-             "--kind", "fact", "--key", "runtime",
-             "--value", "python 3.13", "--source", "human",
-             "--confidence", "inferred")
-
+        # The last v2-code step, with memory still empty.
         _run("sync")
 
+        # Step 3: the memory table becomes v1, and so does the version.
+        db_path = root / utils.AOS_DIR_NAME / utils.DB_FILENAME
+        demo_id = _project_id(db_path, "demo")
+        _install_v1_memory_schema(db_path)
+
+        # Step 4: the memory rows, through v1's frozen writer.
+
+        # Two ACTIVE rows → must migrate to live.
+        _v1_memory_add(
+            db_path, scope="global", project_id=None, kind="preference",
+            key="commit-style", value="conventional commits",
+            source="human", confidence="confirmed",
+        )
+        _v1_memory_add(
+            db_path, scope="project", project_id=demo_id, kind="fact",
+            key="runtime", value="python 3.13",
+            source="human", confidence="inferred",
+        )
+        # An EXPIRED row → must migrate to retired.
+        _v1_memory_add(
+            db_path, scope="project", project_id=demo_id, kind="constraint",
+            key="deploy-window", value="fridays only, until the v1 freeze",
+            source="human", confidence="single", valid_until="2020-01-01",
+        )
+        # A SUPERSEDED row (M-0004) and its live successor (M-0005).
+        old_id = _v1_memory_add(
+            db_path, scope="global", project_id=None, kind="fact",
+            key="editor", value="vim, allegedly",
+            source="human", confidence="assumed",
+        )
+        _v1_memory_add(
+            db_path, scope="global", project_id=None, kind="fact",
+            key="editor", value="whatever ships the work",
+            source="human", confidence="confirmed",
+            valid_until="2099-12-31", supersedes_id=old_id,
+        )
+
     return root / utils.AOS_DIR_NAME / utils.DB_FILENAME
+
+
+def _project_id(db_path: Path, slug: str) -> int:
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT id FROM projects WHERE slug = ?", (slug,)
+        ).fetchone()
+        if row is None:
+            raise AssertionError(f"fixture project {slug!r} missing")
+        return row[0]
+    finally:
+        conn.close()
 
 
 def table_contents(db_path: Path, tables=FIXTURE_TABLES) -> dict[str, list]:

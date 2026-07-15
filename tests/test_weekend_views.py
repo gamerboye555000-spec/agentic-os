@@ -15,7 +15,7 @@ from unittest import mock
 
 from weekend_harness import Night1BackCompatCase
 
-from agentic_os import db, search
+from agentic_os import db, ops, search
 
 
 class SearchFixtureCase(Night1BackCompatCase):
@@ -657,11 +657,12 @@ class TestDoctorHardening(Night1BackCompatCase):
         code, out = self.doctor()
         self.assertEqual(code, 0, out)
         lines = [l for l in out.strip().splitlines() if l]
-        # 20 → 21: the mandated U-E2 runtime power state check joined the
-        # set (D-W8.1 pattern — the pin moves UP with a mandated new
-        # check). It reports [PASS] "standard (default)" here: this
-        # workspace has no power.json, and doctor must never create one.
-        self.assertEqual(len(lines), 21)
+        # 20 → 21 → 25: the mandated U-E2 runtime power state check joined
+        # the set, then U-M2's four memory-claim checks (D-W8.1 pattern —
+        # the pin moves UP with a mandated new check). The power line
+        # reports [PASS] "standard (default)" here: this workspace has no
+        # power.json, and doctor must never create one.
+        self.assertEqual(len(lines), 25)
         warn_lines = [l for l in lines if l.startswith("[WARN]")]
         self.assertEqual(len(warn_lines), 1)
         self.assertIn("T-0001", warn_lines[0])
@@ -696,15 +697,36 @@ class TestDoctorHardening(Night1BackCompatCase):
         )
 
     def test_fails_on_dangling_memory_supersede_pointer(self):
+        # The row is well-formed in every other respect — retired, as a
+        # superseded claim must be, and carrying its correct claim hash — so
+        # the ONLY thing wrong with it is the pointer. Otherwise the U-M2
+        # claim check would fail too and "single failure" would be true for
+        # the wrong reason.
         self.corrupt(
             "INSERT INTO memory (scope, kind, key, value_md, source, "
-            "confidence, valid_from, superseded_by, updated_at) "
+            "confidence, valid_from, superseded_by, updated_at, status, "
+            "pinned, content_sha256) "
             "VALUES ('global', 'fact', 'k', 'v', 's', 'confirmed', "
-            "'2026-01-01T00:00:00Z', 999, '2026-01-01T00:00:00Z')"
+            "'2026-01-01T00:00:00Z', 999, '2026-01-01T00:00:00Z', "
+            "'retired', 0, '')"
         )
+        self._rehash(1)
         self.assert_single_failure(
             "memory supersede pointers resolve", "M-0001", "M-0999"
         )
+
+    def _rehash(self, memory_id: int) -> None:
+        """Give a hand-planted claim the hash its own fields imply."""
+        conn = db.connect(self.db_path)
+        try:
+            with conn:
+                item = ops.get_memory(conn, memory_id)
+                conn.execute(
+                    "UPDATE memory SET content_sha256 = ? WHERE id = ?",
+                    (ops.claim_digest(conn, item), memory_id),
+                )
+        finally:
+            conn.close()
 
     def test_fails_on_pack_row_with_missing_task(self):
         self.corrupt("UPDATE packs SET task_id = 999 WHERE id = 1")

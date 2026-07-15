@@ -76,9 +76,20 @@ def _documents(conn: sqlite3.Connection) -> list[tuple[str, int, str, str]]:
                 row["state_md"],
             )
         )
-    for row in conn.execute("SELECT id, key, value_md FROM memory ORDER BY id"):
+    # U-M2: search may surface historical claims (that is the point of a
+    # ledger search), so every memory hit carries its curation status in the
+    # title — a retired or quarantined claim can never be read off a results
+    # list as live context.
+    for row in conn.execute(
+        "SELECT id, key, value_md, status FROM memory ORDER BY id"
+    ):
         docs.append(
-            ("memory", row["id"], row["key"], row["key"] + "\n" + row["value_md"])
+            (
+                "memory",
+                row["id"],
+                f"[{row['status']}] {row['key']}",
+                row["key"] + "\n" + row["value_md"],
+            )
         )
     return docs
 

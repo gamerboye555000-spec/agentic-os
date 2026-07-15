@@ -826,8 +826,9 @@ class TestDoctor(CliTestCase):
         # secret sweep and both U-H2 checks stay [PASS] on this fixture
         # (R-0001's evidence is attributable and no ref is blank). The
         # power line is [PASS] "standard (default)": this fixture never
-        # writes power.json, and reading it must not create it.
-        self.assertEqual(len(lines), 21)
+        # writes power.json, and reading it must not create it. 21 → 25:
+        # U-M2's four mandated memory-claim checks joined the set.
+        self.assertEqual(len(lines), 25)
         warn_lines = [l for l in lines if l.startswith("[WARN]")]
         self.assertEqual(len(warn_lines), 1)
         self.assertIn("code tasks done without commit evidence", warn_lines[0])

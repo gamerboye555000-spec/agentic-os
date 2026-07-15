@@ -158,6 +158,11 @@ COMMAND_POLICY: dict[tuple[str, ...], CommandPolicy] = {
     ("handoff", "accept"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("memory", "add"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("memory", "retire"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    # U-M2 curation writes: each changes a memory row, its claim hash and an
+    # event in one transaction — authoritative by the same mechanical rule.
+    ("memory", "pin"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("memory", "unpin"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("memory", "link-evidence"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("agent", "add"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("agent", "update"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("ingest", "dropfile"): _p(AUTHORITATIVE_WRITE, ledger=True),
@@ -187,6 +192,7 @@ COMMAND_POLICY: dict[tuple[str, ...], CommandPolicy] = {
     ("task", "list"): _p(READ_ONLY),
     ("task", "show"): _p(READ_ONLY),
     ("memory", "list"): _p(READ_ONLY),
+    ("memory", "show"): _p(READ_ONLY),
     ("agent", "list"): _p(READ_ONLY),
     ("agent", "show"): _p(READ_ONLY),
     ("hooks", "status"): _p(READ_ONLY),

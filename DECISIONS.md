@@ -2484,3 +2484,112 @@ rewriting prior entries.
   idempotency keys, two correlation targets and two audit trails. Narrowing stays
   compatible (every id the protocol accepts, `parse_id` accepts identically);
   broadening would not have.
+
+- **D-v0.3.15 — U-M2 is key/value claim storage, not a graph.** `kind` stays
+  the closed claim type, `key` the stable claim key/subject, `value_md` the
+  human-readable claim value. The temptation at a "typed memory" unit is to
+  generalize into subject/predicate/object and call it future-proofing; that
+  would rewrite every reader (packs, search, mirror, doctor) and every v1 row's
+  meaning in the same breath as the first production migration. Two risky
+  changes at once is how a migration eats a ledger. Graph relationships are
+  U-M3, on top of a claim table that already carries curation, integrity and
+  evidence.
+
+- **D-v0.3.16 — Schema version 2 is the first production U-M1 migration, and
+  U-M2 adds no migration machinery.** The registry stayed empty at U-M1 exactly
+  so this step could be the first thing it carried. U-M2 supplies a
+  `Migration.apply` callable and nothing else: validation, the write lock, the
+  version re-read under it, the snapshot, its verification as v1, the version
+  bump and the `system/migrate` event are all U-M1's, untouched. A schema change
+  that brings its own safety net is a schema change whose safety net has never
+  been tested.
+
+- **D-v0.3.17 — Legacy curation is derived from what v1 already knew, never
+  inferred from text.** A superseded row → `retired`; an expired row →
+  `retired`; everything else → `live`; everything unpinned; no evidence links
+  invented. The expiry test is the *existing* live predicate verbatim, so a row
+  v1 already kept out of packs is exactly a row v2 calls retired — the
+  migration changes what the ledger can express, not what it says. Guessing
+  `proposed` or `contested` from a claim's wording would be inventing curation
+  history no human performed.
+
+- **D-v0.3.18 — Pinned never overrides lifecycle or safety; it is a sort key.**
+  A pinned claim must still be live, unexpired and unsuperseded to be
+  retrieved, and `pin` refuses anything that is not. The alternative — pin as
+  "always include" — makes pinning a second, competing lifecycle that quietly
+  outranks retirement, which is precisely the bug where an agent keeps being
+  told a thing the human retired six months ago.
+
+- **D-v0.3.19 — Evidence uses normalized links, not copied evidence text.**
+  `memory_evidence` is two ids and a timestamp. Copying an evidence claim or
+  ref into the link would duplicate content that can be edited on one side and
+  not the other, and would put evidence text — the thing U-C3 works to keep out
+  of derived surfaces — into a second table with its own privacy story. Links
+  are also why the claim hash binds evidence by *id*: the claim commits to
+  which evidence backs it, not to a snapshot of what that evidence said.
+
+  One consequence, accepted deliberately: the pre-existing `memory/add` event
+  keeps its `key` field. The blanket "events carry no key" rule is right for
+  every event U-M2 adds (`pin`, `unpin`, `link_evidence` carry ids,
+  transitions, counts and a hash prefix — nothing else), but removing `key`
+  from `add` would break the U-C3 warn-on-write behavior this unit is required
+  to preserve. That field is already governed: `events.emit` redacts every
+  secret-shaped string through `secretscan.redact_tree`, and the U-C3 metadata
+  records what was withheld.
+
+- **D-v0.3.20 — Claim hashes reuse U-X1 canonicalization, with every stored
+  text field bound as a SHA-256 digest rather than as raw text.** The structure
+  is canonical JSON v1 (`protocols.serialize_canonical`); U-M2 defines no
+  competing canonicalization. But the leaves are digests, for two measured
+  reasons. First, U-X1 caps a canonical string at `MAX_STRING_CHARS` (8192) and
+  `memory add --value` has never had a length limit — a real 20 KB pasted claim
+  would be *refused by its own migration*, breaking the one guarantee the
+  legacy mapping must keep. Relaxing the protocol bound to fit a database row
+  would be modifying the protocol spine to suit its first consumer. Second, a
+  damaged row must stay reportable: with digest leaves, no stored value of any
+  length or shape can trip a bound, so `doctor` prints one bounded line instead
+  of dying inside the serializer that was supposed to help it. `sha256(text)`
+  binds the text exactly; the binding is Merkle-shaped, not weaker.
+
+  The payload also binds `id` (so a valid hash cannot be transplanted onto
+  another row) and `updated_at` (every write that touches it recomputes the
+  hash anyway). Only `content_sha256` itself is excluded — what gets hashed
+  never contains the hash (D-v0.3.6).
+
+- **D-v0.3.21 — Normal retrieval includes live claims only; hashes are
+  enforced at write time and audited by doctor, not re-verified on read.**
+  Packs filter on lifecycle (`status='live'`, unexpired, unsuperseded) with
+  plain SQL. Verifying hashes on the read path sounds stricter but buys a worse
+  system: it either drops a claim silently (context vanishes with no
+  explanation — the worst outcome available) or refuses the whole pack, letting
+  one damaged row block every pack in the workspace. Instead, *every*
+  authoritative write against an existing claim verifies the stored hash first
+  and refuses on mismatch — so a tampered claim can never be laundered into a
+  valid-looking one by a later pin or retire — and doctor reports the damage by
+  id. Integrity is enforced where it can be acted on.
+
+- **D-v0.3.22 — Status is curation; expiry is time. They are independent
+  axes.** A live claim crosses its own `valid_until` with no write at all, and
+  `--valid-until` accepts a past date, so "expired but not retired" is honestly
+  reachable and doctor reports it as a WARNING, never a failure. A check that
+  turns red because a day passed is a broken check. The same reasoning makes
+  "pinned but ineligible" (pin, then retire) a warning: reachable, harmless,
+  and worth saying out loud.
+
+- **D-v0.3.23 — The 1 → 2 step rebuilds the memory table instead of
+  `ALTER TABLE ADD COLUMN`.** `ADD COLUMN` cannot add `content_sha256 TEXT NOT
+  NULL` without a non-NULL default, and a `DEFAULT ''` would leave every future
+  insert able to store a hashless claim: a migrated database would be
+  permanently weaker than a freshly initialized one, and the difference would
+  be invisible until it mattered. A rebuild from the one shared DDL constant
+  (`db.MEMORY_CLAIM_DDL`) makes a migrated table identical to a born-v2 table,
+  and routes every mapped row through the new CHECK constraints — so the
+  migration cannot commit a value the schema forbids.
+
+- **D-v0.3.24 — U-M3 (graph) and U-M4 (curation workflow) remain deferred.**
+  U-M2 ships the storage those units need — `proposed`/`contested`/
+  `quarantined` are storable, evidence links are normalized, every claim is
+  hashed — and none of their behavior: no approve, reject, contest, quarantine,
+  automatic promotion, contradiction detection, distillation, or agent memory
+  writer. Storage that anticipates a workflow is cheap; a workflow invented
+  ahead of its unit is a design nobody reviewed.
