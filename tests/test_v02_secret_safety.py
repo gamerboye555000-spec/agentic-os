@@ -927,11 +927,12 @@ class TestDoctorSecretSweep(WarnCase):
     def test_clean_workspace_sweep_passes(self):
         out = self.doctor_ok()
         self.assertTrue(self.sweep_line(out).startswith("[PASS]"))
-        # 18 → 20 → 21: the two U-H2 warn-only checks, then the U-E2
-        # runtime power state check, joined the mandated set (D-W8.1
-        # pattern — the pin moves UP with mandated new checks).
+        # 18 → 20 → 21 → 25: the two U-H2 warn-only checks, the U-E2
+        # runtime power state check, then U-M2's four memory-claim checks
+        # joined the mandated set (D-W8.1 pattern — the pin moves UP with
+        # mandated new checks).
         self.assertEqual(
-            len([l for l in out.strip().splitlines() if l]), 21
+            len([l for l in out.strip().splitlines() if l]), 25
         )
 
     def test_domain_row_finding_names_id_field_pattern_only(self):

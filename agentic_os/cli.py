@@ -15,6 +15,7 @@ import traceback
 from pathlib import Path
 
 from . import db, ids, obsidian, ops, power, utils
+from .models import MEMORY_STATUSES
 from .utils import AosError
 
 
@@ -532,6 +533,9 @@ def cmd_memory_add(args) -> int:
         if args.supersedes is not None
         else None
     )
+    evidence_ids = [
+        ids.parse_id(value, "evidence") for value in (args.evidence or [])
+    ]
     with _ledger(args) as (aos_dir, conn):
         item = ops.add_memory(
             conn,
@@ -544,15 +548,34 @@ def cmd_memory_add(args) -> int:
             confidence=args.confidence,
             valid_until=args.valid_until,
             supersedes_id=supersedes_id,
+            pin=args.pin,
+            evidence_ids=evidence_ids,
         )
         print(ids.render_id("memory", item.id))
     return 0
 
 
+def _memory_state(item: dict) -> str:
+    """The one-word lifecycle summary the list has always shown, now leading
+    with the curation status it is derived from."""
+    if item["superseded_by"]:
+        return f"{item['status']}→{item['superseded_by']}"
+    if item["status"] != "live":
+        return f"{item['status']} {_dash(item['valid_until'])}"
+    if not item["live"]:
+        return f"live·expired {_dash(item['valid_until'])}"
+    return "live"
+
+
 def cmd_memory_list(args) -> int:
+    pinned = True if args.pinned else (False if args.unpinned else None)
     with _ledger(args) as (aos_dir, conn):
         items = ops.list_memory(
-            conn, scope=args.scope, project_slug=args.project
+            conn,
+            scope=args.scope,
+            project_slug=args.project,
+            status=args.status,
+            pinned=pinned,
         )
         if args.json:
             _print_json({"memories": items})
@@ -561,19 +584,75 @@ def cmd_memory_list(args) -> int:
             print("(no memory)")
             return 0
         for item in items:
-            if item["superseded_by"]:
-                state = f"superseded→{item['superseded_by']}"
-            elif not item["live"]:
-                state = f"retired {item['valid_until']}"
-            else:
-                state = "live"
             value_one_line = " ".join(item["value_md"].split())
             print(
-                f"{item['id']:<8} {item['scope']:<8} "
+                f"{item['id']:<8} {'PIN' if item['pinned'] else '   '} "
+                f"{item['scope']:<8} "
                 f"{_dash(item['project']):<16} {item['kind']:<11} "
-                f"[{item['confidence']}] {state:<26} "
+                f"[{item['confidence']}] {_memory_state(item):<26} "
                 f"{item['key']}: {value_one_line}"
             )
+    return 0
+
+
+def cmd_memory_show(args) -> int:
+    memory_id = ids.parse_id(args.id, "memory")
+    with _ledger(args) as (aos_dir, conn):
+        doc = ops.show_memory(conn, memory_id)
+        if args.json:
+            _print_json(doc)
+            return 0
+        print(f"{doc['id']} {doc['key']}")
+        print(f"  status:     {doc['status']}")
+        print(f"  pinned:     {'yes' if doc['pinned'] else 'no'}")
+        print(f"  retrieved:  {'yes' if doc['live'] else 'no'} (normal packs)")
+        print(f"  scope:      {doc['scope']}")
+        print(f"  project:    {_dash(doc['project'])}")
+        print(f"  kind:       {doc['kind']}")
+        print(f"  confidence: {doc['confidence']}")
+        print(f"  source:     {doc['source']}")
+        print(f"  valid:      {doc['valid_from']} → {_dash(doc['valid_until'])}")
+        print(f"  superseded: {_dash(doc['superseded_by'])}")
+        print(f"  updated:    {doc['updated_at']}")
+        # Evidence is named by id only: `memory show` never reads an evidence
+        # row's claim or ref, and never opens a file it points at (M2.8).
+        print(f"  evidence:   {', '.join(doc['evidence']) or '-'}")
+        print(f"  hash:       {doc['content_sha256']} ({doc['integrity']})")
+        print()
+        print(doc["value_md"].rstrip())
+    return 0
+
+
+def cmd_memory_pin(args) -> int:
+    memory_id = ids.parse_id(args.id, "memory")
+    pinned = args.pinned_state
+    with _ledger(args) as (aos_dir, conn):
+        item, changed = ops.set_memory_pin(
+            conn, memory_id=memory_id, pinned=pinned
+        )
+        hid = ids.render_id("memory", item.id)
+        word = "pinned" if pinned else "unpinned"
+        if changed:
+            print(f"{hid} {word}")
+        else:
+            print(f"{hid} is already {word}; nothing changed.")
+    return 0
+
+
+def cmd_memory_link_evidence(args) -> int:
+    memory_id = ids.parse_id(args.id, "memory")
+    evidence_id = ids.parse_id(args.evidence_id, "evidence")
+    with _ledger(args) as (aos_dir, conn):
+        item, changed = ops.link_memory_evidence(
+            conn, memory_id=memory_id, evidence_id=evidence_id
+        )
+        hid = ids.render_id("memory", item.id)
+        ehid = ids.render_id("evidence", evidence_id)
+        if changed:
+            count = len(ops.memory_evidence_ids(conn, item.id))
+            print(f"{hid} ← {ehid} ({count} evidence link(s))")
+        else:
+            print(f"{hid} is already linked to {ehid}; nothing changed.")
     return 0
 
 
@@ -1345,7 +1424,7 @@ def build_parser() -> _Parser:
     p_handoff_accept.add_argument("id")
     p_handoff_accept.set_defaults(func=cmd_handoff_accept)
 
-    p_memory = sub.add_parser("memory", help="scoped memory rows")
+    p_memory = sub.add_parser("memory", help="scoped memory claims")
     memory_sub = p_memory.add_subparsers(
         dest="subcommand", metavar="SUBCOMMAND", required=True
     )
@@ -1359,14 +1438,62 @@ def build_parser() -> _Parser:
     p_memory_add.add_argument("--confidence", required=True)
     p_memory_add.add_argument("--valid-until", dest="valid_until", default=None)
     p_memory_add.add_argument("--supersedes", default=None)
+    p_memory_add.add_argument(
+        "--pin", action="store_true",
+        help="pin the new claim (ordering only; refused if it would already "
+        "be ineligible for retrieval)",
+    )
+    p_memory_add.add_argument(
+        "--evidence", action="append", metavar="EVIDENCE_ID", default=None,
+        help="link an evidence row to the claim (repeatable; order and "
+        "duplicates do not matter)",
+    )
     p_memory_add.set_defaults(func=cmd_memory_add)
-    p_memory_list = memory_sub.add_parser("list", help="list memory rows")
+    p_memory_list = memory_sub.add_parser(
+        "list", help="list memory claims (history included, by design)"
+    )
     p_memory_list.add_argument("--scope", default=None)
     p_memory_list.add_argument("-p", "--project", default=None)
+    p_memory_list.add_argument(
+        "--status", default=None, choices=list(MEMORY_STATUSES),
+        help="show only claims with this curation status",
+    )
+    p_memory_pin_filter = p_memory_list.add_mutually_exclusive_group()
+    p_memory_pin_filter.add_argument(
+        "--pinned", action="store_true", help="show only pinned claims"
+    )
+    p_memory_pin_filter.add_argument(
+        "--unpinned", action="store_true", help="show only unpinned claims"
+    )
     p_memory_list.add_argument("--json", action="store_true")
     p_memory_list.set_defaults(func=cmd_memory_list)
+    p_memory_show = memory_sub.add_parser(
+        "show",
+        help="show one claim: status, pin state, hash, evidence ids "
+        "(read-only)",
+    )
+    p_memory_show.add_argument("id", metavar="MEMORY_ID")
+    p_memory_show.add_argument("--json", action="store_true")
+    p_memory_show.set_defaults(func=cmd_memory_show)
+    p_memory_pin = memory_sub.add_parser(
+        "pin",
+        help="pin a live claim so it leads the pack MEMORY section "
+        "(ordering only)",
+    )
+    p_memory_pin.add_argument("id", metavar="MEMORY_ID")
+    p_memory_pin.set_defaults(func=cmd_memory_pin, pinned_state=True)
+    p_memory_unpin = memory_sub.add_parser("unpin", help="remove a claim's pin")
+    p_memory_unpin.add_argument("id", metavar="MEMORY_ID")
+    p_memory_unpin.set_defaults(func=cmd_memory_pin, pinned_state=False)
+    p_memory_link = memory_sub.add_parser(
+        "link-evidence", help="link an evidence row to a memory claim"
+    )
+    p_memory_link.add_argument("id", metavar="MEMORY_ID")
+    p_memory_link.add_argument("evidence_id", metavar="EVIDENCE_ID")
+    p_memory_link.set_defaults(func=cmd_memory_link_evidence)
     p_memory_retire = memory_sub.add_parser(
-        "retire", help="retire a memory row (sets valid_until to now)"
+        "retire",
+        help="retire a memory claim (status=retired; sets valid_until to now)",
     )
     p_memory_retire.add_argument("id")
     p_memory_retire.set_defaults(func=cmd_memory_retire)

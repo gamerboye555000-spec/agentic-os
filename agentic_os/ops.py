@@ -7,23 +7,28 @@ the emit function and prove the rollback.
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
-from . import db, events, ids, obsidian, secretscan, utils
+from . import db, events, ids, obsidian, protocols, secretscan, utils
 from .models import (
     AGENT_KINDS,
     EVIDENCE_KINDS,
     MEMORY_CONFIDENCES,
     MEMORY_KINDS,
     MEMORY_SCOPES,
+    MEMORY_STATUS_LIVE,
+    MEMORY_STATUS_RETIRED,
+    MEMORY_STATUSES,
     RUN_OUTCOMES,
     TASK_KINDS,
     TASK_STATUSES,
     Agent,
+    ClaimHashError,
     Decision,
     Evidence,
     Handoff,
@@ -32,6 +37,8 @@ from .models import (
     Project,
     Run,
     Task,
+    hash_prefix,
+    is_claim_hash,
     validate_agent_name,
     validate_enum,
     validate_provenance,
@@ -148,26 +155,62 @@ def related_decisions(conn: sqlite3.Connection, task: Task) -> list[Decision]:
     return [Decision.from_row(r) for r in rows]
 
 
+def claim_is_eligible(item: MemoryItem, now: str | None = None) -> bool:
+    """THE eligibility predicate for ordinary retrieval (U-M2, M2.7).
+
+    One definition, used by packs, `memory show`/`list`'s `live` flag, the pin
+    gate and doctor — so "what a normal command will feed an agent" can never
+    mean two different things in two places.
+
+    status=live only: proposed, contested, quarantined and retired claims stay
+    out of every ordinary context pack. Expiry and supersession still apply on
+    top — pinning is not on this list, because pinning is ordering, never
+    permission.
+    """
+    if now is None:
+        now = utils.utc_now_iso()
+    return (
+        item.status == MEMORY_STATUS_LIVE
+        and item.superseded_by is None
+        and (item.valid_until is None or item.valid_until > now)
+    )
+
+
 def memory_for_project(
     conn: sqlite3.Connection, project_id: int | None
 ) -> list[MemoryItem]:
-    """Pack MEMORY inclusion rule: live memory only — scope=global plus the
-    pinned project's scope; live means valid_until is NULL or in the future
-    AND superseded_by is NULL; the latest row (highest id) per
-    (scope, project, key) wins; ordered by scope then key."""
+    """Pack MEMORY inclusion rule: eligible claims only — scope=global plus
+    the pinned project's scope; eligible means status='live' AND
+    superseded_by IS NULL AND valid_until is NULL or in the future; the latest
+    row (highest id) per (scope, project, key) wins.
+
+    Order (M2.7): pinned eligible claims first, unpinned second, and inside
+    each group the existing stable (scope, key, id) ordering — pinning changes
+    the order and nothing else.
+
+    Hashes are NOT re-verified here (D-v0.3.21): integrity is enforced at
+    write time and audited by doctor. A read path that refused would let one
+    damaged row block every pack in the workspace, and one that silently
+    dropped rows would be worse still.
+    """
     now = utils.utc_now_iso()
     rows = conn.execute(
-        "SELECT * FROM memory WHERE superseded_by IS NULL "
+        "SELECT * FROM memory WHERE status = ? AND superseded_by IS NULL "
         "AND (valid_until IS NULL OR valid_until > ?) "
         "AND (scope = 'global' OR (project_id IS NOT NULL AND project_id = ?)) "
         "ORDER BY id",
-        (now, project_id),
+        (MEMORY_STATUS_LIVE, now, project_id),
     ).fetchall()
     latest: dict[tuple, MemoryItem] = {}
     for row in rows:
         item = MemoryItem.from_row(row)
+        # Dedupe BEFORE ordering: which claim is current is a lifecycle
+        # question, and a pin must not resurrect a stale row for its key.
         latest[(item.scope, item.project_id, item.key)] = item
-    return sorted(latest.values(), key=lambda m: (m.scope, m.key, m.id))
+    return sorted(
+        latest.values(),
+        key=lambda m: (0 if m.pinned else 1, m.scope, m.key, m.id),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -249,12 +292,11 @@ def handoff_public(item: Handoff) -> dict:
 def memory_public(
     conn: sqlite3.Connection, item: MemoryItem, project_slug: str | None = None
 ) -> dict:
+    """The public claim shape. Never raises on a damaged row: administrative
+    listing must show an invalid claim, not hide it (M2.8)."""
     if project_slug is None and item.project_id is not None:
         project = get_project(conn, item.project_id)
         project_slug = project.slug if project else None
-    live = item.superseded_by is None and (
-        item.valid_until is None or item.valid_until > utils.utc_now_iso()
-    )
     return {
         "id": ids.render_id("memory", item.id),
         "scope": item.scope,
@@ -272,7 +314,17 @@ def memory_public(
             else None
         ),
         "updated_at": item.updated_at,
-        "live": live,
+        "status": item.status,
+        "pinned": bool(item.pinned),
+        "evidence": [
+            ids.render_id("evidence", eid)
+            for eid in memory_evidence_ids(conn, item.id)
+        ],
+        "content_sha256": item.content_sha256,
+        # `live` keeps its established name and now carries the full
+        # eligibility answer: a caller asking "will an agent see this?" gets
+        # the same yes/no the pack builder uses.
+        "live": claim_is_eligible(item),
     }
 
 
@@ -790,6 +842,274 @@ def get_memory(conn: sqlite3.Connection, memory_id: int) -> MemoryItem:
     return MemoryItem.from_row(row)
 
 
+def get_evidence(conn: sqlite3.Connection, evidence_id: int) -> Evidence:
+    row = conn.execute(
+        "SELECT * FROM evidence WHERE id = ?", (evidence_id,)
+    ).fetchone()
+    if row is None:
+        raise AosError(
+            f"No evidence {ids.render_id('evidence', evidence_id)}. "
+            "Run: python aos.py task show T-0001"
+        )
+    return Evidence.from_row(row)
+
+
+# ---------------------------------------------------------------------------
+# The memory claim hash (U-M2, contract M2.6)
+#
+# Lives here rather than in models.py because it needs U-X1's canonical
+# serializer, and protocols.py imports models.py — the dependency can only
+# run one way. It is still pure: no connection, no clock, no I/O.
+
+#: Binds the payload SHAPE into the digest: a future payload revision cannot
+#: collide with a v2 one. NOT a U-X1 registry identity — U-M2 registers no
+#: protocol schema and changes none.
+CLAIM_SCHEMA = "aos.memory-claim/v2"
+
+#: Evidence links per claim, inherited from U-X1's array bound rather than
+#: invented here. `link-evidence` refuses the 257th link BEFORE mutating.
+MAX_EVIDENCE_LINKS_PER_CLAIM = protocols.MAX_ARRAY_ITEMS
+
+
+def _claim_refusal(memory_id: object, field: str, why: str) -> ClaimHashError:
+    hid = f"M-{memory_id:04d}" if isinstance(memory_id, int) else "a memory row"
+    return ClaimHashError(
+        f"Memory {hid} cannot be hashed: its {field} {why}. The row is "
+        "damaged or was edited outside Agentic OS; it was not changed. "
+        "Run: python aos.py doctor"
+    )
+
+
+def _text_leaf(value, field: str, memory_id, *, optional: bool = False):
+    """Bind a stored text field by its sha256 digest, never by its raw text.
+
+    Two reasons, both load-bearing (contract M2.6): U-X1's canonical JSON caps
+    a string at MAX_STRING_CHARS, and `memory add --value` never had a length
+    limit — so a real 20 KB legacy claim would otherwise be REFUSED BY ITS OWN
+    MIGRATION. And a tampered megabyte-long cell must stay reportable rather
+    than blowing up the diagnostic that exists to report it. sha256(text)
+    binds the text exactly; nothing about the binding is weaker.
+    """
+    if value is None:
+        if optional:
+            return None
+        raise _claim_refusal(memory_id, field, "is NULL")
+    if not isinstance(value, str):
+        raise _claim_refusal(memory_id, field, "is not text")
+    return utils.sha256_text(value)
+
+
+def _int_leaf(value, field: str, memory_id, *, optional: bool = False):
+    if value is None:
+        if optional:
+            return None
+        raise _claim_refusal(memory_id, field, "is NULL")
+    # bool is an int subclass; a stored True must not read as pinned=1.
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise _claim_refusal(memory_id, field, "is not an integer")
+    if not (protocols.INT_MIN <= value <= protocols.INT_MAX):
+        raise _claim_refusal(memory_id, field, "is outside the supported range")
+    return value
+
+
+def memory_claim_payload(item: MemoryItem, evidence_ids) -> dict:
+    """The exact hash payload (M2.6). Every semantically authoritative field
+    of the claim is bound; only `content_sha256` itself is excluded, because
+    what gets hashed must never contain the hash (the D-v0.3.6 rule).
+
+    `id` is bound so a valid hash cannot be transplanted between rows;
+    `updated_at` is bound because every write that touches it recomputes the
+    hash in the same statement anyway.
+    """
+    linked: set[int] = set()
+    for evidence_id in evidence_ids:
+        checked = _int_leaf(evidence_id, "evidence link", item.id)
+        if checked is None:  # unreachable: _int_leaf refuses NULL when required
+            raise _claim_refusal(item.id, "evidence link", "is NULL")
+        linked.add(checked)
+    ids_sorted = sorted(linked)
+    if len(ids_sorted) > MAX_EVIDENCE_LINKS_PER_CLAIM:
+        raise _claim_refusal(
+            item.id,
+            "evidence links",
+            f"number {len(ids_sorted)}, above the maximum of "
+            f"{MAX_EVIDENCE_LINKS_PER_CLAIM}",
+        )
+    return {
+        "claim_schema": CLAIM_SCHEMA,
+        "id": _int_leaf(item.id, "id", item.id),
+        "project_id": _int_leaf(item.project_id, "project_id", item.id, optional=True),
+        "superseded_by": _int_leaf(
+            item.superseded_by, "superseded_by", item.id, optional=True
+        ),
+        # The STORED value, verbatim: a tampered pinned=5 must produce a
+        # different digest, not be quietly coerced to True and collide with 1.
+        "pinned": _int_leaf(item.pinned, "pinned", item.id),
+        "evidence_ids": ids_sorted,
+        "scope_sha256": _text_leaf(item.scope, "scope", item.id),
+        "kind_sha256": _text_leaf(item.kind, "kind", item.id),
+        "key_sha256": _text_leaf(item.key, "key", item.id),
+        "value_sha256": _text_leaf(item.value_md, "value_md", item.id),
+        "source_sha256": _text_leaf(item.source, "source", item.id),
+        "confidence_sha256": _text_leaf(item.confidence, "confidence", item.id),
+        "valid_from_sha256": _text_leaf(item.valid_from, "valid_from", item.id),
+        "valid_until_sha256": _text_leaf(
+            item.valid_until, "valid_until", item.id, optional=True
+        ),
+        "status_sha256": _text_leaf(item.status, "status", item.id),
+        "updated_at_sha256": _text_leaf(item.updated_at, "updated_at", item.id),
+    }
+
+
+def memory_claim_digest(item: MemoryItem, evidence_ids) -> str:
+    """The claim's content_sha256: lowercase sha256 over the canonical JSON
+    payload. Canonicalization is U-X1's, unmodified (D-v0.3.20)."""
+    payload = memory_claim_payload(item, evidence_ids)
+    return hashlib.sha256(protocols.serialize_canonical(payload)).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Memory claim integrity (U-M2, M2.6)
+
+def memory_evidence_ids(conn: sqlite3.Connection, memory_id: int) -> list[int]:
+    """The claim's evidence links: ids only, ascending. Deterministic, and
+    the only thing the hash binds about them."""
+    return [
+        row["evidence_id"]
+        for row in conn.execute(
+            "SELECT evidence_id FROM memory_evidence WHERE memory_id = ? "
+            "ORDER BY evidence_id",
+            (memory_id,),
+        )
+    ]
+
+
+def claim_digest(conn: sqlite3.Connection, item: MemoryItem) -> str:
+    """The hash this claim's current stored state should carry."""
+    return memory_claim_digest(item, memory_evidence_ids(conn, item.id))
+
+
+def claim_integrity(conn: sqlite3.Connection, item: MemoryItem) -> str:
+    """'ok' · 'malformed' · 'mismatch' · 'unhashable'. Never raises, never
+    reveals a value: a damaged claim must be REPORTABLE, which a diagnostic
+    that crashes on it is not."""
+    if not is_claim_hash(item.content_sha256):
+        return "malformed"
+    try:
+        digest = claim_digest(conn, item)
+    except ClaimHashError:
+        return "unhashable"
+    return "ok" if digest == item.content_sha256 else "mismatch"
+
+
+def verify_claim(conn: sqlite3.Connection, item: MemoryItem) -> None:
+    """Refuse to mutate a claim whose stored hash does not verify.
+
+    Without this gate, any authoritative write would recompute the hash over
+    whatever the row now says and LAUNDER a tampered claim into a
+    valid-looking one — the mutation would quietly bless the tampering. The
+    refusal names the id and nothing else: no key, value, source or hash.
+    """
+    state = claim_integrity(conn, item)
+    if state == "ok":
+        return
+    hid = ids.render_id("memory", item.id)
+    reason = {
+        "malformed": "its content hash is not 64 lowercase hex characters",
+        "mismatch": "its content hash does not match its stored fields",
+        "unhashable": "its stored fields cannot be hashed",
+    }[state]
+    raise AosError(
+        f"Refusing to change memory {hid}: {reason}. The claim was edited "
+        "outside Agentic OS or is damaged; writing it now would overwrite the "
+        "hash and hide that. Nothing was changed. Run: python aos.py doctor "
+        f"— then inspect it: python aos.py memory show {hid}"
+    )
+
+
+def _rehash_claim(conn: sqlite3.Connection, memory_id: int) -> str:
+    """Recompute and store the claim hash. MUST be called inside the same
+    transaction as the change that made it necessary (M2.6)."""
+    digest = claim_digest(conn, get_memory(conn, memory_id))
+    conn.execute(
+        "UPDATE memory SET content_sha256 = ? WHERE id = ?", (digest, memory_id)
+    )
+    return digest
+
+
+#: The hash a brand-new claim carries between its INSERT and its hash UPDATE,
+#: microseconds later inside the same transaction. The claim hash binds the
+#: row id, and the id is only known after the INSERT — so the two-step is
+#: unavoidable. It is invisible: no other connection can observe an open
+#: transaction, and a placeholder that somehow survived would be caught by
+#: doctor's malformed-hash check rather than passing as a real hash.
+_PENDING_HASH = ""
+
+
+def _evidence_project_id(conn: sqlite3.Connection, item: Evidence) -> int | None:
+    row = conn.execute(
+        "SELECT project_id FROM tasks WHERE id = ?", (item.task_id,)
+    ).fetchone()
+    return row["project_id"] if row else None
+
+
+def _resolve_evidence_links(
+    conn: sqlite3.Connection,
+    *,
+    memory_project_id: int | None,
+    evidence_ids: list[int],
+) -> list[int]:
+    """Validate and normalize requested links BEFORE any mutation.
+
+    Deterministic: de-duplicated and sorted, so `--evidence E-2 --evidence E-1
+    --evidence E-2` and `--evidence E-1 --evidence E-2` produce identical rows
+    and an identical hash.
+    """
+    wanted = sorted(set(evidence_ids))
+    if len(wanted) > MAX_EVIDENCE_LINKS_PER_CLAIM:
+        raise AosError(
+            f"Refusing to link {len(wanted)} evidence rows to one claim; the "
+            f"maximum is {MAX_EVIDENCE_LINKS_PER_CLAIM}."
+        )
+    for evidence_id in wanted:
+        evidence = get_evidence(conn, evidence_id)
+        _check_link_compatible(
+            conn, memory_project_id=memory_project_id, evidence=evidence
+        )
+    return wanted
+
+
+def _check_link_compatible(
+    conn: sqlite3.Connection,
+    *,
+    memory_project_id: int | None,
+    evidence: Evidence,
+) -> None:
+    """Cross-project linkage rule (M2.8).
+
+    Incompatible means BOTH sides name a project and the projects differ. A
+    NULL on either side is compatible on purpose: a global-scope claim
+    legitimately cites project evidence, and a projectless inbox task's
+    evidence has no project to disagree with.
+    """
+    evidence_project_id = _evidence_project_id(conn, evidence)
+    if (
+        memory_project_id is None
+        or evidence_project_id is None
+        or memory_project_id == evidence_project_id
+    ):
+        return
+    memory_project = get_project(conn, memory_project_id)
+    evidence_project = get_project(conn, evidence_project_id)
+    raise AosError(
+        f"Refusing to link evidence {ids.render_id('evidence', evidence.id)} "
+        f"(project '{evidence_project.slug if evidence_project else '?'}') to "
+        f"a memory claim in project "
+        f"'{memory_project.slug if memory_project else '?'}': a claim and its "
+        "evidence must not name different projects. Nothing was changed."
+    )
+
+
 def add_memory(
     conn: sqlite3.Connection,
     *,
@@ -802,7 +1122,15 @@ def add_memory(
     confidence: str,
     valid_until: str | None = None,
     supersedes_id: int | None = None,
+    pin: bool = False,
+    evidence_ids: list[int] | None = None,
 ) -> MemoryItem:
+    """Record a memory claim.
+
+    Backward compatible by construction (M2.7): a caller that passes none of
+    the U-M2 options gets exactly what it got before — a LIVE, UNPINNED claim
+    with the same fields, the same event action and the same id.
+    """
     validate_enum(scope, MEMORY_SCOPES, "memory scope")
     validate_enum(kind, MEMORY_KINDS, "memory kind")
     validate_enum(confidence, MEMORY_CONFIDENCES, "memory confidence")
@@ -836,18 +1164,35 @@ def add_memory(
                 f"Memory {ids.render_id('memory', old.id)} is already "
                 f"superseded by {ids.render_id('memory', old.superseded_by)}."
             )
+        # The superseded claim is about to be retired and re-hashed. Refuse
+        # to touch it if its current hash does not verify (M2.6).
+        verify_claim(conn, old)
+    project_id = project.id if project else None
+    links = _resolve_evidence_links(
+        conn,
+        memory_project_id=project_id,
+        evidence_ids=list(evidence_ids or []),
+    )
+    now = utils.utc_now_iso()
+    if pin and valid_until is not None and not (valid_until > now):
+        # Pinning is ordering among ELIGIBLE claims; a claim born already
+        # expired can never be retrieved, so pinning it would be a lie.
+        raise AosError(
+            "Refusing to pin a claim that is already expired "
+            f"(--valid-until {valid_until}). Nothing was written."
+        )
     secret_meta, secret_warning = _scan_trusted_write(
         "memory", [("key", key), ("value", value), ("source", source)]
     )
-    now = utils.utc_now_iso()
     with db.transaction(conn):
         cursor = conn.execute(
             "INSERT INTO memory (scope, project_id, kind, key, value_md, "
-            "source, confidence, valid_from, valid_until, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "source, confidence, valid_from, valid_until, updated_at, "
+            "status, pinned, content_sha256) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 scope,
-                project.id if project else None,
+                project_id,
                 kind,
                 key,
                 value,
@@ -856,15 +1201,28 @@ def add_memory(
                 now,
                 valid_until,
                 now,
+                MEMORY_STATUS_LIVE,
+                1 if pin else 0,
+                _PENDING_HASH,
             ),
         )
         memory_id = cursor.lastrowid
+        for evidence_id in links:
+            conn.execute(
+                "INSERT INTO memory_evidence (memory_id, evidence_id, "
+                "created_at) VALUES (?, ?, ?)",
+                (memory_id, evidence_id, now),
+            )
         if old is not None:
             conn.execute(
-                "UPDATE memory SET superseded_by = ?, updated_at = ? "
-                "WHERE id = ?",
-                (memory_id, now, old.id),
+                "UPDATE memory SET superseded_by = ?, status = ?, "
+                "updated_at = ? WHERE id = ?",
+                (memory_id, MEMORY_STATUS_RETIRED, now, old.id),
             )
+            # Its superseded_by and status are BOUND fields: the superseded
+            # claim's hash must move in the same transaction as its state.
+            _rehash_claim(conn, old.id)
+        digest = _rehash_claim(conn, memory_id)
         payload = {
             "memory": ids.render_id("memory", memory_id),
             "scope": scope,
@@ -876,7 +1234,13 @@ def add_memory(
             "supersedes": (
                 ids.render_id("memory", old.id) if old else None
             ),
+            "status": MEMORY_STATUS_LIVE,
+            "pinned": bool(pin),
+            "evidence": [ids.render_id("evidence", e) for e in links],
+            "hash_prefix": hash_prefix(digest),
         }
+        if old is not None:
+            payload["supersedes_status"] = MEMORY_STATUS_RETIRED
         if secret_meta:
             payload.update(secret_meta)
         events.emit(
@@ -896,14 +1260,28 @@ def list_memory(
     *,
     scope: str | None = None,
     project_slug: str | None = None,
+    status: str | None = None,
+    pinned: bool | None = None,
 ) -> list[dict]:
     """Every row, including retired and superseded ones — memory never
-    silently disappears; retired rows carry their valid_until."""
+    silently disappears; retired rows carry their valid_until.
+
+    Administrative listing shows INVALID rows too (M2.8): a claim with a
+    broken hash or an unknown status is exactly what an operator came here to
+    find, so it is listed with its status like any other.
+    """
     clauses, params = [], []
     if scope is not None:
         validate_enum(scope, MEMORY_SCOPES, "memory scope")
         clauses.append("m.scope = ?")
         params.append(scope)
+    if status is not None:
+        validate_enum(status, MEMORY_STATUSES, "memory status")
+        clauses.append("m.status = ?")
+        params.append(status)
+    if pinned is not None:
+        clauses.append("m.pinned = ?")
+        params.append(1 if pinned else 0)
     if project_slug is not None:
         project = get_project_by_slug(conn, project_slug)
         if project is None:
@@ -926,28 +1304,174 @@ def list_memory(
 
 
 def retire_memory(conn: sqlite3.Connection, *, memory_id: int) -> MemoryItem:
+    """Retire a claim: status='retired' plus the existing valid_until=now.
+
+    The row and its evidence links stay exactly where they are — retiring is
+    a curation decision, not a delete.
+    """
     item = get_memory(conn, memory_id)
     memory_hid = ids.render_id("memory", item.id)
     now = utils.utc_now_iso()
+    if item.status == MEMORY_STATUS_RETIRED:
+        if item.valid_until is not None:
+            detail = f"valid_until {item.valid_until}"
+        elif item.superseded_by is not None:
+            detail = f"superseded by {ids.render_id('memory', item.superseded_by)}"
+        else:
+            detail = "status retired"
+        raise AosError(f"Memory {memory_hid} is already retired ({detail}).")
     if item.valid_until is not None and item.valid_until <= now:
+        # Preserved v1 behavior: a claim already past its validity is already
+        # retired as far as retrieval is concerned, whatever its status says.
         raise AosError(
             f"Memory {memory_hid} is already retired "
             f"(valid_until {item.valid_until})."
         )
+    verify_claim(conn, item)
     with db.transaction(conn):
         conn.execute(
-            "UPDATE memory SET valid_until = ?, updated_at = ? WHERE id = ?",
-            (now, now, item.id),
+            "UPDATE memory SET status = ?, valid_until = ?, updated_at = ? "
+            "WHERE id = ?",
+            (MEMORY_STATUS_RETIRED, now, now, item.id),
         )
+        digest = _rehash_claim(conn, item.id)
         events.emit(
             conn,
             actor=ACTOR_HUMAN,
             entity="memory",
             entity_id=item.id,
             action="retire",
-            payload={"memory": memory_hid, "valid_until": now},
+            payload={
+                "memory": memory_hid,
+                "valid_until": now,
+                "from_status": item.status,
+                "status": MEMORY_STATUS_RETIRED,
+                "hash_prefix": hash_prefix(digest),
+            },
         )
     return get_memory(conn, item.id)
+
+
+def set_memory_pin(
+    conn: sqlite3.Connection, *, memory_id: int, pinned: bool
+) -> tuple[MemoryItem, bool]:
+    """Pin or unpin a claim. Returns (claim, changed).
+
+    Idempotent: setting the state a claim already has writes nothing,
+    recomputes nothing and emits NO event — an audit journal that records
+    non-events is a journal you stop trusting.
+    """
+    item = get_memory(conn, memory_id)
+    memory_hid = ids.render_id("memory", item.id)
+    if bool(item.pinned) == pinned:
+        return item, False
+    verify_claim(conn, item)
+    if pinned and not claim_is_eligible(item):
+        # Pin is ordering among eligible claims, never a way to force an
+        # ineligible one into context (M2.7).
+        raise AosError(
+            f"Refusing to pin memory {memory_hid}: it is not eligible for "
+            f"normal retrieval (status {item.status}"
+            + (
+                f", superseded by "
+                f"{ids.render_id('memory', item.superseded_by)}"
+                if item.superseded_by
+                else ""
+            )
+            + (
+                f", valid_until {item.valid_until}"
+                if item.valid_until is not None
+                and item.valid_until <= utils.utc_now_iso()
+                else ""
+            )
+            + "). Pinning changes ordering only; it never overrides lifecycle "
+            "or safety state. Nothing was changed."
+        )
+    now = utils.utc_now_iso()
+    with db.transaction(conn):
+        conn.execute(
+            "UPDATE memory SET pinned = ?, updated_at = ? WHERE id = ?",
+            (1 if pinned else 0, now, item.id),
+        )
+        digest = _rehash_claim(conn, item.id)
+        events.emit(
+            conn,
+            actor=ACTOR_HUMAN,
+            entity="memory",
+            entity_id=item.id,
+            action="pin" if pinned else "unpin",
+            payload={
+                "memory": memory_hid,
+                "pinned": pinned,
+                "from_pinned": bool(item.pinned),
+                "hash_prefix": hash_prefix(digest),
+            },
+        )
+    return get_memory(conn, item.id), True
+
+
+def link_memory_evidence(
+    conn: sqlite3.Connection, *, memory_id: int, evidence_id: int
+) -> tuple[MemoryItem, bool]:
+    """Link one evidence row to one claim. Returns (claim, changed).
+
+    The link is normalized: the row carries two ids and a timestamp, never a
+    copy of the evidence's claim, ref or body (M2.2).
+    """
+    item = get_memory(conn, memory_id)
+    evidence = get_evidence(conn, evidence_id)
+    memory_hid = ids.render_id("memory", item.id)
+    existing = memory_evidence_ids(conn, item.id)
+    if evidence_id in existing:
+        return item, False  # idempotent no-op: no write, no event
+    verify_claim(conn, item)
+    _check_link_compatible(
+        conn, memory_project_id=item.project_id, evidence=evidence
+    )
+    if len(existing) + 1 > MAX_EVIDENCE_LINKS_PER_CLAIM:
+        raise AosError(
+            f"Refusing to link more evidence to memory {memory_hid}: it "
+            f"already carries {len(existing)} links, the maximum. Nothing "
+            "was changed."
+        )
+    now = utils.utc_now_iso()
+    with db.transaction(conn):
+        conn.execute(
+            "INSERT INTO memory_evidence (memory_id, evidence_id, created_at) "
+            "VALUES (?, ?, ?)",
+            (item.id, evidence_id, now),
+        )
+        conn.execute(
+            "UPDATE memory SET updated_at = ? WHERE id = ?", (now, item.id)
+        )
+        digest = _rehash_claim(conn, item.id)
+        events.emit(
+            conn,
+            actor=ACTOR_HUMAN,
+            entity="memory",
+            entity_id=item.id,
+            action="link_evidence",
+            payload={
+                "memory": memory_hid,
+                "evidence": ids.render_id("evidence", evidence_id),
+                "evidence_count": len(existing) + 1,
+                "hash_prefix": hash_prefix(digest),
+            },
+        )
+    return get_memory(conn, item.id), True
+
+
+def show_memory(conn: sqlite3.Connection, memory_id: int) -> dict:
+    """One claim, read-only: fields, curation status, pin state, hash,
+    evidence IDs and an integrity verdict.
+
+    Evidence appears as E-XXXX ids only. This command never reads an
+    evidence row's claim, ref, or any file it points at (M2.8).
+    """
+    item = get_memory(conn, memory_id)
+    doc = memory_public(conn, item)
+    doc["integrity"] = claim_integrity(conn, item)
+    return doc
 
 
 def capture_inbox(conn: sqlite3.Connection, text: str) -> Task:

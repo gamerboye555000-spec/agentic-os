@@ -1,10 +1,16 @@
 """U-M1 migration kit (agentic-os-v0.2-u-m1-migration-contract.md).
 
-The framework ships with ZERO production migrations, so almost every proof
-here runs against a *synthetic* registry injected into `apply_migrations`.
-Synthetic steps must never become production schema migrations — the guard
-test at the top pins the production registry as empty and LATEST_VERSION at
-the one declared in db.py.
+Almost every proof here runs against a *synthetic* registry injected into
+`apply_migrations`, so the machinery is tested independently of whatever
+production happens to carry. Synthetic steps must never become production
+schema migrations — the guard test at the top pins the production registry
+and LATEST_VERSION against the one version declared in db.py.
+
+U-M2 filled that registry with the first production step (1 → 2,
+`u-m2-memory-claims-v2`), so the tests that once assumed "apply is a no-op
+on the fixture" now migrate the fixture first and then assert the same
+property. The v1 fixture is still v1; it is just no longer current. U-M2's
+own proofs live in tests/test_v03_memory_claims.py.
 
 The v1 fixture (tests/fixtures/v1_workspace.py) is a real historical v1
 database built with production CLI commands, with representative rows in
@@ -160,29 +166,81 @@ class MigrationTestCase(unittest.TestCase):
     def aos(self, *argv: str) -> tuple[int, str, str]:
         return run_cli("--root", str(self.root), *argv)
 
+    def fresh_v1_copy(self) -> Path:
+        """Another pristine, UNMIGRATED copy of the v1 fixture. For the few
+        tests that need both a v1 database and a current one."""
+        target = Path(tempfile.mkdtemp(prefix="aos-m1-v1-")) / "ws"
+        self.addCleanup(shutil.rmtree, target.parent, True)
+        shutil.copytree(self._fixture_root, target, symlinks=True)
+        return target
+
+    def migrate_to_current(self) -> None:
+        """Bring the v1 fixture up to the version this build supports.
+
+        For every test below whose subject is NOT the schema version — the
+        backup machinery, the read-only guarantees of a no-op apply, the
+        rest of the CLI — the fixture just needs to be current. Since U-M2 it
+        is not, so they say so explicitly instead of relying on an empty
+        registry.
+        """
+        code, _, err = self.aos("migrate", "apply")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.version(), db.SCHEMA_VERSION)
+
 
 # ---------------------------------------------------------------------------
-# 1. The production registry is empty today.
+# 1. The production registry carries exactly the U-M2 step.
 
 class ProductionRegistryTest(MigrationTestCase):
     def test_latest_version_is_derived_from_the_one_schema_declaration(self):
+        # If this fails, a migration was added without raising SCHEMA_VERSION
+        # with it — or the reverse.
         self.assertEqual(migrations.LATEST_VERSION, int(db.SCHEMA_VERSION))
-        self.assertEqual(migrations.LATEST_VERSION, 1)
+        self.assertEqual(migrations.LATEST_VERSION, 2)
 
-    def test_production_registry_is_empty_at_u_m1(self):
-        # U-M1 ships the framework and no schema change. If this fails, a
-        # migration was added without raising SCHEMA_VERSION with it.
-        self.assertEqual(migrations.MIGRATIONS, ())
+    def test_production_registry_is_the_one_u_m2_step(self):
+        self.assertEqual(
+            [
+                (m.from_version, m.to_version, m.migration_id)
+                for m in migrations.MIGRATIONS
+            ],
+            [(1, 2, "u-m2-memory-claims-v2")],
+        )
         migrations.validate_registry()
 
-    def test_production_registry_reports_no_pending_migration(self):
+    def test_no_synthetic_step_ever_reached_production(self):
+        # The synthetic steps below exist to exercise the machinery. If one
+        # of them shows up here, a test fixture became a schema migration.
+        ids = {m.migration_id for m in migrations.MIGRATIONS}
+        self.assertNotIn("0001-synthetic-v2", ids)
+        self.assertNotIn("0002-synthetic-v3", ids)
+
+    def test_production_registry_reports_the_one_pending_migration(self):
         report = migrations.status(self.db_path)
         self.assertEqual(report["current_version"], 1)
-        self.assertEqual(report["latest_version"], 1)
+        self.assertEqual(report["latest_version"], 2)
+        self.assertTrue(report["pending"])
+        self.assertEqual(
+            report["plan"],
+            [{"from": 1, "to": 2, "migration_id": "u-m2-memory-claims-v2"}],
+        )
+
+    def test_nothing_is_pending_once_the_fixture_is_current(self):
+        self.migrate_to_current()
+        report = migrations.status(self.db_path)
+        self.assertEqual(report["current_version"], 2)
         self.assertFalse(report["pending"])
         self.assertEqual(report["plan"], [])
 
-    def test_status_and_plan_agree_that_nothing_is_pending(self):
+    def test_status_and_plan_agree_about_what_is_pending(self):
+        code, out, _ = self.aos("migrate", "status")
+        self.assertEqual(code, 0)
+        self.assertIn("pending:         yes", out)
+        code, out, _ = self.aos("migrate", "plan")
+        self.assertEqual(code, 0)
+        self.assertIn("1 → 2", out)
+
+        self.migrate_to_current()
         code, out, _ = self.aos("migrate", "status")
         self.assertEqual(code, 0)
         self.assertIn("pending:         no", out)
@@ -222,6 +280,9 @@ class ReadOnlyTest(MigrationTestCase):
             conn.close()
 
     def test_noop_apply_writes_no_backup_no_event_and_no_byte(self):
+        # A no-op apply is only reachable on a CURRENT database now.
+        self.migrate_to_current()
+        migrate_events_before = len(self.migrate_events())
         before, listing = self.db_bytes(), self.aos_listing()
         events_before = self.event_count()
 
@@ -231,14 +292,14 @@ class ReadOnlyTest(MigrationTestCase):
 
         self.assertEqual(self.db_bytes(), before)
         self.assertEqual(self.aos_listing(), listing)
-        self.assertFalse(self.backups_dir.exists())
         self.assertEqual(self.event_count(), events_before)
-        self.assertEqual(self.migrate_events(), [])
-        self.assertEqual(self.version(), "1")
+        self.assertEqual(len(self.migrate_events()), migrate_events_before)
+        self.assertEqual(self.version(), db.SCHEMA_VERSION)
 
     def test_noop_apply_never_opens_the_database_read_write(self):
         # The no-op path's byte guarantee comes from never taking a
         # read-write handle at all, not from being careful once it has one.
+        self.migrate_to_current()
         real_connect = db.connect
         rw_opens = []
 
@@ -993,8 +1054,16 @@ class RegistryValidationTest(MigrationTestCase):
             conn.commit()
         finally:
             conn.close()
-        self.assertEqual(migrations.MIGRATIONS, ())
-        self.assertFalse(migrations.status(self.db_path)["pending"])
+        # The planted name is inert: the registry is still exactly the one
+        # step compiled into source.
+        self.assertEqual(
+            [m.migration_id for m in migrations.MIGRATIONS],
+            ["u-m2-memory-claims-v2"],
+        )
+        self.assertEqual(
+            [s["migration_id"] for s in migrations.status(self.db_path)["plan"]],
+            ["u-m2-memory-claims-v2"],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1071,6 +1140,7 @@ class FilesystemSafetyTest(MigrationTestCase):
     def test_backups_and_exports_are_never_migrated(self):
         # apply resolves the live ledger from the workspace and takes NO path
         # argument, so a backup, export, or fixture cannot be handed to it.
+        self.migrate_to_current()
         self.aos("backup", "create")
         snapshot = next(self.backups_dir.glob("*.db"))
         before = snapshot.read_bytes()
@@ -1191,6 +1261,12 @@ class PackagingParityTest(MigrationTestCase):
         self.assertFalse([m for m in members if "backups" in m])
 
     def test_script_module_and_zipapp_agree(self):
+        # All three run against ONE workspace, so `apply` can only be
+        # compared once the database is current — otherwise the first
+        # entrypoint migrates it and the other two answer a different
+        # question. The real 1→2 parity proof, with a fresh v1 copy per
+        # entrypoint, is in tests/test_v03_memory_claims.py.
+        self.migrate_to_current()
         repo_env = self._clean_env(PYTHONPATH=str(REPO_ROOT))
         clean = self._clean_env()
         root = str(self.root)
@@ -1212,6 +1288,7 @@ class PackagingParityTest(MigrationTestCase):
                 self.assertEqual(archive.returncode, script.returncode)
 
     def test_zipapp_noop_apply_outside_the_repo_changes_nothing(self):
+        self.migrate_to_current()
         before, listing = self.db_bytes(), self.aos_listing()
         proc = self._run(
             [sys.executable, str(self.pyz), "--root", str(self.root),
@@ -1220,7 +1297,6 @@ class PackagingParityTest(MigrationTestCase):
         self.assertIn("No migrations pending", proc.stdout)
         self.assertEqual(self.db_bytes(), before)
         self.assertEqual(self.aos_listing(), listing)
-        self.assertFalse(self.backups_dir.exists())
 
     def test_zipapp_refuses_an_unsupported_version_the_same_way(self):
         self.set_version_raw("99")
@@ -1235,7 +1311,27 @@ class PackagingParityTest(MigrationTestCase):
 # ---------------------------------------------------------------------------
 # 20. The rest of the system is untouched.
 
+def _table_info(db_path: Path, table: str) -> list:
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(f"PRAGMA table_info({table})").fetchall()
+    finally:
+        conn.close()
+
+
 class NoRegressionTest(MigrationTestCase):
+    def setUp(self):
+        super().setUp()
+        pristine = self.fresh_v1_copy()
+        self.pristine_root = pristine
+        self.pristine_aos_dir = pristine / utils.AOS_DIR_NAME
+        self.pristine_db_path = self.pristine_aos_dir / utils.DB_FILENAME
+        # These tests are about backup, doctor and the rest of the CLI — none
+        # of which opens a database this build does not support. The fixture
+        # is v1 by design, so bring it current first and let each test make
+        # its own point.
+        self.migrate_to_current()
+
     def test_backup_create_still_emits_its_event_after_the_refactor(self):
         conn = db.open_db(self.aos_dir)
         try:
@@ -1249,7 +1345,7 @@ class NoRegressionTest(MigrationTestCase):
         payload = json.loads(rows[0][0])
         self.assertEqual(payload["filename"], result["path"].name)
         self.assertEqual(payload["sha256"], result["manifest"]["sha256"])
-        self.assertEqual(payload["schema_version"], "1")
+        self.assertEqual(payload["schema_version"], db.SCHEMA_VERSION)
 
     def test_write_backup_pair_writes_files_but_no_event(self):
         conn = db.open_db(self.aos_dir)
@@ -1274,26 +1370,27 @@ class NoRegressionTest(MigrationTestCase):
         self.assertTrue(all(c.ok for c in checks))
         named = [c for c in checks if c.name == "schema_version supported"]
         self.assertEqual(len(named), 1)
-        self.assertEqual(named[0].detail, "1")
+        self.assertEqual(named[0].detail, db.SCHEMA_VERSION)
 
     def test_verify_backup_expected_version_is_load_bearing(self):
-        # The line that makes U-M2 possible: once SCHEMA_VERSION is 2, a
-        # correct v1 pre-migration snapshot must still verify against v1.
-        conn = db.open_db(self.aos_dir)
-        try:
-            result = backup.create_backup(conn, self.aos_dir)
-        finally:
-            conn.close()
-        ok = backup.verify_backup(result["path"], expected_schema_version="1")
+        # The line that made U-M2 possible, now load-bearing for real: a v1
+        # pre-migration snapshot must verify against v1 and FAIL against 2.
+        # This one needs the fixture as it was born, so it snapshots the
+        # pristine v1 copy from the class fixture rather than the migrated
+        # workspace this class sets up.
+        snapshot = migrations.apply_migrations(self.pristine_aos_dir)["snapshot"]
+        ok = backup.verify_backup(snapshot, expected_schema_version="1")
         self.assertTrue(all(c.ok for c in ok))
 
-        bad = backup.verify_backup(result["path"], expected_schema_version="2")
+        bad = backup.verify_backup(snapshot, expected_schema_version="2")
         failed = [c for c in bad if not c.ok]
         self.assertEqual(len(failed), 1)
         self.assertEqual(failed[0].name, "schema_version supported")
         self.assertIn("expected '2'", failed[0].detail)
 
     def test_core_commands_still_work_on_the_fixture(self):
+        # (The refusal on an UNMIGRATED fixture is U-M2's proof; see
+        # tests/test_v03_memory_claims.py::VersionGateTest.)
         for argv in (
             ("status",), ("doctor",), ("task", "list"), ("task", "show", "T-0001"),
             ("log",), ("sync",), ("backup", "create"), ("memory", "list"),
@@ -1303,14 +1400,38 @@ class NoRegressionTest(MigrationTestCase):
                 code, _, err = self.aos(*argv)
                 self.assertEqual(code, 0, f"{argv}: {err}")
 
-    def test_migrate_did_not_change_the_core_schema(self):
+    def test_migrate_changed_only_what_the_step_declares(self):
+        """Since U-M2 the fixture DOES migrate, so "no drift" can no longer
+        mean "nothing changed". It means: the one declared table changed, no
+        other core table did, and the result is the schema a fresh install
+        would have built."""
         from weekend_harness import core_schema
 
-        before = core_schema(self.db_path)
-        self.aos("migrate", "status")
-        self.aos("migrate", "plan")
-        self.aos("migrate", "apply")
-        self.assertEqual(core_schema(self.db_path), before)
+        # self.setUp already migrated this workspace; compare against the
+        # pristine v1 fixture and against a brand-new v2 workspace.
+        before = core_schema(self.pristine_db_path)
+        after = core_schema(self.db_path)
+        self.assertEqual(set(after), set(before))
+        for table, sql in before.items():
+            if table == "memory":
+                self.assertNotEqual(after[table], sql)
+                continue
+            self.assertEqual(after[table], sql, f"{table} drifted")
+
+        fresh_root = Path(tempfile.mkdtemp(prefix="aos-m1-fresh-"))
+        self.addCleanup(shutil.rmtree, fresh_root, True)
+        conn, _ = db.init_db(
+            fresh_root / utils.AOS_DIR_NAME / utils.DB_FILENAME
+        )
+        conn.close()
+        fresh = core_schema(fresh_root / utils.AOS_DIR_NAME / utils.DB_FILENAME)
+        self.assertEqual(
+            [tuple(r) for r in _table_info(self.db_path, "memory")],
+            [tuple(r) for r in _table_info(
+                fresh_root / utils.AOS_DIR_NAME / utils.DB_FILENAME, "memory"
+            )],
+        )
+        self.assertEqual(set(fresh), set(after))
 
     def test_help_lists_migrate(self):
         proc = subprocess.run(

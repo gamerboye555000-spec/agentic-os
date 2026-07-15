@@ -29,6 +29,12 @@ evidence attributable inside the run-bounded recovery window
 (D-v0.2.37), and legacy evidence rows whose ref is blank after
 normalization (D-v0.2.36) — both name bounded run/evidence IDs and counts
 only, never a ref, claim, summary, or agent value.
+
+U-M2 adds four memory-claim lines (checks 22-25): claim shape and hash
+integrity, evidence-link resolution (both FAIL), plus two WARN-ONLY facts —
+pinned-but-ineligible claims, and non-retired claims past their valid_until.
+Same rule as every line above: M-XXXX/E-XXXX ids, closed-vocabulary status
+names and counts only. Never a key, value, source, evidence ref, or a hash.
 """
 
 from __future__ import annotations
@@ -39,8 +45,15 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import db, ids, obsidian, power, secretscan, utils
-from .models import AGENT_KINDS, AGENT_NAME_RE, TASK_STATUSES
+from . import db, ids, obsidian, ops, power, secretscan, utils
+from .models import (
+    AGENT_KINDS,
+    AGENT_NAME_RE,
+    MEMORY_STATUS_RETIRED,
+    MEMORY_STATUSES,
+    TASK_STATUSES,
+    MemoryItem,
+)
 
 # Shared generated-layout rules live in obsidian.py (public, also consumed
 # by the U-C4 mirror export); these aliases keep doctor's historical names.
@@ -196,7 +209,18 @@ def _secret_sweep_findings(conn: sqlite3.Connection) -> list[str]:
     findings: list[str] = []
 
     def note(label: str, fields) -> None:
-        for field, hits in secretscan.scan_fields(fields):
+        # Hand the detector text and nothing else. A TEXT column can hold a
+        # BLOB — only reachable by editing the file outside Agentic OS — and
+        # the shared regex detector takes str, so an unfiltered value would
+        # crash the very report that exists to name the damage. Identity for
+        # every real value; the damaged cell is reported by the check that
+        # owns it (memory claims: check 22).
+        text_only = [
+            (field, value)
+            for field, value in fields
+            if value is None or isinstance(value, str)
+        ]
+        for field, hits in secretscan.scan_fields(text_only):
             findings.append(f"{label} {field}: {','.join(hits)}")
 
     # Projects and agents are identified by ROW id: their public names
@@ -751,4 +775,143 @@ def run_checks(conn: sqlite3.Connection, aos_dir: Path) -> list[Check]:
             )
         )
 
+    checks.extend(_memory_claim_checks(conn))
+
     return checks
+
+
+# ---------------------------------------------------------------------------
+# U-M2 memory claim integrity (checks 22-25; contract M2.10)
+
+def _memory_claim_checks(conn: sqlite3.Connection) -> list[Check]:
+    """Four single-purpose checks over the v2 memory claims.
+
+    Every diagnostic below is an M-XXXX / E-XXXX id, a status name from the
+    closed vocabulary, or a count. Never a key, value, source, evidence ref
+    or a hash — a check that leaks the row it is complaining about would be
+    a worse problem than the row.
+    """
+    now = utils.utc_now_iso()
+    claim_problems: list[str] = []
+    pinned_ineligible: list[str] = []
+    expired_not_retired: list[str] = []
+
+    for row in conn.execute("SELECT * FROM memory ORDER BY id").fetchall():
+        hid = ids.render_id("memory", row["id"])
+        problems: list[str] = []
+        if row["status"] not in MEMORY_STATUSES:
+            # The status VALUE is not echoed: it is stored data, and stored
+            # data is exactly what must not reach a diagnostic line.
+            problems.append("unknown status")
+        if row["pinned"] not in (0, 1):
+            problems.append("pinned is not 0 or 1")
+
+        try:
+            item = MemoryItem.from_row(row)
+        except (TypeError, KeyError):
+            claim_problems.append(f"{hid}: unreadable row")
+            continue
+
+        state = ops.claim_integrity(conn, item)
+        if state != "ok":
+            problems.append(
+                {
+                    "malformed": "malformed content hash",
+                    "mismatch": "content hash does not match the claim",
+                    "unhashable": "claim fields cannot be hashed",
+                }[state]
+            )
+
+        expired = row["valid_until"] is not None and not (
+            row["valid_until"] > now
+        )
+        if row["status"] == MEMORY_STATUS_RETIRED:
+            # Retired must be JUSTIFIED: something must have retired it.
+            if row["superseded_by"] is None and not expired:
+                problems.append("retired but neither superseded nor expired")
+        elif row["superseded_by"] is not None:
+            # Supersession retires transactionally (M2.7), so no honest path
+            # leaves a superseded claim non-retired.
+            problems.append("superseded but not retired")
+
+        if row["superseded_by"] is not None and row["superseded_by"] == row["id"]:
+            problems.append("superseded by itself")
+
+        if problems:
+            claim_problems.append(f"{hid}: " + ", ".join(problems))
+
+        if row["pinned"] and not ops.claim_is_eligible(item, now):
+            pinned_ineligible.append(hid)
+        if expired and row["status"] != MEMORY_STATUS_RETIRED:
+            expired_not_retired.append(hid)
+
+    link_problems: list[str] = []
+    for row in conn.execute(
+        "SELECT me.memory_id, me.evidence_id, m.id AS m_ref, e.id AS e_ref "
+        "FROM memory_evidence me "
+        "LEFT JOIN memory m ON m.id = me.memory_id "
+        "LEFT JOIN evidence e ON e.id = me.evidence_id "
+        "ORDER BY me.memory_id, me.evidence_id"
+    ).fetchall():
+        hid = ids.render_id("memory", row["memory_id"])
+        ehid = ids.render_id("evidence", row["evidence_id"])
+        if row["m_ref"] is None:
+            link_problems.append(f"{hid} → missing memory claim")
+        if row["e_ref"] is None:
+            link_problems.append(f"{hid} → missing evidence {ehid}")
+    # Duplicate links are impossible while the composite primary key stands;
+    # this finds the ones that got in if it was ever bypassed.
+    for row in conn.execute(
+        "SELECT memory_id, evidence_id, COUNT(*) AS n FROM memory_evidence "
+        "GROUP BY memory_id, evidence_id HAVING n > 1 "
+        "ORDER BY memory_id, evidence_id"
+    ).fetchall():
+        link_problems.append(
+            f"{ids.render_id('memory', row['memory_id'])} → "
+            f"{ids.render_id('evidence', row['evidence_id'])} × {row['n']}"
+        )
+
+    return [
+        # 22. Claim shape and integrity.
+        Check(
+            "memory claims are well-formed",
+            not claim_problems,
+            "; ".join(claim_problems[:UH2_DISPLAY_LIMIT])
+            + (
+                f" (+{len(claim_problems) - UH2_DISPLAY_LIMIT} more)"
+                if len(claim_problems) > UH2_DISPLAY_LIMIT
+                else ""
+            ),
+        ),
+        # 23. Evidence links resolve and are unique.
+        Check(
+            "memory evidence links resolve",
+            not link_problems,
+            "; ".join(link_problems[:UH2_DISPLAY_LIMIT])
+            + (
+                f" (+{len(link_problems) - UH2_DISPLAY_LIMIT} more)"
+                if len(link_problems) > UH2_DISPLAY_LIMIT
+                else ""
+            ),
+        ),
+        # 24 (WARN). Pinned but ineligible: honestly reachable (pin, then
+        #     retire; pin, then the expiry passes) and harmless — but the
+        #     human who pinned it deserves to hear that it is not retrieved.
+        Check(
+            "pinned claims eligible for retrieval",
+            not pinned_ineligible,
+            _bounded_ids(pinned_ineligible, "claim"),
+            warn_only=True,
+        ),
+        # 25 (WARN). Past valid_until but not retired. Expiry is TEMPORAL —
+        #     a claim crosses its own valid_until with no write at all, and
+        #     `--valid-until` accepts a past date. So this is a fact worth
+        #     surfacing, never a failure: a check that turns red because a
+        #     day passed is a broken check (M2.7).
+        Check(
+            "non-retired claims past their valid_until",
+            not expired_not_retired,
+            _bounded_ids(expired_not_retired, "claim"),
+            warn_only=True,
+        ),
+    ]

@@ -1,10 +1,14 @@
 """Backup-first schema migrations (U-M1; contract:
 agentic-os-v0.2-u-m1-migration-contract.md).
 
-This module is the machinery, and — deliberately — carries zero production
-migrations. `MIGRATIONS` is empty and `LATEST_VERSION` is derived from
+This module is the machinery. `LATEST_VERSION` is derived from
 `db.SCHEMA_VERSION` rather than typed as a second literal, so the registry
-and the schema can never drift apart. U-M2 adds the first real step.
+and the schema can never drift apart.
+
+U-M2 (agentic-os-v0.3-u-m2-memory-claims-contract.md) adds the first — and,
+today, only — production migration: 1 → 2, `u-m2-memory-claims-v2`. It
+supplies a step body and nothing else; every guarantee around it (validate,
+lock, re-read, snapshot, verify as v1, then mutate) is U-M1's, unchanged.
 
 Three facts shaped the design, each measured rather than assumed:
 
@@ -42,6 +46,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import db, events, ops, secretscan, utils
+from .models import MEMORY_STATUS_LIVE, MEMORY_STATUS_RETIRED, MemoryItem
 from .utils import AosError
 
 #: The highest schema version this build understands. Derived from the one
@@ -67,11 +72,105 @@ class Migration:
     apply: Callable[[sqlite3.Connection], None]
 
 
-#: The canonical production registry. EMPTY AT U-M1 BY CONTRACT (M1.0): the
-#: framework ships before the first schema change. Never populated by
-#: importing arbitrary files or by evaluating names read from the database —
-#: a literal tuple in source is the whole discovery mechanism.
-MIGRATIONS: tuple[Migration, ...] = ()
+# ---------------------------------------------------------------------------
+# Production migration 1 → 2: memory claims (U-M2, contract M2.3/M2.4)
+
+#: The temporary name the v2 memory table is built under before it takes the
+#: real one. Never survives the step: it is renamed inside the transaction.
+_MIGRATING_TABLE = "memory_v2_migrating"
+
+#: The v1 memory columns, in their v1 order. Pinned here so the step reads
+#: the historical row shape explicitly rather than trusting `SELECT *` to
+#: mean what it meant in 2026.
+_V1_MEMORY_COLUMNS = (
+    "id",
+    "scope",
+    "project_id",
+    "kind",
+    "key",
+    "value_md",
+    "source",
+    "confidence",
+    "valid_from",
+    "valid_until",
+    "superseded_by",
+    "updated_at",
+)
+
+
+def _legacy_status(row: sqlite3.Row, now: str) -> str:
+    """The deterministic legacy curation mapping (M2.4).
+
+    Superseded → retired. Already expired → retired. Everything else → live.
+    The expiry test is the EXISTING live predicate verbatim
+    (ops.memory_for_project): a row v1 already kept out of packs is exactly a
+    row v2 calls retired. Nothing is inferred from free text, ever.
+    """
+    if row["superseded_by"] is not None:
+        return MEMORY_STATUS_RETIRED
+    valid_until = row["valid_until"]
+    if valid_until is not None and not (valid_until > now):
+        return MEMORY_STATUS_RETIRED
+    return MEMORY_STATUS_LIVE
+
+
+def _memory_claims_v2(conn: sqlite3.Connection) -> None:
+    """Rebuild `memory` as the v2 claim table and add `memory_evidence`.
+
+    A rebuild rather than ALTER TABLE ADD COLUMN, for one measured reason:
+    ADD COLUMN cannot add `content_sha256 TEXT NOT NULL` without a non-NULL
+    default, and a `DEFAULT ''` would leave every future insert able to store
+    a hashless claim — a migrated database would be permanently weaker than a
+    freshly initialized one. Building from db.MEMORY_CLAIM_DDL makes the two
+    identical, and routing every mapped row through the new CHECK constraints
+    means this step cannot commit a value the schema forbids.
+
+    Runs inside U-M1's already-open transaction: no COMMIT, no ROLLBACK, no
+    touching meta.schema_version — all three belong to apply_migrations.
+    """
+    now = utils.utc_now_iso()  # read ONCE: one migration, one clock reading
+    conn.execute(db.MEMORY_CLAIM_DDL.format(table=_MIGRATING_TABLE))
+
+    columns = ", ".join(_V1_MEMORY_COLUMNS)
+    for row in conn.execute(
+        f"SELECT {columns} FROM {db.MEMORY_TABLE} ORDER BY id"
+    ).fetchall():
+        legacy = {name: row[name] for name in _V1_MEMORY_COLUMNS}
+        status = _legacy_status(row, now)
+        # Every v1 field is carried across verbatim: same id, same text, same
+        # timestamps. Nothing is normalized, trimmed, case-folded or
+        # re-stamped (M2.4).
+        claim = MemoryItem(**legacy, status=status, pinned=0, content_sha256="")
+        # No evidence links are invented: the hash binds an empty link set,
+        # which is the truth about every legacy claim.
+        digest = ops.memory_claim_digest(claim, ())
+        conn.execute(
+            f"INSERT INTO {_MIGRATING_TABLE} ({columns}, status, pinned, "
+            "content_sha256) VALUES ("
+            + ", ".join("?" * len(_V1_MEMORY_COLUMNS))
+            + ", ?, ?, ?)",
+            (*(legacy[name] for name in _V1_MEMORY_COLUMNS), status, 0, digest),
+        )
+
+    conn.execute(f"DROP TABLE {db.MEMORY_TABLE}")
+    conn.execute(f"ALTER TABLE {_MIGRATING_TABLE} RENAME TO {db.MEMORY_TABLE}")
+    # AFTER the rename, so the rename never has to repoint a live reference.
+    conn.execute(
+        db.MEMORY_EVIDENCE_DDL.format(table=db.MEMORY_EVIDENCE_TABLE)
+    )
+
+
+MEMORY_CLAIMS_V2 = Migration(
+    from_version=1,
+    to_version=2,
+    migration_id="u-m2-memory-claims-v2",
+    apply=_memory_claims_v2,
+)
+
+#: The canonical production registry: exactly one step, 1 → 2. Never
+#: populated by importing arbitrary files or by evaluating names read from
+#: the database — a literal tuple in source is the whole discovery mechanism.
+MIGRATIONS: tuple[Migration, ...] = (MEMORY_CLAIMS_V2,)
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 
-from . import ids
+from . import ids, models
 
 ADAPTER_NAMES = ("claude-code", "codex", "gemini", "generic")
 
@@ -377,8 +377,16 @@ def handoff_note(handoff) -> str:
     return "\n".join(lines) + "\n"
 
 
-def memory_note(item, project_slug: str | None) -> str:
+def memory_note(item, project_slug: str | None, evidence_ids=()) -> str:
+    """A memory claim's note.
+
+    U-M2 adds curation state: status, pin, evidence links (as ids — the note
+    never copies an evidence claim, ref or body) and a BOUNDED hash prefix.
+    The full hash is `memory show`'s business; a mirror note is a projection,
+    not an integrity oracle.
+    """
     memory_hid = ids.render_id("memory", item.id)
+    evidence_hids = [ids.render_id("evidence", e) for e in evidence_ids]
     head = frontmatter(
         [
             ("type", "memory"),
@@ -387,6 +395,8 @@ def memory_note(item, project_slug: str | None) -> str:
             ("project", project_slug),
             ("kind", item.kind),
             ("key", item.key),
+            ("status", item.status),
+            ("pinned", "true" if item.pinned else "false"),
             ("confidence", item.confidence),
             ("source", item.source),
             ("valid_from", item.valid_from),
@@ -397,11 +407,15 @@ def memory_note(item, project_slug: str | None) -> str:
                 if item.superseded_by
                 else None,
             ),
+            ("evidence_count", str(len(evidence_hids))),
+            ("hash_prefix", models.hash_prefix(item.content_sha256)),
             ("updated", item.updated_at),
         ],
         ["aos/memory"],
     )
     lines = [head, "", f"# {memory_hid} {_one_line(item.key)}", ""]
+    lines += [f"- status: {item.status}"]
+    lines += [f"- pinned: {'yes' if item.pinned else 'no'}"]
     lines += [f"- scope: {item.scope}"]
     if project_slug:
         lines += [f"- project: [[{project_slug}]]"]
@@ -413,6 +427,12 @@ def memory_note(item, project_slug: str | None) -> str:
         lines += [
             f"- superseded by: [[{ids.render_id('memory', item.superseded_by)}]]"
         ]
+    if evidence_hids:
+        lines += [
+            "- evidence: "
+            + ", ".join(f"[[{hid}]]" for hid in evidence_hids)
+        ]
+    lines += [f"- hash: {models.hash_prefix(item.content_sha256)}…"]
     lines += _section("Value", item.value_md)
     return "\n".join(lines) + "\n"
 

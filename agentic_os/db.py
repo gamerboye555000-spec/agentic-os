@@ -4,8 +4,9 @@ transaction helper that carries the domain-row + event-row invariant.
 Rules honored here:
 - WAL journal mode set at init.
 - PRAGMA foreign_keys=ON on EVERY connection; busy_timeout >= 3000ms.
-- meta.schema_version = "1" at init; a different version is a hard stop
-  (no auto-migration in this MVP).
+- meta.schema_version = "2" at init; a different version is a hard stop.
+  Normal commands NEVER auto-migrate: an older database is refused here and
+  the human is pointed at `migrate status/plan/apply` (U-M2, M2.5).
 """
 
 from __future__ import annotations
@@ -16,9 +17,58 @@ from pathlib import Path
 
 from .utils import DB_FILENAME, AosError
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
-SCHEMA_SQL = """
+#: The v2 memory claim (U-M2, contract M2.2). The table name is parameterized
+#: for exactly one reason: the 1→2 migration builds the new table under a
+#: temporary name and renames it, so a MIGRATED table is created from this
+#: same DDL as a freshly initialized one and the two cannot drift.
+#:
+#: `content_sha256` has NO default on purpose — a claim without its integrity
+#: hash must be impossible to insert, so there is nothing for a careless
+#: writer to fall into.
+MEMORY_CLAIM_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  scope TEXT NOT NULL,
+  project_id INTEGER,
+  kind TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value_md TEXT NOT NULL,
+  source TEXT NOT NULL,
+  confidence TEXT NOT NULL,
+  valid_from TEXT NOT NULL,
+  valid_until TEXT,
+  superseded_by INTEGER,
+  updated_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'live'
+    CHECK (status IN ('proposed','live','contested','quarantined','retired')),
+  pinned INTEGER NOT NULL DEFAULT 0
+    CHECK (pinned IN (0, 1)),
+  content_sha256 TEXT NOT NULL
+)"""
+
+#: Normalized evidence links (U-M2, M2.2). Two integers and a timestamp: no
+#: evidence body, claim, ref or any other copied text can live here.
+#:
+#: The composite PRIMARY KEY is what makes a duplicate link impossible at the
+#: storage layer. Plain REFERENCES (NO ACTION) matches every other FK in this
+#: schema: with foreign_keys=ON, deleting a linked memory or evidence row is
+#: REFUSED. No cascade — the ledger is append-only and has no delete path, so
+#: a cascade would only be a silent deletion mechanism for a caller that does
+#: not exist.
+MEMORY_EVIDENCE_DDL = """CREATE TABLE {table}(
+  memory_id INTEGER NOT NULL,
+  evidence_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (memory_id, evidence_id),
+  FOREIGN KEY(memory_id) REFERENCES memory(id),
+  FOREIGN KEY(evidence_id) REFERENCES evidence(id)
+)"""
+
+MEMORY_TABLE = "memory"
+MEMORY_EVIDENCE_TABLE = "memory_evidence"
+
+_SCHEMA_HEAD = """
 CREATE TABLE IF NOT EXISTS meta(
   key TEXT PRIMARY KEY,
   value TEXT
@@ -118,21 +168,9 @@ CREATE TABLE IF NOT EXISTS handoffs(
   FOREIGN KEY(task_id) REFERENCES tasks(id)
 );
 
-CREATE TABLE IF NOT EXISTS memory(
-  id INTEGER PRIMARY KEY,
-  scope TEXT NOT NULL,
-  project_id INTEGER,
-  kind TEXT NOT NULL,
-  key TEXT NOT NULL,
-  value_md TEXT NOT NULL,
-  source TEXT NOT NULL,
-  confidence TEXT NOT NULL,
-  valid_from TEXT NOT NULL,
-  valid_until TEXT,
-  superseded_by INTEGER,
-  updated_at TEXT NOT NULL
-);
+"""
 
+_SCHEMA_TAIL = """
 CREATE TABLE IF NOT EXISTS packs(
   id INTEGER PRIMARY KEY,
   task_id INTEGER NOT NULL,
@@ -153,6 +191,18 @@ CREATE TABLE IF NOT EXISTS agents(
   notes TEXT
 );
 """
+
+#: The canonical v2 schema. Composed rather than typed as one literal so the
+#: memory tables have exactly ONE definition in the codebase, shared with the
+#: 1→2 migration (M2.3).
+SCHEMA_SQL = (
+    _SCHEMA_HEAD
+    + MEMORY_CLAIM_DDL.format(table=MEMORY_TABLE)
+    + ";\n\n"
+    + MEMORY_EVIDENCE_DDL.format(table=MEMORY_EVIDENCE_TABLE)
+    + ";\n"
+    + _SCHEMA_TAIL
+)
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -175,12 +225,27 @@ def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
 
 
 def _check_schema_version(conn: sqlite3.Connection) -> None:
+    """The version gate every NORMAL command walks through.
+
+    Normal commands never auto-migrate (U-M2 M2.5): an older database is
+    refused here, unchanged, and the human is handed the exact three commands
+    that move it forward. Only the migration commands read the ledger's
+    version themselves (migrations.read_schema_version) and so can open an
+    older schema — deliberately, and only to migrate it.
+    """
     version = get_meta(conn, "schema_version")
-    if version != SCHEMA_VERSION:
-        raise AosError(
-            f"Database schema_version is {version!r} but this build supports "
-            f"{SCHEMA_VERSION!r}. No auto-migration in this MVP."
-        )
+    if version == SCHEMA_VERSION:
+        return
+    raise AosError(
+        f"Database schema_version is {version!r} but this build supports "
+        f"{SCHEMA_VERSION!r}. Normal commands never auto-migrate; nothing "
+        "was changed. Inspect and migrate it deliberately:\n"
+        "  python aos.py migrate status\n"
+        "  python aos.py migrate plan\n"
+        "  python aos.py migrate apply\n"
+        "`migrate apply` snapshots and verifies the database before it "
+        "changes anything. See RECOVERY.md."
+    )
 
 
 def open_db(aos_dir: Path) -> sqlite3.Connection:

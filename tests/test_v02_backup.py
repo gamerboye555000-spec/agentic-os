@@ -33,7 +33,7 @@ from pathlib import Path
 from weekend_harness import Night1BackCompatCase, WeekendOpsTestCase, run_cli
 
 import agentic_os
-from agentic_os import utils
+from agentic_os import db, utils
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -164,7 +164,7 @@ class TestBackupCreate(BackupCase):
             manifest["source_db_path"],
             str(self.aos_dir / utils.DB_FILENAME),
         )
-        self.assertEqual(manifest["schema_version"], "1")
+        self.assertEqual(manifest["schema_version"], db.SCHEMA_VERSION)
         self.assertEqual(manifest["size_bytes"], backup_path.stat().st_size)
         self.assertEqual(manifest["sha256"], utils.sha256_file(backup_path))
         self.assertIn("agentic-os", manifest["tool"])
@@ -446,7 +446,7 @@ class TestBackupRestore(BackupCase):
                 conn.execute(
                     "SELECT value FROM meta WHERE key = 'schema_version'"
                 ).fetchone()["value"],
-                "1",
+                db.SCHEMA_VERSION,
             )
             titles = [
                 r["title"]

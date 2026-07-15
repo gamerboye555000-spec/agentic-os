@@ -1,4 +1,11 @@
-"""Enums, dataclasses, and row conversion. Closed enums reject unknown values."""
+"""Enums, dataclasses, and row conversion. Closed enums reject unknown values.
+
+Depends on `utils` and nothing else in the package, deliberately: this is the
+domain vocabulary every other module is built on (`protocols` imports it for
+the evidence/run enums), so it can import none of them back. The U-M2 claim
+HASH therefore lives in `ops` — it needs U-X1's canonical serializer — while
+the vocabulary it is expressed in stays here.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +23,15 @@ PACK_TARGETS = ("claude-code", "codex", "gemini", "generic")
 MEMORY_SCOPES = ("global", "project")
 MEMORY_KINDS = ("preference", "fact", "constraint", "summary")
 MEMORY_CONFIDENCES = ("confirmed", "single", "inferred", "assumed")
+#: U-M2 curation status. Closed here AND by a CHECK constraint in the schema:
+#: the domain boundary and the storage boundary agree, so neither a careless
+#: caller nor a direct SQL writer can invent a status. `proposed`,
+#: `contested` and `quarantined` are storable for the U-M4 workflow; U-M2
+#: ships no command that produces them.
+MEMORY_STATUSES = ("proposed", "live", "contested", "quarantined", "retired")
+#: The only status ordinary retrieval will look at (M2.7).
+MEMORY_STATUS_LIVE = "live"
+MEMORY_STATUS_RETIRED = "retired"
 AGENT_KINDS = ("local", "cloud", "human", "generic")
 
 #: All user-input validators anchor with \Z, never $ (D-v0.2.3) — '$' admits
@@ -156,6 +172,11 @@ class Handoff(_Row):
 
 @dataclass
 class MemoryItem(_Row):
+    """A v2 memory claim. Every v1 field keeps its v1 meaning (D-v0.3.15):
+    `kind` is the closed claim type, `key` the stable claim key/subject,
+    `value_md` the human-readable claim value. U-M2 adds curation state, not
+    a new data model."""
+
     id: int
     scope: str
     project_id: int | None
@@ -168,6 +189,9 @@ class MemoryItem(_Row):
     valid_until: str | None
     superseded_by: int | None
     updated_at: str
+    status: str
+    pinned: int
+    content_sha256: str
 
 
 @dataclass
@@ -214,3 +238,38 @@ class Event(_Row):
     entity_id: int | None
     action: str
     payload_json: str
+
+
+# ---------------------------------------------------------------------------
+# Memory claim hash vocabulary (U-M2, contract M2.6). The hash ITSELF is
+# computed in ops.memory_claim_digest: it needs U-X1's canonical serializer,
+# and protocols imports this module, so the dependency can only run one way.
+
+#: A claim hash is exactly 64 lowercase hex characters. Uppercase, blank,
+#: truncated and "sha256:"-prefixed spellings are malformed, not equivalent.
+CLAIM_HASH_RE = re.compile(r"^[0-9a-f]{64}\Z", re.ASCII)
+
+#: Shown when a hash must be named in human output: enough to correlate two
+#: lines, never enough to reconstruct anything (M2.6 — hashes are never
+#: printed in full outside `memory show`).
+HASH_PREFIX_CHARS = 12
+
+
+def is_claim_hash(value: object) -> bool:
+    return isinstance(value, str) and bool(CLAIM_HASH_RE.match(value))
+
+
+def hash_prefix(value: object) -> str:
+    """A bounded, safe rendering of a hash for events and diagnostics."""
+    if not isinstance(value, str):
+        return "(none)"
+    return value[:HASH_PREFIX_CHARS] if value else "(blank)"
+
+
+class ClaimHashError(AosError):
+    """A claim's stored fields cannot be hashed at all.
+
+    Distinct from a mismatch: the row holds something no honest write could
+    have produced (a BLOB in a TEXT column, a non-integer pin). Carries the
+    memory id and the FIELD NAME only — never the value, whatever it is.
+    """

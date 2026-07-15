@@ -124,9 +124,10 @@ schema change programmatically is guesswork, and doing it automatically
 would silently bypass the snapshot taken to protect you. The snapshot is the
 rollback.
 
-Today this drill is theoretical: the migration registry is empty, so
-`migrate apply` is always a no-op and takes no snapshot. It is written now
-because the first real migration must not be the first time anyone reads it.
+This drill is no longer theoretical. Since U-M2 there is one production
+migration — **1 → 2, `u-m2-memory-claims-v2`** (memory claims) — so
+`migrate apply` on a pre-U-M2 workspace really does take a snapshot and
+really does change the memory table. Everything below applies to it exactly.
 
 ### What `migrate apply` guarantees before it changes anything
 
@@ -180,6 +181,55 @@ Anything written to the ledger *after* the snapshot — which means during the
 migration itself — is gone. That is a very short window by design: the write
 lock is held from the snapshot onward, so nothing else could have committed
 during it.
+
+### Restoring the v1 pre-migration snapshot (the 1 → 2 case), exactly
+
+The snapshot `migrate apply` takes before the memory-claims migration is a
+**schema v1 database**. That changes two steps of the drill above, and both
+surprises are expected:
+
+```bash
+# 3'. `backup verify` with no arguments checks the snapshot against the
+#     version THIS BUILD supports (2). A v1 pre-migration snapshot therefore
+#     reports:
+#
+#       [FAIL] schema_version supported — backup is schema '1', this build
+#              supports '2'
+#       Backup verification failed: schema_version supported.
+#
+#     For a pre-migration snapshot that FAIL is not damage — it is the
+#     snapshot being what it is supposed to be: the database as it was
+#     BEFORE the migration. The checks that tell you whether the bytes are
+#     good are the other six (file exists, manifest well-formed, size,
+#     sha256, opens as SQLite, integrity_check). Read those. If they pass,
+#     the snapshot is sound.
+#
+#     `migrate apply` itself verified this snapshot AS schema 1 before it
+#     touched anything, which is the check that actually mattered.
+
+# 6'. After restoring a v1 snapshot you are back on version 1, so every
+#     normal command refuses again — correctly. `doctor` included:
+python3 aos.py migrate status     # → schema version: 1, pending: yes
+python3 aos.py doctor             # → refuses: schema_version is '1'
+
+#     That is the ledger telling the truth. From here you either stay on the
+#     older build, or migrate again once the reason for the failure is fixed:
+python3 aos.py migrate apply
+python3 aos.py doctor             # now it runs
+```
+
+**Never** "fix" that refusal by editing `meta.schema_version` to 2. The
+memory table would still be v1 — no `status`, no `pinned`, no
+`content_sha256`, no `memory_evidence` — and every command that reads a
+claim would fail against a database now claiming to be something it is not.
+The version row describes the bytes; it does not change them.
+
+**Never** hand-edit `content_sha256` either. It is a claim's integrity hash,
+computed from the claim's own authoritative fields. Editing it to "make
+doctor pass" does not repair the claim — it destroys the only evidence that
+the claim was altered, and every write against that claim will still refuse.
+If `doctor` reports a hash mismatch, see TROUBLESHOOTING.md: the answer is to
+restore or to re-state the claim, never to launder it.
 
 ### "PARTIALLY ADVANCED": an earlier step committed, a later one failed
 

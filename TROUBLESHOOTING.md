@@ -663,22 +663,33 @@ No snapshot was taken and no event was written.
 means exactly what it says: no backup, no event, no byte changed. The
 no-op path never even opens the database read-write.
 
-### "Database schema_version is … but this build supports '1'."
+### "Database schema_version is '1' but this build supports '2'."
 
-A **normal** command (`status`, `task list`, `sync`, …) refusing like this
-is U-C1 behavior, unchanged by U-M1, and it is correct: this build does
-not understand that database. It will not guess, and it will not quietly
-migrate. Run `python3 aos.py migrate status` to see the version, the
-supported version, and whether a path exists.
+A **normal** command (`status`, `task list`, `sync`, `memory list`, …)
+refusing like this is correct and expected on any workspace created before
+U-M2. This build does not understand a v1 database. It will not guess, and
+it will not quietly migrate. Nothing was changed by the refusal.
 
-- **Version is lower and a migration exists** → `migrate plan`, then
-  `migrate apply`.
+The fix is the three commands the message itself prints:
+
+```bash
+python3 aos.py migrate status   # where am I, what is pending?
+python3 aos.py migrate plan     # exactly what would run: 1 → 2
+python3 aos.py migrate apply    # snapshots + verifies first, then migrates
+```
+
+`migrate apply` takes a verified snapshot before it changes anything (see
+RECOVERY.md), preserves every memory row's id and text exactly, and derives
+each claim's curation status from what v1 already recorded.
+
+- **Version is lower and a migration exists** (today: version 1) →
+  `migrate plan`, then `migrate apply`.
 - **Version is lower and no migration exists** (today: any version below
   1) → this build cannot reach it. Use the build that wrote it, or restore
   a backup that verifies.
 - **Version is higher** → see below.
 
-### "Database schema version N is newer than this build supports (1)."
+### "Database schema version N is newer than this build supports (2)."
 
 The database was written by a newer Agentic OS. **Upgrade the tool, do not
 touch the database.** This build refuses to migrate, read, or "fix" it, and
@@ -1062,3 +1073,101 @@ generates — delete it, or add the schema it was meant to project.
 Changing a schema changes its digest, and the digest is what a future consumer
 vendors. A digest change is a protocol change: if consumers already exist, mint
 a new major rather than editing a published one in place.
+
+## Memory claims (U-M2)
+
+### "Refusing to change memory M-0001: its content hash does not match its stored fields."
+
+Every claim carries a `content_sha256` binding its scope, project, kind, key,
+value, source, confidence, validity, supersession, status, pin state and
+evidence links. This message means the stored fields and the stored hash
+disagree: the row was edited outside Agentic OS (raw SQL, a merge tool, a
+partially-written restore), or the hash itself was substituted.
+
+The write refused **on purpose**, and nothing changed. If a mutation had gone
+ahead it would have recomputed the hash over the altered row and quietly
+certified the edit — the ledger would have stopped being able to tell you
+anything had happened at all.
+
+```bash
+python3 aos.py doctor                  # which claims, by id — never their text
+python3 aos.py memory show M-0001      # the claim, its hash and (mismatch)
+```
+
+Then choose:
+
+- **You know what the row should say** → restore the pre-edit database
+  (RECOVERY.md), or add a *new* claim superseding the damaged one
+  (`memory add --supersedes M-0001`). Superseding is a normal write against a
+  hash-valid claim; if the damaged claim itself is the one being superseded,
+  restore instead.
+- **You do not know** → restore from a backup that verifies. A claim whose
+  integrity you cannot establish is not context you want an agent reading.
+
+Never "fix" this by writing a recomputed hash into the row. That does not
+repair anything; it only deletes the evidence that the claim was altered.
+
+### "Refusing to change memory M-0001: its content hash is not 64 lowercase hex characters."
+
+Same situation, cruder cause: the hash cell is blank, truncated, uppercase, or
+carries a prefix like `sha256:`. A claim hash is exactly 64 lowercase hex
+characters — nothing else is a spelling of the same thing. See above.
+
+### doctor: "[FAIL] memory evidence links resolve — M-0001 → missing evidence E-0007"
+
+A link row points at a memory claim or an evidence row that is not there.
+Foreign keys make this impossible through normal use (`PRAGMA foreign_keys=ON`
+on every connection refuses to delete a linked row), so it means something
+deleted rows with foreign keys off, or a restore landed half a database.
+Restore from a verified backup; do not delete the link to make the line go
+away.
+
+### "Refusing to link evidence E-0002 (project 'other') to a memory claim in project 'demo'"
+
+A claim and its evidence may not name two different projects. Either the
+evidence id is wrong, or the claim belongs to the other project.
+
+A NULL on either side is fine and is not this error: a **global-scope claim**
+may cite project evidence, and evidence on a projectless (inbox) task may back
+any claim. The refusal happens only when both sides name a project and the
+projects differ.
+
+### doctor: "[WARN] pinned claims eligible for retrieval — 1 claim(s): M-0001"
+
+You pinned a claim and it is no longer eligible for normal retrieval — it was
+retired, superseded, or its `valid_until` has passed. **Pinning is ordering,
+never permission**: it does not put an ineligible claim back into context, so
+this claim is pinned and unreachable.
+
+It is a warning, not a failure, because getting here is honest (pin, then
+retire). Fix it however you like: `memory unpin M-0001` to tidy up, or leave
+it — a retired claim is inert either way. If you actually want the claim back
+in context, state it again as a new live claim; U-M2 has no un-retire, by
+design.
+
+### doctor: "[WARN] non-retired claims past their valid_until — M-0003"
+
+The claim's `valid_until` is in the past but its status is not `retired`. Also
+honest, also not a failure: **expiry is temporal and retirement is curation**.
+A live claim crosses its own `valid_until` with no write at all, and
+`memory add --valid-until` accepts a past date. Such a claim is already
+excluded from every context pack; the line exists so you know it is there.
+
+Run `python3 aos.py memory retire M-0003` if you want the status to say so.
+Nothing retires it automatically — U-M2 performs no status transitions on its
+own.
+
+### "Refusing to pin memory M-0001: it is not eligible for normal retrieval"
+
+Pin refuses anything that is not live, unexpired and unsuperseded, because a
+pin on an unreachable claim is a lie about what agents will see. `memory show
+M-0001` prints the status, validity and supersession that caused it.
+
+### A quarantined (or proposed, or contested) claim is not in my pack
+
+Working as designed. **Normal retrieval means `status = 'live'` only.** U-M2
+stores those statuses for the later curation workflow (U-M4) and ships no
+command that produces them, so on a v2 database from this build you will only
+ever see `live` and `retired` unless something wrote a status directly.
+
+`memory list --status quarantined` shows them; nothing else will.

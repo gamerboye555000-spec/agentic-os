@@ -267,15 +267,25 @@ python aos.py handoff create T-0001 --from claude-code --to codex \
     --state "Done: pack built. Remaining: verify evidence flow."
 python aos.py handoff accept H-0001
 
-# Scoped memory rows (M-0001): add, list, retire, supersede:
+# Scoped memory claims (M-0001): add, list, show, retire, supersede:
 python aos.py memory add --scope project --project agentic-os \
     --kind constraint --key storage --value "SQLite is source of truth" \
     --source human --confidence confirmed
 python aos.py memory list --json
+python aos.py memory show M-0001
 python aos.py memory add --scope project --project agentic-os \
     --kind constraint --key storage --value "SQLite, WAL mode" \
     --source human --confidence confirmed --supersedes M-0001
 python aos.py memory retire M-0002
+
+# Curation (U-M2): pin what should lead the pack, cite the evidence for it:
+python aos.py memory pin M-0003
+python aos.py memory link-evidence M-0003 E-0001
+python aos.py memory add --scope project --project agentic-os \
+    --kind fact --key runtime --value "python 3.13" --source human \
+    --confidence confirmed --pin --evidence E-0001 --evidence E-0002
+python aos.py memory list --status live --pinned
+python aos.py memory unpin M-0003
 
 # Search tasks, decisions, evidence, handoffs, and memory:
 python aos.py search "SQLite" --json
@@ -302,18 +312,65 @@ python aos.py backup restore .agentic-os/backups/aos-backup-<stamp>.db \
     --to /somewhere/new/aos.db
 ```
 
-Memory in context packs: the pack MEMORY section carries live rows only
-(not retired, not superseded, latest per key), global scope plus the pinned
-project. Retired and superseded rows stay in the ledger and in
-`memory list` forever — they only stop being fed to agents.
+## Memory claims and curation (U-M2)
+
+A memory row is a **claim**: a `key` (what it is about), a `value_md` (what
+it says), and — since schema v2 — the curation state that decides whether an
+agent ever sees it.
+
+**Status.** Every claim carries exactly one:
+
+| status | meaning | in context packs? |
+|---|---|---|
+| `live` | curated, current | **yes** |
+| `proposed` | suggested, not accepted | no |
+| `contested` | disputed | no |
+| `quarantined` | withheld | no |
+| `retired` | superseded or no longer valid | no |
+
+`memory add` creates a **live, unpinned** claim, exactly as it always did.
+U-M2 stores the other four statuses for the U-M4 curation workflow but ships
+no command that produces them — there is no approve, reject, contest or
+quarantine yet, and no automatic promotion.
+
+**Normal retrieval means live only.** A claim reaches a context pack only if
+it is `live` **and** unexpired **and** unsuperseded. Everything else stays in
+the ledger and in `memory list` forever — it just stops being fed to agents.
+
+**Pinning is ordering, never permission.** `memory pin` makes a claim lead
+the pack MEMORY section; that is all it does. A pinned claim must still be
+live, unexpired and unsuperseded to be retrieved — pin a claim and then
+retire it and it disappears from packs exactly like any other retired claim
+(doctor will tell you it is pinned but unreachable). Order is: pinned claims
+first, unpinned second, and inside each group the same stable scope/key/id
+order as always.
+
+**Evidence links.** `memory link-evidence M-0001 E-0001` records that a claim
+is backed by an evidence row. The link is a normalized pair of ids — no copy
+of the evidence's text lives in it, and `memory show` prints the ids, never
+the evidence body or the file it points at. A claim and its evidence may not
+name two different projects; a global claim citing project evidence is fine.
+
+**Every claim carries a hash.** `content_sha256` binds every authoritative
+field — scope, project, kind, key, value, source, confidence, validity,
+supersession, status, pin state and the sorted evidence links. Any
+authoritative write recomputes it in the same transaction. Change a claim
+behind Agentic OS's back and `doctor` says so, and every write against that
+claim refuses rather than quietly re-blessing the edit.
+
+```bash
+python aos.py memory show M-0001            # status, pin, hash, evidence ids
+python aos.py memory show M-0001 --json
+python aos.py memory list --status retired  # administrative: history included
+python aos.py memory list --pinned
+```
 
 ## Schema migrations (U-M1)
 
-**Today there is nothing to migrate.** The schema is at version 1, this
-build supports version 1, and the migration registry is deliberately empty.
-U-M1 ships the machinery — backup-first, transactional, forward-only —
-*before* the first schema change exists, so no schema change ever has to
-invent its own safety net. U-M2 (memory v2) stays blocked until U-M1 merges.
+**Schema version 2 is current.** A workspace created by this build starts at
+2 and never migrates. A workspace from an earlier build is at version 1 and
+has exactly one migration pending: `u-m2-memory-claims-v2` (memory claims —
+see above), the first production migration the U-M1 machinery carries.
 
 ```bash
 # Where am I, what does this build support, is anything pending?
@@ -321,10 +378,17 @@ python aos.py migrate status
 
 # What exactly would run, in order? (read-only; writes nothing)
 python aos.py migrate plan
+#   1 → 2  u-m2-memory-claims-v2
 
-# Run it. No-op today.
+# Run it. Snapshots and verifies the database first.
 python aos.py migrate apply
 ```
+
+The 1 → 2 migration preserves every memory row exactly — same id, same text,
+same timestamps — and derives curation from what v1 already knew: a
+superseded or expired row becomes `retired`, every other row becomes `live`,
+every row starts unpinned, no evidence link is invented, and every row gets a
+valid hash. Nothing is inferred from your text.
 
 `status` and `plan` are read-only *byte-for-byte*: they open the database
 through a connection SQLite itself refuses writes on, and leave no `-wal`,
@@ -333,9 +397,10 @@ successful no-op that never opens the database read-write at all — no
 backup, no event, not one byte changed.
 
 **Nothing auto-migrates.** No normal command will ever quietly change your
-schema. A database at an unsupported version is refused by every command
-exactly as it always was; `migrate apply` is the only door, and you open it
-deliberately. That refusal is a feature — an unexpected version means
+schema. A database at an unsupported version is refused by every command —
+`memory list` on a v1 database tells you to run `migrate status` / `plan` /
+`apply` and changes nothing. `migrate apply` is the only door, and you open
+it deliberately. That refusal is a feature — an unexpected version means
 something is wrong, and guessing is how data dies.
 
 **Backup first, always.** Before the first schema change of a real
