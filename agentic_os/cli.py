@@ -795,6 +795,117 @@ def _apply_export(plan) -> None:
         print(result.cleanup_warning, file=sys.stderr)
 
 
+def _hooks_settings_path(args) -> Path:
+    from . import hooks
+
+    if args.settings is not None:
+        # expanduser only — no resolve(): a symlinked settings path must
+        # still LOOK like a symlink to the installer's refusal check.
+        return Path(args.settings).expanduser()
+    return hooks.default_settings_path()
+
+
+def _hooks_mode(args) -> bool:
+    """True = apply. Dry-run is the default posture; passing both is an
+    error rather than a guess."""
+    if args.dry_run and args.apply:
+        raise AosError("Pass --dry-run or --apply, not both.")
+    return args.apply
+
+
+def _print_settings_plan(plan, verb: str) -> None:
+    if not plan.changed:
+        print(f"Nothing to {verb}: {plan.path} already matches; no changes.")
+        return
+    for line in plan.diff_lines():
+        print(line, end="" if line.endswith("\n") else "\n")
+    print(f"Dry run: nothing was changed. Re-run with --apply to {verb}.")
+
+
+def _confirm_settings_rewrite(path: Path) -> None:
+    try:
+        reply = input(
+            f"Rewrite {path}? A timestamped backup is written first. "
+            "Type 'yes' to proceed: "
+        )
+    except EOFError:
+        reply = ""
+    if reply.strip() != "yes":
+        raise AosError("Not confirmed; nothing was changed.")
+
+
+def _apply_settings_plan(plan, done_message: str) -> int:
+    from . import hooks
+
+    for line in plan.diff_lines():
+        print(line, end="" if line.endswith("\n") else "\n")
+    _confirm_settings_rewrite(plan.path)
+    backup = hooks.apply_plan(plan)
+    if backup is not None:
+        print(f"backup: {backup}")
+        print(f"Restore anytime: cp '{backup}' '{plan.path}'")
+    print(done_message)
+    return 0
+
+
+def cmd_hooks_install(args) -> int:
+    from . import hooks
+
+    apply = _hooks_mode(args)
+    path = _hooks_settings_path(args)
+    plan = hooks.plan_install(path)
+    if not apply:
+        _print_settings_plan(plan, "install")
+        return 0
+    if not plan.changed:
+        print(f"AOS hooks already installed in {path}; nothing to do.")
+        return 0
+    return _apply_settings_plan(
+        plan,
+        f"Installed AOS Stop/SessionEnd hooks into {path} "
+        f"(version {hooks.HOOK_PROTOCOL_VERSION}, "
+        f"digest {hooks.install_digest()[:16]}). "
+        "Sessions publish write-back dropfiles; ingest stays manual.",
+    )
+
+
+def cmd_hooks_status(args) -> int:
+    from . import hooks
+
+    path = _hooks_settings_path(args)
+    info = hooks.status(path)
+    print(f"settings: {info['settings']}")
+    print(f"state: {info['state']}")
+    if info["state"] == "installed":
+        print(f"version: {info['version']}")
+        print(f"digest: {info['digest']}")
+    elif info["state"] == "drifted":
+        print(
+            "AOS-owned hook entries differ from what this checkout "
+            "installs. Preview the fix: python aos.py hooks install --dry-run"
+        )
+    return 0
+
+
+def cmd_hooks_uninstall(args) -> int:
+    from . import hooks
+
+    apply = _hooks_mode(args)
+    path = _hooks_settings_path(args)
+    plan = hooks.plan_uninstall(path)
+    if not apply:
+        _print_settings_plan(plan, "uninstall")
+        return 0
+    if not plan.changed:
+        print(f"No AOS-owned hooks in {path}; nothing to do.")
+        return 0
+    return _apply_settings_plan(
+        plan,
+        f"Removed the AOS-owned Stop/SessionEnd hooks from {path}. "
+        "Unrelated settings and hooks were preserved.",
+    )
+
+
 def cmd_doctor(args) -> int:
     with _ledger(args) as (aos_dir, conn):
         from . import doctor
@@ -1163,6 +1274,52 @@ def build_parser() -> _Parser:
 
     p_doctor = sub.add_parser("doctor", help="health checks")
     p_doctor.set_defaults(func=cmd_doctor)
+
+    p_hooks = sub.add_parser(
+        "hooks",
+        help="Claude Code session hooks (U-H1): previewable, reversible "
+        "install into Claude settings",
+    )
+    hooks_sub = p_hooks.add_subparsers(
+        dest="subcommand", metavar="SUBCOMMAND", required=True
+    )
+
+    def _hooks_common(p) -> None:
+        p.add_argument(
+            "--settings", default=None, metavar="PATH",
+            help="Claude settings file (default: ~/.claude/settings.json)",
+        )
+
+    p_hooks_install = hooks_sub.add_parser(
+        "install",
+        help="merge the AOS Stop/SessionEnd handlers into Claude settings "
+        "(dry-run unless --apply)",
+    )
+    p_hooks_install.add_argument("--dry-run", action="store_true")
+    p_hooks_install.add_argument(
+        "--apply", action="store_true",
+        help="write the change (asks for confirmation; backs up first)",
+    )
+    _hooks_common(p_hooks_install)
+    p_hooks_install.set_defaults(func=cmd_hooks_install)
+
+    p_hooks_status = hooks_sub.add_parser(
+        "status", help="report absent / installed (version, digest) / drifted"
+    )
+    _hooks_common(p_hooks_status)
+    p_hooks_status.set_defaults(func=cmd_hooks_status)
+
+    p_hooks_uninstall = hooks_sub.add_parser(
+        "uninstall",
+        help="remove only the AOS-owned handlers (dry-run unless --apply)",
+    )
+    p_hooks_uninstall.add_argument("--dry-run", action="store_true")
+    p_hooks_uninstall.add_argument(
+        "--apply", action="store_true",
+        help="write the change (asks for confirmation; backs up first)",
+    )
+    _hooks_common(p_hooks_uninstall)
+    p_hooks_uninstall.set_defaults(func=cmd_hooks_uninstall)
 
     return parser
 

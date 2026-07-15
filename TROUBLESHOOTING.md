@@ -1,9 +1,9 @@
 # TROUBLESHOOTING — Agentic OS
 
 Written for a tired human after a bad run. This page currently covers the
-Windows/Obsidian export (U-C4); other troubleshooting lives in
-`RECOVERY.md` (backup/restore/corruption drill) until the full docs pass
-(U-P2) lands.
+Windows/Obsidian export (U-C4) and the Claude Code session hooks (U-H1, at
+the end); other troubleshooting lives in `RECOVERY.md`
+(backup/restore/corruption drill) until the full docs pass (U-P2) lands.
 
 ## Windows / Obsidian export (`sync --export-to PATH`)
 
@@ -295,3 +295,122 @@ renames (the recovery drill above still applies), and cloud sync clients
 can briefly lock files mid-swap — that surfaces as the "could not move the
 current generation aside" refusal; rerun after the sync pass finishes.
 Prefer a plain local NTFS folder when you can.
+
+## Claude Code session hooks (U-H1)
+
+### The model in one paragraph
+
+Two AOS-owned command hooks bridge a Claude Code session to the manual
+dropfile path. On **Stop**, the hook looks at the official
+`last_assistant_message` only (never the transcript) for exactly one fenced
+` ```aos-dropfile ` block and stages it — validated with the same parser,
+size caps, and secret scanner as `ingest dropfile` — at
+`.agentic-os/exports/hook-staging/stop-<session>.json`. On **SessionEnd**,
+the hook re-validates that record and publishes at most one dropfile at a
+deterministic name under `.agentic-os/exports/`. The hooks own exactly those
+two paths and touch nothing else: no ledger, no git, no network, no
+transcript, no other workspace file. Ingest stays manual
+(`python aos.py ingest dropfile <path>`). The Stop hook never blocks Claude
+from stopping — every refusal is a diagnostic, and diagnostics never repeat
+envelope content (it could be exactly the secret the scanner refused).
+
+### Hook messages ("aos-hook[stop]: …" / "aos-hook[session-end]: …") and what to do
+
+- **Silence.** Normal for most sessions: no envelope in the final message,
+  or the session ran outside an AOS workspace, or SessionEnd found nothing
+  staged. Nothing was written; there is nothing to do.
+- **"staged write-back envelope for T-XXXX …"** The Stop capture worked;
+  SessionEnd will publish it when the session ends.
+- **"found N aos-dropfile envelopes (exactly one is required) …"** The
+  final response carried more than one envelope (or opening fence); with
+  one staged record per session, publishing an arbitrary winner would drop
+  the others silently. Nothing was staged. Ask the agent to emit exactly
+  one, or write the dropfile manually.
+- **"… opening fence is never closed (incomplete envelope) …" / "content
+  follows the … closing fence (the envelope must end the final
+  message) …"** The final response ATTEMPTED an envelope whose shape is
+  not exactly right — a truncated fence, or commentary after the closing
+  fence. Nothing was staged. Ask the agent to end the response with one
+  complete fenced envelope, or write the dropfile manually.
+- **"The previously staged envelope for this session was invalidated
+  (superseded by this refused attempt) …"** appended to a Stop refusal: an
+  earlier message of this session had staged a valid envelope and a later
+  message tried to replace it with one that was refused. The stale record
+  was removed — SessionEnd never publishes a superseded write-back. Have
+  the agent re-emit a valid envelope, or write the dropfile manually.
+- **"envelope is not a valid dropfile: Malformed dropfile at line N …"**
+  The fenced content deviates from the protocol format (the line is named
+  by number, never echoed). Nothing was staged. Fix the format or write the
+  dropfile manually.
+- **"secret-shaped content detected in the envelope — <pattern> in
+  <field> …"** The same U-C3 refusal ingest would give. Nothing was staged
+  or published; the value was not echoed. If it is a real credential,
+  rotate it; then re-emit the write-back without the value.
+- **"session_id is missing or not a safe identifier …"** The hook input did
+  not carry a filename-safe session id. Nothing was written. This should
+  not happen with a real Claude Code; if it persists, check `hooks status`
+  for drift.
+- **"… is not a real directory (symlink or non-directory); refusing to
+  touch it."** `exports/` or `exports/hook-staging/` is a symlink or a
+  file. The hook refuses to read or write through a path the workspace
+  does not really own. Replace it with a real directory and rerun the
+  session write-back (or write the dropfile manually).
+- **"… the staged record … Inspect and remove it manually: <path>"** The
+  staged record is unreadable, oversized, malformed, not valid UTF-8,
+  carries the wrong format marker, is not bound to this session, fails its
+  digest, or fails re-validation — something replaced or edited it between
+  Stop and SessionEnd. Every such refusal carries this same recovery
+  pointer. Nothing was published; the record is retained byte-for-byte so
+  you can look at it.
+  Inspect it (`cat <path>`); if the envelope inside is good, publish it
+  yourself by copying the envelope text into a
+  `.agentic-os/exports/dropfile-…-1.md` file and ingesting that; then
+  delete the staged record.
+- **"a different file already exists at the deterministic dropfile name …"**
+  Something else sits at the exact name this publication would use (same
+  session, same content digest — so it should have been the same bytes).
+  Nothing was overwritten; the staged record is retained. Inspect both
+  files, keep the right one, delete the staged record.
+- **"dropfile already published (identical bytes) …"** A duplicate/retry
+  SessionEnd found the previous publication; this is the idempotent
+  success path. Nothing to do.
+- **"WARN: published, but the staged record could not be removed …"** The
+  dropfile IS published (exit 0); only the staging cleanup failed. Remove
+  the named file manually — a leftover identical record would re-converge
+  on the next retry anyway.
+- **Stale `hook-staging/stop-*.json` records.** A session that crashed (or
+  never fired SessionEnd) leaves its staged record behind. Staged records
+  are inert — nothing reads them except that session's SessionEnd. Delete
+  them freely, or salvage the envelope inside as above.
+
+### Installer refusals (`aos hooks install/status/uninstall`)
+
+- Dry-run is the default and never writes; `--apply` asks you to type
+  `yes` and backs up the settings file first
+  (`settings.json.aos-backup-<stamp>`). Restore any apply with
+  `cp <backup> <settings>`.
+- **"Settings file … is not valid UTF-8 JSON …" / "Unsupported settings
+  structure …"** The installer refuses to touch a file it cannot fully
+  parse and re-render safely (an explicit `"hooks": null` counts: it is
+  refused like every other non-object value, consistently by install,
+  status, and uninstall). Fix the JSON (or move the file) and rerun.
+  Nothing was changed.
+- **"Settings file … changed while confirmation was pending …"** The file
+  was rewritten between the printed diff and your `yes`. The concurrent
+  edit was preserved untouched (no rewrite, no backup); re-run to plan
+  against the current contents.
+- **"Settings path … is a symlink; refusing to modify it."** Point
+  `--settings` at the real file; an atomic replace through a symlink would
+  strand the link.
+- **"Settings directory … does not exist; create it first …"** The
+  installer never `mkdir`s your settings directory (a typo would grow a
+  tree in the wrong place).
+- **`state: drifted`** in `hooks status`: AOS-owned entries exist but do
+  not match what this checkout installs (moved checkout, edited command,
+  half-removed pair). `hooks install --dry-run` shows the exact healing
+  diff; `--apply` converges to exactly one AOS-owned entry per event.
+- Uninstall removes ONLY entries whose command is exactly the
+  AOS-generated shape (`python3 <checkout>/aos_hooks.py stop|session-end`)
+  and only drops an event array its own removal emptied; your other hooks
+  are untouched — including commands that merely mention the
+  `aos_hooks.py` filename.

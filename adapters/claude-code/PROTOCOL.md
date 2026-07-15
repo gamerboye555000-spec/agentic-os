@@ -54,6 +54,39 @@ exactly this structure:
     ## open questions
     - <anything the next run must know>
 
+## Session write-back envelope (U-H1 hooks)
+
+If the AOS session hooks are installed (`python aos.py hooks status` says
+`installed`), you may skip writing the dropfile yourself: end your FINAL
+response with exactly one fenced `aos-dropfile` block whose content is
+exactly the dropfile format above, starting at `# AOS DROPFILE`:
+
+    ```aos-dropfile
+    # AOS DROPFILE
+    task: T-XXXX
+    agent: claude-code
+    outcome: success|partial|fail|unknown
+    summary: <one paragraph, what actually happened>
+
+    ## evidence
+    - kind: <note|file|commit|test|url|command_output> | ref: <ref> | claim: <claim>
+
+    ## open questions
+    - <anything the next run must know>
+    ```
+
+Rules: exactly one envelope per response (two or more refuse; both fences
+must start at column 0); the envelope must END the response — the closing
+fence is the last line (at most one final newline may follow) and an
+unterminated opening fence refuses; a new envelope in a later response
+replaces the earlier one, and a refused envelope attempt invalidates it —
+the last attempt before the session ends wins, so a superseded write-back
+is never published. The same size caps and secret refusals as dropfile
+ingest apply. On Stop the hook stages the envelope; on SessionEnd it
+publishes at most one dropfile under `.agentic-os/exports/`.
+Ingest stays manual: the human runs `python aos.py ingest dropfile <path>`
+to accept it into the ledger.
+
 ## Agent notes
 
 Claude Code reads `CLAUDE.md`, not `AGENTS.md`. Reference this protocol
