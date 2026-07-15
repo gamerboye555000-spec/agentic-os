@@ -2079,3 +2079,173 @@ Rule per gate: that phase's tests written AND the full suite green before moving
   were not touched. Live data was checked: the runtime DB had zero task rows
   with status `active` (the only task is `done`), so no data migration was
   needed or performed.
+
+## U-M1 decisions (migration kit, T-0011)
+
+Contract: `agentic-os-v0.2-u-m1-migration-contract.md`. U-M1 ships the
+migration framework and **zero production migrations**. Appended without
+rewriting prior entries.
+
+- **D-v0.2.30 — The migration kit ships before the first migration.**
+  `agentic_os/migrations.py` lands with `MIGRATIONS = ()` and
+  `LATEST_VERSION == 1`, unchanged from `db.SCHEMA_VERSION`. Why: a schema
+  change and the machinery to survive it are two different risks, and
+  landing them together means the first migration is also the first test of
+  every guarantee protecting it. U-M2 (memory v2) is blocked until U-M1
+  merges, and adds exactly one step to the registry plus the matching
+  `SCHEMA_VERSION` bump.
+
+- **D-v0.2.31 — `LATEST_VERSION` is derived, never re-declared.**
+  `LATEST_VERSION = int(db.SCHEMA_VERSION)`. A second literal would let the
+  registry and the schema drift apart — a build could then support a version
+  it cannot write, or write one it will not migrate. A guard test pins both
+  the derivation and today's values (`1`, `()`), so raising either is a
+  deliberate, visible act.
+
+- **D-v0.2.32 — The version lives in `meta.schema_version`, and U-M1 did not
+  move it.** The task brief called for a `schema_version` *table*; no such
+  table exists — the version is one TEXT row in the generic `meta` key/value
+  table, written by `ops.initialize()`. Introducing a table would itself be
+  a schema change, which is precisely what U-M1 must not do. The brief's
+  refusal cases were mapped onto the real storage (contract M1.1). The
+  reader fetches ALL matching rows rather than `LIMIT 1`, so a `meta` table
+  rebuilt without its primary key cannot smuggle an ambiguous version past
+  the check.
+
+- **D-v0.2.33 — Version parsing is canonical-strict.** A value parses only
+  if `value == str(int(value))` and is non-negative: `"1"` yes; `"01"`,
+  `" 1"`, `"+1"`, `"1.0"`, `"1_0"`, `"0x1"` no. Why: `int()` alone accepts
+  the whole second list, which turns a corrupted cell into a plausible
+  version and then migrates from the wrong place. Refusing is cheap;
+  migrating from a misread version is unrecoverable.
+
+- **D-v0.2.34 — `migrate` reads the ledger itself instead of `db.open_db()`.**
+  `open_db` refuses any version != `SCHEMA_VERSION`, so a database *pending
+  migration* — by definition at a lower version — cannot be opened through
+  it. The version gate is the door migration must walk through. The gate is
+  NOT relaxed for anyone else: `db.open_db` is untouched, every normal
+  command still refuses exactly as before, and a test pins that. This is the
+  mechanism behind "normal commands never auto-migrate": migration lives
+  behind one explicit command and nothing else calls it.
+
+- **D-v0.2.35 — `status`/`plan` read through `PRAGMA query_only=ON`, not URI
+  `mode=ro`.** Measured, not assumed (contract M1.3): a `mode=ro` open of a
+  WAL database creates `-shm`/`-wal` and **cannot remove them on close**,
+  leaving lock artifacts behind forever; a plain read-write open checkpoints
+  a dirty `-wal` on close, changing `aos.db`'s bytes. A read-write handle
+  with `query_only=ON` does neither — SQLite itself rejects writes, reads
+  still resolve through the `-wal` (no stale version), close does not
+  checkpoint, and a quiescent workspace is left exactly as found.
+  `immutable=1` was rejected outright: it would ignore the `-wal` and return
+  a stale version — the exact hazard the stale-state rules exist to prevent.
+  It remains correct in `backup.py`, where the file genuinely is immutable.
+
+- **D-v0.2.36 — The write lock is held on one connection; the snapshot is
+  sourced from a second.** `conn.backup(dest)` **hangs forever** when `conn`
+  holds its own open `BEGIN IMMEDIATE`: `backup_step` returns `SQLITE_BUSY`
+  against the connection's own write transaction and CPython retries on an
+  unbounded sleep loop. So the literal reading of "lock, then snapshot"
+  deadlocks. Instead the lock holder stays open while a second reader
+  connection sources the snapshot — under WAL a reader is not blocked, and
+  because the holder has written nothing it observes exactly the committed
+  pre-migration state. This is *stronger* than releasing the lock to
+  snapshot and re-taking it: no writer can commit between the snapshot and
+  the first step, so the snapshot is provably the pre-migration state.
+
+- **D-v0.2.37 — The pre-migration snapshot emits no `backup_create` event.**
+  Emitting one requires a commit, which would release the write lock taken
+  moments earlier and reopen the race it exists to close. `backup.py` was
+  split instead: `write_backup_pair()` (files + manifest, no event) is the
+  eventless half, and `create_backup()` is now that plus the existing event —
+  `backup create` behavior is byte-identical to baseline. The snapshot's
+  identity is recorded inside the `system/migrate` event, committed
+  atomically with the step it protects. This extends U-C2's own rule (a
+  backup never contains its own event) rather than contradicting it. A
+  migration that fails before any step commits leaves a verified snapshot
+  with no event referencing it; that is the safe outcome, and the failure
+  message names the file.
+
+- **D-v0.2.38 — `verify_backup` gained `expected_schema_version`.**
+  It previously hard-failed unless a backup's version equalled
+  `db.SCHEMA_VERSION`. The moment U-M2 ships (`SCHEMA_VERSION = "2"`), a
+  *correct* pre-migration snapshot of a v1 database would fail that check
+  and `migrate apply` would refuse to proceed — the framework would deadlock
+  on the first real migration it was built for. The snapshot is now verified
+  against the version it was actually taken at. Default `None` keeps the
+  current meaning ("can this build use this backup?") and the current
+  diagnostic string exactly, so U-C2 is unchanged. Today `current ==
+  SCHEMA_VERSION == "1"`, so this is a no-op in production and is proved by
+  direct test — it is not dead code, it is the one line that makes U-M2
+  possible.
+
+- **D-v0.2.39 — A no-op apply never opens the database read-write.** With
+  nothing pending, `apply` returns after the `query_only` pre-flight. Why:
+  "not one byte changed" should be true by construction, not by being
+  careful with a handle that could write. A test spies on `db.connect` and
+  pins exactly one (read-only) open.
+
+- **D-v0.2.40 — Rollback across committed steps is restore, never
+  automatic.** A failed step rolls back completely (its schema change,
+  version bump, and event die together) and no later step runs. If an
+  earlier step already committed, the database is reported PARTIALLY
+  ADVANCED — a real, consistent state — with the exact `backup restore`
+  command for the pre-migration snapshot. No automatic destructive rollback
+  is attempted: un-applying a committed schema change programmatically is
+  guesswork, and doing it automatically would silently bypass the snapshot
+  taken to protect the user. A corrected retry resumes from the version
+  actually committed and never replays completed steps.
+
+- **D-v0.2.41 — Migration diagnostics print an exception's class, never its
+  text.** A step body's `str(exc)` can embed SQL and row values; the
+  diagnostic carries only the failed transition, the safe migration id, the
+  exception class name, and the snapshot's relative path. Likewise the
+  `system/migrate` payload carries exactly `{from, to, migration_id,
+  snapshot}` with `snapshot` **relative** to the workspace — never an
+  absolute, user-identifying path — and still passes through
+  `events.emit`'s `secretscan.redact_tree` choke point (U-C3).
+
+- **D-v0.2.42 — A malformed version is a database value, so it is redacted
+  before it is quoted.** Found by a test, not by review: the first draft
+  echoed the raw value (`schema_version 'sk-live-…' is not an integer`),
+  which would print a secret-shaped cell straight to the terminal. Malformed
+  versions now go through `secretscan.redact_tree` and are length-bounded,
+  so a corrupted megabyte-long cell cannot become the error message either.
+
+- **D-v0.2.43 — The v1 fixture is a builder, not a committed `.db`.**
+  `tests/fixtures/v1_workspace.py` builds a real historical v1 workspace
+  through production CLI commands only — never raw INSERTs — so it cannot
+  drift from what v1 code actually writes, and it carries representative
+  rows in every table (all four task statuses, runs, packs, evidence,
+  decisions, handoffs, memory, agents, 20 events). A committed binary would
+  be unstable across sqlite versions and page layouts, would bake in
+  wall-clock timestamps from `utils.utc_now_iso()`, and would sit in the
+  tree as exactly the kind of file the packaging allowlist exists to keep
+  out of `aos.pyz`.
+
+- **D-v0.2.44 — Synthetic registries are injectable, and test-only.**
+  `plan_migrations`/`apply_migrations` accept `registry` + `latest` so tests
+  can prove v1→v2 and multi-step behavior without a production schema
+  change. Production callers pass neither, so the empty registry always
+  applies; the CLI never threads them through. Synthetic steps must never
+  become production migrations — D-v0.2.30's guard test is what enforces it.
+
+- **D-v0.2.45 — The version `UPDATE` asserts it matched exactly one row.**
+  An `UPDATE` matching zero rows succeeds silently in SQLite. A step whose
+  own body removed or duplicated the `meta.schema_version` row would then
+  commit a `system/migrate` event announcing a bump that never happened, and
+  the ledger would lie about its own shape — the one thing the version row
+  exists to prevent. The step fails and rolls back instead. Unreachable
+  today (`read_schema_version` runs immediately before, in the same
+  transaction); the assertion is what keeps it unreachable once real
+  migrations exist.
+
+- **D-v0.2.46 — One documented deviation from the one-line error rule.**
+  `cli.py`'s contract is "errors are ONE actionable line on stderr", and
+  every other `AosError` in the tree obeys it — including every other
+  migration refusal. The PARTIALLY ADVANCED message is the single exception:
+  it carries the state explanation plus a copy-pasteable `backup restore …
+  --to …` command. Folding a command the user must run at the worst possible
+  moment into a prose line would make the error that most needs clarity the
+  hardest to act on. The rule's intent (no tracebacks, no walls of text for
+  ordinary failures) holds: the message is bounded, fixed-shape, and carries
+  no SQL, row values, or secrets.
