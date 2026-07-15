@@ -1,9 +1,10 @@
 # TROUBLESHOOTING — Agentic OS
 
 Written for a tired human after a bad run. This page currently covers the
-Windows/Obsidian export (U-C4) and the Claude Code session hooks (U-H1, at
-the end); other troubleshooting lives in `RECOVERY.md`
-(backup/restore/corruption drill) until the full docs pass (U-P2) lands.
+Windows/Obsidian export (U-C4), the Claude Code session hooks (U-H1), and
+the success-proof ingest gate (U-H2, at the end); other troubleshooting
+lives in `RECOVERY.md` (backup/restore/corruption drill) until the full
+docs pass (U-P2) lands.
 
 ## Windows / Obsidian export (`sync --export-to PATH`)
 
@@ -414,3 +415,78 @@ envelope content (it could be exactly the secret the scanner refused).
   and only drops an event array its own removal emptied; your other hooks
   are untouched — including commands that merely mention the
   `aos_hooks.py` filename.
+
+## Success needs proof (U-H2 ingest gate)
+
+### The model in one paragraph
+
+A dropfile that declares `outcome: success` must carry at least one
+evidence row with a non-blank ref **in that same file**, or
+`ingest dropfile` refuses the whole file atomically — exit 1, empty
+stdout, nothing written, no dedupe marker (so a corrected file is never
+a "duplicate"). The gate checks presence and structural non-blankness
+only: it never opens, executes, or semantically verifies what an
+evidence ref points at — a wrong-but-non-blank ref still ingests, and
+`doctor`'s warn lines (below) are the audit trail, not a truth oracle.
+`partial`, `fail`, and `unknown` remain valid with no evidence.
+
+### "Refusing to ingest success dropfile for T-XXXX …"
+
+The dropfile claims `success` but its `## evidence` section carries no
+acceptable row. Nothing was ingested; the dropfile itself is untouched.
+Choose the honest fix:
+
+- **The work really succeeded:** add an evidence row to the dropfile
+  (`- kind: test | ref: <what proves it> | claim: <what it proves>`) and
+  re-run the ingest — the refusal wrote no dedupe marker, so the
+  corrected file ingests normally. Or record the proof yourself and end
+  the run directly:
+
+  ```bash
+  python aos.py evidence add T-XXXX --kind test --ref "<proof>" --claim "<what it proves>"
+  python aos.py run end R-XXXX --outcome success --summary "<one paragraph>"
+  ```
+
+  Direct `run end --outcome success` is deliberately not gated — it is
+  the human recovery path. Add the evidence **before** the task's next
+  run starts, or doctor's attribution window (below) will keep naming
+  the run.
+- **The claim was hollow:** re-ingest with the honest structured outcome
+  — `partial`, `fail`, or `unknown` — which stays valid with an empty
+  evidence section.
+
+### "Malformed dropfile at line N: evidence ref/claim must not be blank"
+
+An evidence bullet's ref (or claim) collapses to nothing once whitespace
+is normalized — NBSP and other Unicode whitespace count as blank. The
+line is named by number, never echoed. Put a real ref/claim on that line
+(or delete the row) and re-ingest. The same rule guards the CLI:
+`evidence add` refuses a blank `--ref` or a supplied-but-blank `--claim`
+(omit `--claim` entirely instead).
+
+### "[WARN] success runs without attributable evidence — N run(s): R-…"
+
+Warn-only (doctor still exits 0): these runs ended with outcome
+`success`, but no evidence row with a non-blank ref exists for the same
+task inside the run's window — from the run's start until the task's
+next run starts (evidence added after a successful end still counts
+until then; evidence created before the run, or belonging to a later
+run, never does). At most the first 10 run IDs are shown, plus the
+total. To clear a run you can still vouch for, record the proof before
+another run starts:
+
+```bash
+python aos.py evidence add T-XXXX --kind note --ref "<what proves it>" --claim "<what it proves>"
+```
+
+Once the task's next run has started, the earlier run's window is
+closed — the warning then simply stays as an honest historical record
+of a proof-less success claim. Doctor never edits the ledger.
+
+### "[WARN] evidence rows with blank refs — N row(s): E-…"
+
+Warn-only: legacy evidence rows (admitted before U-H2 closed the parser
+hole) whose ref is blank after normalization. They are named by bounded
+E-XXXX IDs only, never rewritten or deleted, and they still count for
+the `done` evidence gate exactly as before. Add a real evidence row
+beside them if the task needs a usable proof trail.

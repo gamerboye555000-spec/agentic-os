@@ -17,6 +17,13 @@ so in the output and the event payload.
 Dedupe (pinned): the ingest event payload stores the dropfile's sha256; a
 prior ingest event with the same hash refuses the ingest (exit 1).
 
+Success gate (U-H2, D-v0.2.35): a dropfile claiming outcome `success` must
+carry at least one acceptable evidence row in the same file (vocabulary
+kind, non-blank ref and claim after collapse) or the whole ingest refuses
+before its transaction opens — after size/UTF-8/parse/task/secret/duplicate
+checks, so duplicates keep precedence. `partial`/`fail`/`unknown` stay valid
+with empty evidence. Presence is enforced, never truth.
+
 Input caps (D-v0.2.6): file size, evidence rows, and open questions are
 bounded (MAX_DROPFILE_BYTES / MAX_EVIDENCE_ROWS / MAX_QUESTIONS); oversized
 input is refused whole, before any row is written.
@@ -152,9 +159,19 @@ def parse_dropfile(text: str) -> dict:
                 line_no,
                 f"evidence kind must be one of {'|'.join(EVIDENCE_KINDS)}",
             )
-        evidence.append(
-            (kind, _one_line(match.group(2)), _one_line(match.group(3)))
-        )
+        # U-H2 (D-v0.2.36): a ref or claim that collapses to nothing is a
+        # malformed evidence line — Python whitespace semantics, so NBSP and
+        # U+3000 padding count. (A whitespace-only claim is right-stripped
+        # off the line before the bullet regex and refuses above as a shape
+        # mismatch; the claim branch here guards the collapsed value in
+        # case the grammar ever changes.) The field is named, never the value.
+        ref = _one_line(match.group(2))
+        if not ref:
+            raise _malformed(line_no, "evidence ref must not be blank")
+        claim = _one_line(match.group(3))
+        if not claim:
+            raise _malformed(line_no, "evidence claim must not be blank")
+        evidence.append((kind, ref, claim))
 
     questions: list[str] = []
     while True:
@@ -207,6 +224,19 @@ def _scan_for_secrets(doc: dict) -> None:
         )
 
 
+def _has_acceptable_evidence(doc: dict) -> bool:
+    """U-H2 success gate (D-v0.2.35): at least one row in THIS dropfile
+    whose kind is in the vocabulary and whose ref and claim survive the
+    one-line collapse. parse_dropfile already guarantees every parsed row
+    satisfies all three; the gate re-judges them so it cannot silently
+    weaken if the parser's guarantees ever shift. Presence and structural
+    non-blankness only — the evidence target is never verified."""
+    return any(
+        kind in EVIDENCE_KINDS and _one_line(ref) and _one_line(claim)
+        for kind, ref, claim in doc["evidence"]
+    )
+
+
 def _refuse_duplicate(conn: sqlite3.Connection, sha: str) -> None:
     for row in conn.execute(
         "SELECT id, payload_json FROM events "
@@ -251,6 +281,19 @@ def ingest_dropfile(conn: sqlite3.Connection, path: Path) -> dict:
     task_hid = ids.render_id("task", task.id)
     _scan_for_secrets(doc)
     _refuse_duplicate(conn, sha)
+    # U-H2 success gate (D-v0.2.35): a structured success claim must carry
+    # proof IN THIS FILE — pre-existing task evidence does not count. Runs
+    # after every other check (duplicate keeps precedence for legacy files)
+    # and before the transaction, so refusal leaves zero partial state. The
+    # diagnostic names the validated task id and the recovery rule only.
+    if doc["outcome"] == "success" and not _has_acceptable_evidence(doc):
+        raise AosError(
+            f"Refusing to ingest success dropfile for {task_hid}: "
+            "outcome 'success' requires at least one evidence row with a "
+            "non-blank ref in the same dropfile. Add evidence, or use the "
+            "honest structured outcome 'partial', 'fail', or 'unknown'. "
+            "Nothing was ingested."
+        )
 
     agent = doc["agent"]
     actor = f"agent:{agent}"

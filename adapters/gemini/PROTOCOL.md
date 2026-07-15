@@ -54,6 +54,10 @@ exactly this structure:
     ## open questions
     - <anything the next run must know>
 
+A dropfile with `outcome: success` must list at least one non-blank evidence
+row; ingest refuses a success dropfile whose evidence section is empty.
+`partial`, `fail`, and `unknown` remain valid with no evidence.
+
 ## Agent notes
 
 Gemini CLI conventions churn quickly. Treat the pack file as the only

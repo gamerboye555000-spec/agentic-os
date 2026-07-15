@@ -1,3 +1,105 @@
+# DECISIONS — Agentic OS v0.2 U-H2 evidence-bearing success claims run
+
+This section continues the `D-v0.2.*` series for the U-H2 pass executed per
+`agentic-os-v0.2-u-h2-success-proof-contract.md` on branch
+`v0.2-u-h2-success-proof` (2026-07-15). Prepended per the established
+precedent (D-W0.4, reaffirmed in D-v0.2.7); everything below stays
+byte-identical.
+
+## D-v0.2 decisions (U-H2)
+
+- **D-v0.2.35 — Success-dropfile ingest gate: in-file proof, after every
+  other check, before the transaction.** A dropfile whose structured
+  `outcome` is `success` must carry at least one acceptable evidence row
+  in that same file — pre-existing task evidence never satisfies the gate.
+  Acceptable means: vocabulary kind, ref non-blank after the one-line
+  collapse (Python whitespace semantics, so NBSP/U+3000 count), and the
+  explicitly present claim non-blank after the same collapse; the target
+  of the evidence is never verified — U-H2 enforces presence and
+  structural non-blankness, not truth, and no free-text classification
+  exists anywhere (only the structured outcome field is judged). The gate
+  runs after size, UTF-8, parse, task, secret-scan, and duplicate checks
+  (a file ingested before U-H2 reaches the duplicate refusal first) and
+  before the ingest transaction opens, so refusal is trivially atomic:
+  exit 1 via `AosError`, stdout byte-empty, one bounded stderr diagnostic
+  naming only the validated task ID and the recovery rule (add evidence,
+  or use the honest `partial`/`fail`/`unknown`), zero rows and zero
+  events written, and no model-controlled value echoed. `partial`,
+  `fail`, and `unknown` remain valid with an empty evidence section; no
+  outcome is added. The U-H1/U-H2 boundary, pinned: the hooks stay
+  transport-only — a structurally valid success envelope with an EMPTY
+  evidence section still stages and publishes exactly as D-v0.2.29
+  records — and the gate refuses that file at ingest, where the ledger is
+  actually written. (A blank-ref evidence row, by contrast, is now
+  structurally malformed per the shared parser, so the hook refuses to
+  stage it — parser parity, unchanged posture, not new hook policy.)
+
+- **D-v0.2.36 — The evidence-only slice of D-v0.2.20.** U-H2 takes
+  exactly the evidence items of the approved-for-later hardening list:
+  post-collapse dropfile evidence validation (a ref or claim that
+  collapses to empty refuses as a malformed evidence line, named by line
+  number and field, never by value — with the honest grammar note that a
+  whitespace-only claim is right-stripped off the line and refuses as an
+  evidence-line shape mismatch at the same line, since strip and collapse
+  share Python's Unicode whitespace definition) and non-blank evidence
+  refs/claims at the trusted CLI write (`ops.add_evidence` refuses a
+  whitespace-only ref, and a whitespace-only explicitly supplied claim,
+  before any lookup, hashing, mutation, or event; `claim=None` stays
+  legal; file-sha256 and evidence-git behavior is unchanged for non-blank
+  values). The rest of D-v0.2.20 (priority bounds, task text, agent-name
+  grammar, run summaries) remains deferred. Legacy blank-ref rows
+  admitted through the pre-U-H2 regex hole are surfaced by a new
+  warn-only doctor line naming bounded `E-XXXX` IDs and counts only —
+  they are never rewritten or deleted, and `mark_done`/the done gate
+  still count them exactly as before.
+
+- **D-v0.2.37 — Run-bounded recovery window; `evidence.run_id` stays
+  dormant.** Doctor gains a warn-only check for ended runs with outcome
+  `success` that no acceptable evidence is attributable to. Evidence is
+  attributable to run R when: same `task_id`; ref non-blank after
+  normalization; `created_at >= R.started_at`; and, when a next run
+  exists for the task (the earliest strictly later run in the
+  `(started_at, id)` total order), `created_at` strictly earlier than
+  that next run's `started_at`. So: evidence during the run counts;
+  evidence added after a successful end still counts until the next run
+  starts (the recovery window); evidence belonging to a later run cannot
+  heal an earlier one; evidence created before the run never counts; and
+  two sequential runs sharing one second-precision `started_at` are
+  judged conservatively — the earlier run's window is empty, so
+  shared-timestamp evidence never heals it. Deliberately rejected
+  alternatives: populating `evidence.run_id` (a schema-semantics change
+  and a new write path U-H2 does not need), any schema change, and a new
+  evidence-linking CLI. The warning names run IDs only — total count plus
+  at most the first 10 (`(+N more)`) — never a ref, claim, summary, or
+  agent value, and stays warn-only (doctor exit 0 when hard checks pass).
+
+- **D-v0.2.38 — Direct run endings and `mark_done` stay untouched.**
+  `run end --outcome success` remains accepted with no evidence check and
+  no warning — CLI surface, stdout, stderr, summary semantics, and event
+  shape are byte-identical to pre-U-H2. It is the documented human
+  recovery path after a gate refusal (the human verifies, records
+  evidence via the CLI, and ends the run honestly), and doctor's
+  D-v0.2.37 window is the audit that closes the loop afterwards.
+  `mark_done` and the done-override flow (D-v0.2.5) are unchanged.
+
+- **D-v0.2.39 — Gate U-H2 result.** Focused suite
+  (`tests/test_v02_success_proof.py`) 42 green; U-H1 hook suite 91 green
+  (unchanged count); full suite 736 green (694 pre-existing, none
+  weakened or deleted); `compileall` clean; `git diff --check` clean.
+  Renderer and all four checked-in `adapters/*/PROTOCOL.md` stay
+  byte-identical; the one concise success rule lives in the SHARED
+  dropfile section (the gate judges every adapter's dropfiles), so the
+  codex/gemini/generic protocols were regenerated alongside claude-code —
+  a reported deviation from the expected file list, forced by the
+  existing all-adapters parity invariant. Four existing test pins moved,
+  each the minimal mandated edit, also reported: the U-H1 dogfood
+  scenario 5 body gained one evidence row (its identity is duplicate/
+  retry + dedupe; the old success/empty ingest-accepts assertion is
+  exactly what U-H2 forbids, and the refusal is pinned in the U-H2
+  suite), and three doctor line-count pins moved 18 → 20 under the
+  D-W8.1 "pin moves up with mandated new checks" pattern
+  (test_cli, test_weekend_views, test_v02_secret_safety).
+
 # DECISIONS — Agentic OS v0.2 U-H1 SessionEnd hook + installer run
 
 This section continues the `D-v0.2.*` series for the U-H1 pass executed per
