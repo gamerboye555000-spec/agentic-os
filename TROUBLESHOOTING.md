@@ -1,10 +1,10 @@
 # TROUBLESHOOTING — Agentic OS
 
 Written for a tired human after a bad run. This page currently covers the
-Windows/Obsidian export (U-C4), the Claude Code session hooks (U-H1), and
-the success-proof ingest gate (U-H2, at the end); other troubleshooting
-lives in `RECOVERY.md` (backup/restore/corruption drill) until the full
-docs pass (U-P2) lands.
+Windows/Obsidian export (U-C4), the Claude Code session hooks (U-H1), the
+success-proof ingest gate (U-H2), and packaging/entrypoints (U-P1, at the
+end); other troubleshooting lives in `RECOVERY.md` (backup/restore/corruption
+drill) until the full docs pass (U-P2) lands.
 
 ## Windows / Obsidian export (`sync --export-to PATH`)
 
@@ -490,3 +490,145 @@ hole) whose ref is blank after normalization. They are named by bounded
 E-XXXX IDs only, never rewritten or deleted, and they still count for
 the `done` evidence gate exactly as before. Add a real evidence row
 beside them if the task needs a usable proof trail.
+
+## Packaging and entrypoints (U-P1)
+
+### The model in one paragraph
+
+There is exactly one CLI implementation (`agentic_os.cli:main`). Three
+entrypoints reach it — `python3 aos.py`, `python3 -m agentic_os`, and
+`python3 aos.pyz` — and each is a shim that calls `main()` and exits with
+its return value. Same commands, same flags, same stdout, same stderr,
+same exit codes; `--help` is byte-identical from all three (the parser
+pins `prog="aos"`, so help text never depends on how you invoked it). The
+archive is built by `python3 tools/build_zipapp.py` (stdlib only, default
+output `dist/aos.pyz`), contains the `agentic_os` package and nothing
+else, and is a generated artifact — never committed, always rebuildable.
+If any of the three disagree about anything other than the limitation
+below, that is a bug.
+
+### "Permission denied" running ./aos.pyz
+
+The builder sets mode `0o755`, but a copy can lose it (some `cp` flags,
+FAT32/exFAT/DrvFS destinations, unzip-and-rezip round trips). Either
+restore the bit or invoke the interpreter explicitly — both are fine:
+
+```bash
+chmod +x aos.pyz && ./aos.pyz --help
+python3 aos.pyz --help          # always works, no execute bit needed
+```
+
+### "bad interpreter: /usr/bin/env: no such file or directory"
+
+The archive's shebang is `#!/usr/bin/env python3`, which needs `env` at
+`/usr/bin/env` and a `python3` on PATH. On a system with neither, run it
+through an interpreter you name yourself:
+
+```bash
+/path/to/your/python3 aos.pyz --help
+```
+
+Nothing about the archive's contents changes — the shebang is only a
+convenience for direct execution.
+
+### Python version mismatch
+
+Agentic OS needs Python 3.12+. A zipapp carries no interpreter: it runs
+under whatever `python3` resolves to. On an older interpreter you will
+see a `SyntaxError` (the code uses 3.10+ syntax) or an import error from
+`tomllib`/`sqlite3` features, not a friendly message. Check first:
+
+```bash
+python3 --version               # want 3.12 or newer
+python3.12 aos.pyz --help       # or name the interpreter explicitly
+```
+
+Building on 3.12 and running on 3.11 fails the same way — the archive is
+source, not bytecode, so the *running* interpreter is what matters.
+
+### Build refusals: stale or unsafe output paths
+
+The builder refuses to replace anything at `--output` that is not a plain
+regular file, and refuses **without touching it**:
+
+```
+build_zipapp: refusing to replace a symlink: /path/aos.pyz
+build_zipapp: refusing to replace output path (a directory): /path/aos.pyz
+build_zipapp: refusing to replace output path (a FIFO): /path/aos.pyz
+```
+
+A symlink is refused even when it points at a regular file — the builder
+inspects the path with `lstat`, so it sees the link itself and will never
+write through it into a target you did not name. Fix it by naming a
+different `--output`, or by removing the object yourself once you have
+looked at what it is. An existing *regular* `aos.pyz` is a normal
+destination and is replaced on success.
+
+`cannot create output directory …` means the parent could not be made —
+usually because a path component exists as a file, or the directory is
+read-only.
+
+### A failed build never damages what is already there
+
+The archive is staged in a temporary directory and written to a temporary
+file beside the destination; the destination is replaced only by a final
+atomic rename after a complete, successful build. So:
+
+- a failed rebuild leaves your existing `aos.pyz` byte-identical;
+- a failed first build leaves no `aos.pyz` at all — never a truncated one;
+- no `.aos-pyz-*.tmp` debris survives either way.
+
+If a build fails, the previous archive is still the one you had. Just fix
+the cause and rebuild.
+
+### Running the archive outside the repository
+
+That is the point of it — copy `aos.pyz` anywhere and run it:
+
+```bash
+cp dist/aos.pyz ~/bin/aos.pyz
+cd ~/unrelated/project
+unset PYTHONPATH
+~/bin/aos.pyz init && ~/bin/aos.pyz status && ~/bin/aos.pyz doctor
+```
+
+The archive never needs the checkout it was built from, and never needs
+the repository on `PYTHONPATH`. Workspace discovery is unchanged: pass
+`--root PATH`, or run inside a directory at or below the workspace and it
+walks up to the nearest `.agentic-os/`. "Not initialized. Run: python
+aos.py init" from the archive means exactly what it means everywhere else
+— you are not under an initialized workspace — and `aos.pyz init` fixes
+it just as `python aos.py init` would.
+
+### `hooks install` does not work from the archive
+
+Expected, and the one place the three entrypoints differ. A Claude Code
+hook must point at a stable on-disk script — `aos_hooks.py`, which ships
+beside `aos.py` in a checkout. Inside a zipapp that path would resolve to
+`<...>/aos.pyz/aos_hooks.py`, which is not a real file, and `aos_hooks.py`
+is not part of the `agentic_os` runtime package that the archive carries.
+
+Manage hooks from a source checkout:
+
+```bash
+cd /path/to/agentic-os
+python3 aos.py hooks install --apply
+```
+
+Everything else — `init`, `status`, `doctor`, `sync`, task/run/evidence
+work — behaves identically from the archive.
+
+### Rebuilding the artifact
+
+`dist/aos.pyz` is generated and gitignored; it does not update itself when
+you change the source. After pulling or editing, rebuild:
+
+```bash
+python3 tools/build_zipapp.py                    # → dist/aos.pyz
+python3 tools/build_zipapp.py --output PATH      # → anywhere you like
+```
+
+There is nothing to clean first — the rebuild replaces the destination
+atomically. If you suspect a stale copy, check what you are actually
+running (`which aos.pyz`, or the path you typed): a copy you made earlier
+somewhere else does not change when you rebuild `dist/aos.pyz`.

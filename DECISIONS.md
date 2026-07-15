@@ -1,3 +1,173 @@
+# DECISIONS — Agentic OS v0.2 U-P1 packaging run
+
+This section continues the `D-v0.2.*` series for the U-P1 pass executed per
+`agentic-os-v0.2-u-p1-packaging-contract.md` on branch `v0.2-u-p1-packaging`
+(2026-07-15). Prepended per the established precedent (D-W0.4, reaffirmed in
+D-v0.2.7); everything below stays byte-identical.
+
+## D-v0.2 decisions (U-P1)
+
+- **D-v0.2.40 — One canonical CLI, shared by every entrypoint.**
+  `agentic_os.cli.main(argv=None) -> int` is the single implementation of the
+  argparse tree, command dispatch, exit-code mapping, and exception handling.
+  All three entrypoints — `aos.py`, `agentic_os/__main__.py` (`python3 -m
+  agentic_os`), and the zipapp's archive-root `__main__.py` — are three-line
+  shims that call it and `sys.exit()` its return value. No entrypoint may
+  restate a flag, a subcommand, or a dispatch rule: a second parser would be a
+  second product, silently drifting from the first. What this pass did NOT
+  have to change is the load-bearing part: `build_parser()` already pins
+  `prog="aos"`, so usage/help text derives from the pinned prog rather than
+  `sys.argv[0]`, and `--help` is byte-identical across all three entrypoints by
+  construction — no `cli.py` change was needed, and none was made. `aos.py` was
+  already a thin shim at baseline and was likewise not modified. Verified, not
+  assumed: `python3 aos.py --help`, `python3 -m agentic_os --help`, and
+  `python3 dist/aos.pyz --help` produce identical stdout and identical exit
+  codes, and a domain error (`status` outside a workspace) exits 1 with
+  byte-empty stdout from all three.
+
+- **D-v0.2.41 — The archive entrypoint is the module entrypoint, verbatim.**
+  The builder copies `agentic_os/__main__.py` byte-for-byte to the archive root
+  as `__main__.py` rather than generating a third shim. This makes D-v0.2.40
+  mechanically true instead of a convention maintained by hand — there is no
+  third copy to drift — and a test asserts the byte-identity of both archive
+  members against the on-disk file. The cost is one constraint, documented in
+  the file itself: `agentic_os/__main__.py` must use the absolute import `from
+  agentic_os.cli import main`, never a relative `from .cli import main`, so the
+  same bytes are valid both inside the package (under `-m`) and at the archive
+  root (where there is no parent package). Corollary:
+  `zipapp.create_archive(main=...)` is deliberately NOT used — its generated
+  stub calls `fn()` and discards the return value, which would force exit code 0
+  for every command and silently break the exit-code contract (D-P0.9). The
+  shim is explicit precisely so exit codes survive.
+
+- **D-v0.2.42 — Zero runtime dependencies, stated and tested.**
+  `aos.pyz` runs on a stock Python 3.12 with nothing outside the standard
+  library. `pyproject.toml` declares `dependencies = []` (asserted by test, as
+  is the absence of optional runtime extras), `requires-python = ">=3.12"`, and
+  an `aos` console script bound to `agentic_os.cli:main` — the same canonical
+  CLI, so an installed copy cannot behave differently. The builder is itself
+  stdlib-only (`zipapp`, `pathlib`, `shutil`, `tempfile`, `os`, `stat`,
+  `argparse`, `sys`; a test asserts every top-level import is in
+  `sys.stdlib_module_names`). `setuptools` under `[build-system] requires` is a
+  build-time requirement and is not a runtime dependency; it is the only one.
+  Nothing was installed globally in this pass.
+
+- **D-v0.2.43 — The archive carries the runtime package only, by allowlist.**
+  Archive membership is exactly: `agentic_os/**/*.py` (excluding any path with
+  a `__pycache__` component) plus the root `__main__.py`. This is an allowlist
+  by construction, not a denylist of bad names. Every required exclusion —
+  `.git`, `.agentic-os`, `tests/`, `__pycache__`, `*.pyc`, ledger and backup
+  DBs, exports, local settings, credentials, `*.md` doc trees, `adapters/`,
+  `research/`, `aos_hooks.py` — follows because those are either not under the
+  package, or not `.py`, or under `__pycache__`. The reason is the failure
+  mode: a denylist is defeated by any new file whose name nobody anticipated,
+  and the thing being shipped is a file that may be copied to other machines. A
+  user's ledger, vault, backup, or credential embedded in a distributed archive
+  is not a cosmetic defect. Proven adversarially rather than by inspecting a
+  clean tree: a synthetic contaminated source tree (containing `.env`,
+  `credentials.json`, `aos.db`, a `.agentic-os/` ledger with backups, `.pyc`
+  files, `__pycache__/`, `tests/`, `.git/`, docs) builds an archive whose member
+  list is exactly the four legitimate `.py` files and whose concatenated bytes
+  contain no `sk-live-SECRET`, no `SQLite format 3`, no ledger and no backup
+  content. `[tool.setuptools] packages = ["agentic_os"]` applies the same
+  explicit-allowlist posture to the sdist/wheel path instead of auto-discovery.
+
+- **D-v0.2.44 — Output safety: `lstat`, and fail-closed refusal.**
+  The builder refuses any existing output object that is not a regular file —
+  symlink, directory, FIFO, socket, block/char device — exiting nonzero with
+  one concise diagnostic and leaving the object exactly as found. The check
+  uses `os.lstat`, never `os.stat`, and `build()` resolves only the output's
+  *parent*, never its final component: resolving the final component would
+  follow a symlink and defeat the check. A symlink is therefore refused even
+  when it points at a regular file — writing through a link into a target the
+  user did not name is the exact accident this prevents. Tested per object
+  kind, each asserting the object survives unchanged (symlink still a symlink
+  pointing at the same target, with the target's bytes intact; directory still
+  holding its contents; FIFO still a FIFO; socket still a socket). Diagnostics
+  name paths and conditions only — a test writes a secret into a refused
+  directory and asserts the one-line diagnostic contains neither the secret nor
+  a traceback. An existing *regular* file is a legal destination and is
+  replaced only on success (D-v0.2.45).
+
+- **D-v0.2.45 — Atomic replacement: the destination is never opened for
+  writing.** The archive is staged in a `TemporaryDirectory` outside the source
+  tree, written to a temp file *in the destination's parent* (same filesystem,
+  so the rename is atomic), chmod'd `0o755`, and only then `os.replace`d over
+  the destination. Because the destination is never opened for writing, a
+  failure at any earlier step cannot truncate or corrupt it — there is no
+  partial-write window to reason about. Consequences, each tested by injecting
+  a real failure into the production branch and then inspecting the filesystem
+  (not by matching error text): an existing valid archive survives a failed
+  rebuild byte-identically, with mode intact and still a valid zipapp; a failed
+  first build leaves no destination at all; a staging failure leaves the prior
+  archive intact; and the temp file is removed in a `finally`, so no
+  `.aos-pyz-*.tmp` debris survives either path. The builder does not modify the
+  source tree (tested: package `.py` mtimes are unchanged across a build) —
+  only the requested artifact and its short-lived sibling temp file.
+
+- **D-v0.2.46 — Generated artifacts are not committed.**
+  `dist/`, `build/`, `*.pyz`, and `*.egg-info/` are gitignored, and `aos.pyz`
+  is not committed. A committed binary is a second copy of the runtime that
+  goes stale silently the moment source changes, and reviewing it is not
+  possible. The archive is reproducible from source with one stdlib-only
+  command; that is the distribution story, and rebuilding is documented in
+  README and TROUBLESHOOTING.
+
+- **D-v0.2.47 — Packaging changes reach behavior, not semantics.**
+  U-P1 adds ways to *reach* the CLI and changes nothing about what it *does*:
+  database schema, CLI commands and flags, hook behavior, dropfile behavior,
+  evidence rules, backup/export behavior, doctor semantics, migration behavior,
+  and AICompany are untouched. `agentic_os/cli.py` was not modified (no
+  incompatibility required it) and `aos.py` was not modified (already a thin
+  shim). Evidence beyond the new tests: the pre-existing 736-test suite passes
+  unchanged, and the archive's `doctor` reports the same 20 checks PASS on a
+  fresh `init` as the script entrypoint does. Root resolution was verified to
+  be entrypoint-independent at baseline — `--root PATH`, else cwd-upward
+  discovery from `Path.cwd()`; it never consults `__file__` or `sys.argv[0]` —
+  which is why the archive works from any directory, outside the repository,
+  with `PYTHONPATH` cleared.
+
+- **D-v0.2.48 — Known limitation: `hooks install` is unsupported from the
+  archive; not fixed here.** `hooks.default_runner_path()` resolves the hook
+  runner as `Path(__file__).resolve().parent.parent / "aos_hooks.py"` — the
+  `aos_hooks.py` that ships beside `aos.py` in a checkout. Inside a zipapp,
+  `__file__` is a path within the archive, so that resolves to
+  `<...>/aos.pyz/aos_hooks.py`, which does not exist; there is no `--runner`
+  override flag. So `hooks install` / `hooks status` / `hooks uninstall` are
+  not supported from `aos.pyz` — manage hooks from a source checkout. Left
+  unfixed deliberately: `aos_hooks.py` is not part of the `agentic_os` runtime
+  package, so shipping it would violate D-v0.2.43; a Claude Code settings hook
+  must point at a stable on-disk script path, which a zipapp's interior path is
+  not, so shipping it would not actually help; and fixing it means changing
+  `hooks.py`, which this pass forbids absent an incompatibility blocking a
+  shared entrypoint. This blocks one command from one entrypoint — it does not
+  block the shared entrypoint. The required archive paths are unaffected:
+  `init`, `status`, and `doctor` never call `default_runner_path()` (it is
+  reached only from the hooks install/status/uninstall handlers). Documented in
+  README and TROUBLESHOOTING rather than papered over.
+
+- **D-v0.2.49 — CI and release publication remain deferred.**
+  No GitHub Actions, no release publishing, no branch-protection automation, no
+  Docker, no global installation, and no third-party runtime library was added.
+  U-P1 delivers the build and the entrypoints; publishing them is a separate
+  decision with separate consequences (registry namespace, signing, versioning
+  cadence) and is out of scope for this pass.
+
+- **D-v0.2.50 — Gate U-P1 result.** 40 focused tests green
+  (`tests/test_v02_packaging.py`), 776 green across the full suite (736
+  pre-existing, unchanged; 736 + 40 = 776). Covered: module delegation to the canonical CLI via
+  `runpy` with `main()` patched (proving both delegation and exit-code
+  propagation); module/script `--help` and error-path stdout/stderr/exit-code
+  equality; archive validity (regular file, execute bit, `#!/usr/bin/env
+  python3`, `is_zipfile`); archive `--help` outside the repository with
+  `PYTHONPATH` cleared, asserted equal to the script's, with a probe proving
+  the checkout is genuinely absent from `sys.path`; archive and module
+  `init`/`status`/`doctor` in disposable workspaces (doctor: every line
+  `[PASS]`, exit 0); shebang execution; exact archive membership; adversarial
+  exclusion from a contaminated tree; failure atomicity and destination
+  preservation; per-kind unsafe-output refusals; custom and relative output
+  paths; pyproject metadata; and `aos.py` behavior unchanged.
+
 # DECISIONS — Agentic OS v0.2 U-H2 evidence-bearing success claims run
 
 This section continues the `D-v0.2.*` series for the U-H2 pass executed per

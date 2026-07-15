@@ -19,6 +19,64 @@ not an orchestrator:
 
 Python 3.12+. Standard library only — nothing to install.
 
+**Zero runtime dependencies.** Every entrypoint below runs on a stock Python
+3.12 with nothing outside the standard library — no pip install, no virtualenv,
+no third-party package at runtime.
+
+## Running it (three equivalent entrypoints)
+
+All three run the same CLI — same commands, flags, output, and exit codes.
+There is one implementation (`agentic_os.cli:main`); each entrypoint is a
+three-line shim that calls it.
+
+```bash
+# 1. From a source checkout:
+python3 aos.py --help
+
+# 2. As a module (anywhere the agentic_os package is importable):
+python3 -m agentic_os --help
+
+# 3. As a standalone archive — one file, no checkout, no PYTHONPATH:
+python3 tools/build_zipapp.py          # builds dist/aos.pyz
+python3 dist/aos.pyz --help
+./dist/aos.pyz --help                  # executable, #!/usr/bin/env python3
+```
+
+### The standalone archive (`aos.pyz`)
+
+`tools/build_zipapp.py` builds a single-file [zipapp](https://docs.python.org/3/library/zipapp.html)
+using only the standard library. Copy `dist/aos.pyz` anywhere — another
+machine, a USB stick, `~/bin` — and it runs on its own:
+
+```bash
+python3 tools/build_zipapp.py --output ~/bin/aos.pyz
+cd ~/some/project && ~/bin/aos.pyz init && ~/bin/aos.pyz doctor
+```
+
+The archive carries the `agentic_os` runtime package and nothing else — no
+tests, no `.git`, no ledger, no vault, no backups, no exports, no credentials.
+It finds your workspace the same way every entrypoint does (`--root PATH`, or
+the nearest `.agentic-os/` walking up from the current directory), so it never
+needs the repository it was built from. It is a build artifact and is **not**
+committed; rebuild it from source whenever you need it.
+
+One limitation: `hooks install` / `hooks status` / `hooks uninstall` are not
+supported from the archive — Claude Code hooks must point at the `aos_hooks.py`
+that ships beside `aos.py` in a checkout, which is not a file inside a zipapp.
+Manage hooks from a source checkout. See TROUBLESHOOTING.md.
+
+### Installed console script
+
+`pyproject.toml` declares an `aos` console script that delegates to the same
+CLI, so an installed copy behaves identically:
+
+```bash
+aos init && aos status && aos doctor
+```
+
+Packaging metadata declares no runtime dependencies. (Installation and release
+publishing are deferred — nothing here installs itself.)
+
 ## Quickstart
 
 ```bash
@@ -380,6 +438,10 @@ documented in `TROUBLESHOOTING.md`.
 Human-facing IDs are stable and zero-padded: tasks `T-0001`, runs `R-0001`,
 decisions `D-0001`, evidence `E-0001`, handoffs `H-0001`, packs `P-0001`,
 memory `M-0001`.
+
+In the checkout itself, `python3 tools/build_zipapp.py` writes `dist/aos.pyz`.
+`dist/` and `*.pyz` are gitignored: the archive is generated from source and is
+never committed.
 
 ## Rules of the road
 
