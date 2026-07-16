@@ -2030,10 +2030,11 @@ class DoctorTest(V3WorkspaceTestCase):
         ):
             self.assertIn(name, out)
 
-    def test_doctor_check_count_is_thirty(self):
-        """(47) 25 → 30: five mandated memory-graph checks joined the set."""
+    def test_doctor_check_count_is_thirty_one(self):
+        """(47) 25 → 30 → 31: five mandated memory-graph checks joined the
+        set, then U-M5's one retrieval-benchmark registry check."""
         out = self.doctor_lines()
-        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 30)
+        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 31)
 
     def test_doctor_reports_damaged_records_by_safe_ids_only(self):
         """(47)"""

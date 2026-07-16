@@ -759,6 +759,103 @@ All five `protocol` commands are `read_only`: none opens SQLite, creates
 workspace. They work from an empty directory, and from `aos.pyz` with no
 checkout at all.
 
+## Retrieval evaluation (U-M5)
+
+U-M5 answers one question with measurements instead of opinion: do lexical,
+temporal, provenance and bounded graph signals retrieve better than what this
+system does today, without leaking anything?
+
+**It changes nothing.** `aos search`, `pack build` and pack MEMORY inclusion
+behave exactly as they did before this unit existed. `retrieval` is an
+evaluation and inspection surface; adopting a candidate is a separate human
+decision, taken after reading this report. There are no embeddings, no vector
+store, no model call and no new dependency — deciding whether any of that is
+warranted is the whole point, and shipping it here would assume the answer.
+
+```bash
+# What can be measured?
+python aos.py retrieval benchmark list
+python aos.py retrieval benchmark show core-retrieval
+
+# Measure it. Read-only: opens no database, writes no file, emits no event.
+python aos.py retrieval benchmark run core-retrieval
+python aos.py retrieval benchmark run graph-expansion --candidate all --k 5
+
+# Run the candidate retriever against YOUR workspace (read-only).
+python aos.py retrieval query "deploy window" --project demo
+python aos.py retrieval query "deploy window" --project demo --graph-depth 1
+python aos.py retrieval query "deploy window" --as-of 2026-01-01T00:00:00Z
+```
+
+### The three candidates
+
+| Candidate | What it is |
+|---|---|
+| `baseline` | The closest faithful representation of today's lexical memory retrieval: conjunctive substring matching over `key + value`, **no eligibility filter** — exactly what `aos search` does. |
+| `candidate-0` | Eligibility + latest-per-key + deterministic integer scoring over lexical, phrase, key, pin, scope, freshness and provenance signals. No graph expansion. |
+| `candidate-1` | `candidate-0` plus bounded depth-1 expansion over **active** edges. |
+
+The baseline is measured as it is, not rewritten to be easy to measure: a test
+proves it returns the same memory result set as the live `search` backend.
+
+### What retrieval refuses to return
+
+A claim is retrievable only if it is `live`, unsuperseded, unexpired at the
+requested `--as-of`, not `restricted`, hash-valid, and either global or in the
+requested project. One predicate decides, and it is strictly stricter than the
+pack builder's: U-M5 can refuse what a pack would carry, never the reverse.
+
+Graph expansion inherits every one of those rules — there is no second, weaker
+gate on the expansion path — and a neighbour needs at least one query term to
+be included at all. A well-connected claim that matches nothing is noise, and
+degree buys it nothing. Every expanded result ranks below every primary one,
+so expansion adds recall at the tail and never disturbs the head.
+
+### Explainable, not magic
+
+Every result carries its rank, its integer score, each score component, its
+match reasons, its lifecycle and provenance metadata, and — when it arrived by
+expansion — which claim and edge carried it. There are no learned weights;
+every weight is pinned in the contract. Default output prints metadata only:
+never a claim value, a source locator, provenance text, an evidence ref or a
+full hash. `--show-key` additionally prints the claim key, which is strictly
+less than `memory show` already prints for exactly these claims.
+
+### The gate is advisory
+
+`benchmark run` exits 0 only when every **candidate** passes its gate: zero
+leakage of any class, deterministic byte-identical replay, thresholds met, no
+regression against the baseline, and result/graph bounds held. Any single
+forbidden, wrong-project, restricted, lifecycle or hash-invalid result fails
+the gate regardless of how good the relevance numbers are — one is a bug, the
+other is a score.
+
+`baseline` is reported but never gated: it is what production does today, it
+cannot be "promoted", and gating it would mean exiting 1 forever the moment
+production was measured to leak. Its leakage counters are printed at full
+severity, because they are the finding.
+
+The printed recommendation (`promote candidate-1` · `promote candidate-0` ·
+`keep baseline` · `insufficient evidence`) is a deterministic function of
+those gates. **No command acts on it.**
+
+### Where the benchmark definitions live
+
+Same mechanic as the protocol spine: the embedded Python definitions in
+`agentic_os/retrieval.py` are canonical, so `aos.pyz` carries every benchmark
+with no data directory. The checked-in JSON under `retrieval_benchmarks/` is a
+deterministic byte-for-byte projection — never a second place to edit. The
+fixtures are entirely synthetic: two invented projects, invented claims, and
+deliberately planted leakage bait.
+
+```bash
+python3 tools/gen_retrieval_benchmarks.py            # verify (writes nothing)
+python3 tools/gen_retrieval_benchmarks.py --write    # regenerate
+```
+
+All four `retrieval` commands are `read_only` and permitted in recovery mode;
+none creates `power.json`. The `benchmark` leaves need no workspace at all.
+
 ## Targeting a workspace (--root)
 
 Every command accepts a global `--root PATH` placed **before** the command:

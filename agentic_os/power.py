@@ -225,6 +225,20 @@ COMMAND_POLICY: dict[tuple[str, ...], CommandPolicy] = {
     ("protocol", "validate"): _p(READ_ONLY),
     ("protocol", "digest"): _p(READ_ONLY),
     ("protocol", "verify-registry"): _p(READ_ONLY),
+    # U-M5 retrieval evaluation. Read out of the implementation, as this
+    # matrix requires — not inferred from the fact that "benchmark" sounds
+    # harmless. The three `benchmark` leaves open no connection at all: they
+    # evaluate embedded synthetic fixtures in memory, so there is nothing to
+    # write through (D-v0.3.60). `retrieval query` issues SELECT only: it
+    # rewrites no claim, hash, graph row, pack, mirror or index, and unlike
+    # `search` it does not even touch the derived FTS table or its watermark.
+    # None of the four creates power.json. All four are therefore permitted
+    # in recovery, which is the point: understanding a damaged workspace is
+    # exactly when retrieval inspection earns its keep.
+    ("retrieval", "benchmark", "list"): _p(READ_ONLY),
+    ("retrieval", "benchmark", "show"): _p(READ_ONLY),
+    ("retrieval", "benchmark", "run"): _p(READ_ONLY),
+    ("retrieval", "query"): _p(READ_ONLY),
 
     # Explicitly safe under recovery: never mutates the live ledger.
     # backup verify reads a backup copy; backup restore writes a distinct
