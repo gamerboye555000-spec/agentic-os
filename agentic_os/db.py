@@ -156,8 +156,10 @@ MEMORY_EDGES_DDL = """CREATE TABLE {table}(
 #: The v4 governed agent identity table (U-A1). The table name is
 #: parameterized for the same one reason the memory DDLs are: the 3→4
 #: migration builds the new table under a temporary name and renames it, so a
-#: MIGRATED table is created from this same DDL as a freshly initialized one
-#: and the two cannot drift (the D-v0.3.43 rule, applied a third time).
+#: MIGRATED table and a freshly initialized one are built from this same DDL
+#: and their schemas are structurally identical (the D-v0.3.43 rule, applied
+#: a third time) — not byte-identical, since SQLite's ALTER TABLE RENAME may
+#: add identifier quoting the original CREATE TABLE lacked.
 #:
 #: The five v3 columns (kind, invoke_hint, capabilities_json, trust_level,
 #: notes) survive as INERT legacy history: they lose their NOT NULL/DEFAULT

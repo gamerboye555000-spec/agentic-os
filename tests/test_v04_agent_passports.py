@@ -432,7 +432,7 @@ class MigrationTests(V3FixtureTestCase):
             1,
         )
 
-    def test_damaged_legacy_row_refuses_by_id_and_rolls_back(self):
+    def test_damaged_legacy_row_refuses_safely_and_rolls_back(self):
         self.execute(
             "UPDATE agents SET notes = CAST(x'deadbeef' AS BLOB) WHERE id = 2"
         )

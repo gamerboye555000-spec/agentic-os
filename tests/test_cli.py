@@ -827,7 +827,7 @@ class TestDoctor(CliTestCase):
         # (R-0001's evidence is attributable and no ref is blank). The
         # power line is [PASS] "standard (default)": this fixture never
         # writes power.json, and reading it must not create it.
-        # 21 → 25 → 30 → 31: U-M2's four mandated memory-claim checks joined
+        # 21 → 25 → 30 → 34: U-M2's four mandated memory-claim checks joined
         # the set, then U-M3's five memory-graph checks, then U-M5's
         # retrieval benchmark registry check.
         self.assertEqual(len(lines), 34)
