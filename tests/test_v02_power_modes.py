@@ -705,8 +705,17 @@ class RecoveryTests(PowerCase):
          ("memory", "source", "link", "M-0001", "MS-0001", "--relation", "supports")),
         (("memory", "edge", "add"),
          ("memory", "edge", "add", "M-0001", "M-0002", "--relation", "related")),
-        (("agent", "add"), ("agent", "add", "newbot")),
-        (("agent", "update"), ("agent", "update", "newbot", "--notes", "n")),
+        # U-A1 governed agent writes: identity/passport rows + their hashes
+        # + an event in one transaction each.
+        (("agent", "create"), ("agent", "create", "newbot")),
+        (("agent", "import"), ("agent", "import", "nonexistent.json")),
+        (("agent", "passport", "publish"),
+         ("agent", "passport", "publish", "newbot")),
+        (("agent", "suspend"), ("agent", "suspend", "newbot")),
+        (("agent", "archive"), ("agent", "archive", "newbot")),
+        (("agent", "restore"), ("agent", "restore", "newbot")),
+        (("agent", "revoke"), ("agent", "revoke", "newbot")),
+        (("agent", "discard"), ("agent", "discard", "newbot")),
         (("ingest", "dropfile"), ("ingest", "dropfile", "SELF")),
         (("done",), ("done", "T-0002", "--no-evidence", "--reason", "because")),
         (("pack", "build"), ("pack", "build", "T-0002")),
@@ -939,14 +948,14 @@ class DoctorIntegrationTests(PowerCase):
         self.assertNotIn('{"version"', line)
         self.assertNotIn(str(self.aos_dir), line)
 
-    def test_doctor_check_count_is_thirty_one(self):
+    def test_doctor_check_count_is_thirty_four(self):
         """(25) 20 → 21 → 25 → 30 → 31: the mandated power check joined the
         set at U-E2, then U-M2's four memory-claim checks, then U-M3's five
         memory-graph checks, then U-M5's one retrieval-benchmark registry
         check (the D-W8.1 pattern — the pin moves UP with a mandated new
         check)."""
         out = self.aos("doctor")
-        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 31)
+        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 34)
 
     def test_doctor_still_passes_cleanly_on_the_baseline_fixture(self):
         """(25) The new checks do not disturb the ones already there."""
@@ -1337,7 +1346,7 @@ class ExclusionTests(PowerCase):
         """(25) U-E2 changed no schema, and must not. U-M2 owns the version:
         this pins that power modes follow it rather than declaring their own.
         """
-        self.assertEqual(db.SCHEMA_VERSION, "3")
+        self.assertEqual(db.SCHEMA_VERSION, "4")
         self.assertEqual(migrations.LATEST_VERSION, int(db.SCHEMA_VERSION))
 
     def test_power_state_lives_beside_the_ledger_not_inside_it(self):

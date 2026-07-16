@@ -43,6 +43,15 @@ and one WARN-ONLY fact — restricted claim text found in a generated pack or
 mirror note, which a `pack build` predating the classification reaches
 honestly. Same rule again: ids, reason codes, generated file names and counts.
 Never a key, value, locator, provenance, evidence ref, or a hash.
+
+U-A1 rewrites check 13 for the governed v4 identity shape and adds three
+agent-registry lines (checks 32-34): identity hashes verify, passport
+history intact (both FAIL — and both feed the recovery gate, so a tampered
+registry blocks leaving recovery), plus one WARN-ONLY fact — active agents
+with no published passport, which every migrated legacy agent honestly is.
+The secret sweep extends over stored passport documents. Same rule as every
+line above: name-or-`agent #id`, `v<N>`, closed verdicts and counts only.
+Never a role, mission, note, document excerpt, or a hash value.
 """
 
 from __future__ import annotations
@@ -55,12 +64,19 @@ from pathlib import Path
 
 from . import db, ids, models, obsidian, ops, power, secretscan, utils
 from .models import (
+    AGENT_CLASSES,
     AGENT_KINDS,
+    AGENT_LIFECYCLES,
     AGENT_NAME_RE,
+    AGENT_ORIGINS,
+    AGENT_OWNERS,
+    AGENT_SCOPES,
+    MAX_AGENT_NAME_CHARS,
     MEMORY_SENSITIVITY_RESTRICTED,
     MEMORY_STATUS_RETIRED,
     MEMORY_STATUSES,
     TASK_STATUSES,
+    Agent,
     MemoryItem,
 )
 from .utils import AosError
@@ -290,6 +306,27 @@ def _secret_sweep_findings(conn: sqlite3.Connection) -> list[str]:
                 ("notes", row["notes"]),
                 ("capabilities", capabilities),
             ],
+        )
+    # U-A1 passport documents: every string leaf, under safe keys — role,
+    # mission and limitations are exactly the prose an operator pastes a
+    # credential into. Identified by agent row id + version, never by name.
+    for row in conn.execute(
+        "SELECT agent_id, version, document FROM agent_passports "
+        "ORDER BY agent_id, version"
+    ).fetchall():
+        document = row["document"]
+        if not isinstance(document, str):
+            continue  # check 33 reports the damaged document
+        try:
+            payload = json.loads(document)
+        except ValueError:
+            continue  # check 33 reports the malformed document
+        note(
+            f"agent #{row['agent_id']} passport v{row['version']}",
+            (
+                (_safe_payload_key(field), value)
+                for field, value in _iter_payload_strings(payload)
+            ),
         )
     for row in conn.execute(
         "SELECT id, actor, payload_json FROM events ORDER BY id"
@@ -566,27 +603,62 @@ def run_checks(conn: sqlite3.Connection, aos_dir: Path) -> list[Check]:
         )
     )
 
-    # 13. Agent registry rows are well-formed (name charset, kind
-    #     vocabulary, capabilities_json a JSON array).
+    # 13. Agent identity rows are well-formed (U-A1: the v4 governed shape —
+    #     vocabularies, scope↔project consistency, resolvable project — plus
+    #     the v3 legacy-history rules this check has always enforced: name
+    #     charset, kind vocabulary when a kind is carried, capabilities_json
+    #     a JSON array when carried). Historical violations are REPORTED,
+    #     never rewritten.
     bad_agents = []
-    for row in conn.execute(
-        "SELECT name, kind, capabilities_json FROM agents ORDER BY name"
-    ).fetchall():
+    project_ids = {
+        r["id"] for r in conn.execute("SELECT id FROM projects").fetchall()
+    }
+    for row in conn.execute("SELECT * FROM agents ORDER BY id").fetchall():
         problems = []
         name = row["name"] or ""
-        if not AGENT_NAME_RE.match(name):
+        valid_name = isinstance(name, str) and bool(AGENT_NAME_RE.match(name))
+        # The identifier doctor echoes: the name when it is well-formed and
+        # not secret-shaped, the row id otherwise (a name is itself a
+        # scanned field and must never ride out as another finding's label).
+        label = (
+            name
+            if valid_name and not secretscan.scan_secrets(name)
+            else f"agent #{row['id']}"
+        )
+        if not valid_name:
             problems.append("invalid name")
-        if row["kind"] not in AGENT_KINDS:
-            problems.append(f"unknown kind {row['kind']!r}")
+        elif row["origin"] != "legacy" and len(name) > MAX_AGENT_NAME_CHARS:
+            # Legacy names are carried verbatim whatever their length; only
+            # the governed populations own the new-name bound.
+            problems.append("name exceeds the new-name bound")
+        if row["agent_class"] not in AGENT_CLASSES:
+            problems.append("unknown agent class")
+        if row["scope"] not in AGENT_SCOPES:
+            problems.append("unknown scope")
+        if row["lifecycle"] not in AGENT_LIFECYCLES:
+            problems.append("unknown lifecycle")
+        if row["owner"] not in AGENT_OWNERS:
+            problems.append("unknown owner")
+        if row["origin"] not in AGENT_ORIGINS:
+            problems.append("unknown origin")
+        if row["scope"] == "project":
+            if row["project_id"] is None:
+                problems.append("project scope without a project")
+            elif row["project_id"] not in project_ids:
+                problems.append("project does not resolve")
+        elif row["project_id"] is not None:
+            problems.append("global scope with a project")
+        if row["kind"] is not None and row["kind"] not in AGENT_KINDS:
+            problems.append("unknown kind")
         if row["capabilities_json"] is not None:
             try:
                 value = json.loads(row["capabilities_json"])
                 if not isinstance(value, list):
                     problems.append("capabilities_json is not a JSON array")
-            except ValueError:
+            except (TypeError, ValueError):
                 problems.append("capabilities_json does not parse")
         if problems:
-            bad_agents.append(f"{name or '(unnamed)'}: " + ", ".join(problems))
+            bad_agents.append(f"{label}: " + ", ".join(problems))
     checks.append(
         Check(
             "agent registry rows are well-formed",
@@ -798,8 +870,117 @@ def run_checks(conn: sqlite3.Connection, aos_dir: Path) -> list[Check]:
     checks.extend(_memory_claim_checks(conn))
     checks.extend(_memory_graph_checks(conn, aos_dir, aos_root))
     checks.append(_retrieval_benchmark_check())
+    checks.extend(_agent_registry_checks(conn))
 
     return checks
+
+
+# ---------------------------------------------------------------------------
+# U-A1 governed agent registry integrity (checks 32-34)
+
+def _agent_doctor_label(row) -> str:
+    """The identifier doctor echoes for an agent: the name when well-formed
+    and not secret-shaped, `agent #id` otherwise."""
+    name = row["name"]
+    if (
+        isinstance(name, str)
+        and AGENT_NAME_RE.match(name)
+        and not secretscan.scan_secrets(name)
+    ):
+        return name
+    return f"agent #{row['id']}"
+
+
+def _agent_registry_checks(conn: sqlite3.Connection) -> list[Check]:
+    """Three single-purpose checks over the governed agent registry.
+
+    Every diagnostic is a name-or-`agent #id`, a `v<N>`, a verdict from the
+    closed vocabulary, or a count. Never a role, mission, document excerpt,
+    legacy note, or a hash value.
+    """
+    from . import passports
+
+    identity_problems: list[str] = []
+    history_problems: list[str] = []
+    uncovered: list[str] = []
+
+    for row in conn.execute("SELECT * FROM agents ORDER BY id").fetchall():
+        label = _agent_doctor_label(row)
+        try:
+            agent = Agent.from_row(row)
+        except (TypeError, KeyError):
+            identity_problems.append(f"{label}: unreadable row")
+            continue
+
+        # 32. Identity hash.
+        state = passports.agent_integrity(agent)
+        if state != "ok":
+            identity_problems.append(
+                f"{label}: "
+                + {
+                    "malformed": "malformed content hash",
+                    "mismatch": "content hash does not match the identity",
+                    "unhashable": "identity fields cannot be hashed",
+                }[state]
+            )
+
+        # 33. Passport history (contiguity, row hashes, document validity and
+        #     row↔document consistency, draft shape, pointer resolution) —
+        #     the same shared verdicts the no-laundering gate refuses on.
+        for problem in passports.history_problems(conn, agent):
+            history_problems.append(f"{label}: {problem}")
+
+        # 34 (WARN). Governed coverage: a live identity nothing has declared
+        #     for yet. History happening is not an error (D-v0.3.44).
+        if (
+            agent.lifecycle == "active"
+            and agent.current_passport_version is None
+        ):
+            uncovered.append(label)
+
+    # Orphaned passports cannot exist while the FK stands; this finds the
+    # ones that got in if it was ever bypassed.
+    for row in conn.execute(
+        "SELECT p.id, p.agent_id FROM agent_passports p "
+        "LEFT JOIN agents a ON a.id = p.agent_id "
+        "WHERE a.id IS NULL ORDER BY p.id"
+    ).fetchall():
+        history_problems.append(
+            f"agent #{row['agent_id']}: passport without an identity row"
+        )
+
+    return [
+        # 32 (FAIL). Identity hashes verify.
+        Check(
+            "agent identity hashes verify",
+            not identity_problems,
+            "; ".join(identity_problems[:UH2_DISPLAY_LIMIT])
+            + (
+                f" (+{len(identity_problems) - UH2_DISPLAY_LIMIT} more)"
+                if len(identity_problems) > UH2_DISPLAY_LIMIT
+                else ""
+            ),
+        ),
+        # 33 (FAIL). Passport history intact.
+        Check(
+            "agent passport history intact",
+            not history_problems,
+            "; ".join(history_problems[:UH2_DISPLAY_LIMIT])
+            + (
+                f" (+{len(history_problems) - UH2_DISPLAY_LIMIT} more)"
+                if len(history_problems) > UH2_DISPLAY_LIMIT
+                else ""
+            ),
+        ),
+        # 34 (WARN, never fatal). Active agents with no published passport —
+        #     every migrated legacy agent starts here, honestly.
+        Check(
+            "active agents without a published passport",
+            not uncovered,
+            _bounded_ids(uncovered, "agent"),
+            warn_only=True,
+        ),
+    ]
 
 
 def _retrieval_benchmark_check() -> Check:

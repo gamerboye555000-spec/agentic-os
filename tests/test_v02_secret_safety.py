@@ -602,53 +602,47 @@ class TestTrustedWritesWarnAndSucceed(WarnCase):
         self.assertEqual(payload["scope"], "global")
         self.assertEqual(payload["confidence"], "confirmed")
 
-    def test_agent_registry_fields_warn(self):
+    def test_agent_passport_fields_warn(self):
+        # U-A1: role and mission are the passport's free-text fields — the
+        # warn-on-write boundary covers them exactly as it covered the
+        # retired notes/capabilities.
         out, err = self.aos_warned(
-            "agent", "add", "codex", "--notes", f"notes {FAKE_ASSIGNMENT}",
-            "--capability", f"cap {FAKE_SK}", "--capability", "review docs",
+            "agent", "create", "codex",
+            "--role", f"role {FAKE_ASSIGNMENT}",
+            "--mission", f"mission {FAKE_SK}",
         )
         self.assertIn("Added agent codex", out)
         self.assert_warning(
-            err, "agent", ["notes", "capabilities"],
+            err, "agent", ["role", "mission"],
             ["sk-api-key", "credential-assignment"],
         )
-        payload = self.latest_payload("agent", "add")
+        payload = self.latest_payload("agent", "create")
         self.assert_metadata(
             payload,
-            ["notes", "capabilities"], ["sk-api-key", "credential-assignment"],
+            ["role", "mission"], ["sk-api-key", "credential-assignment"],
         )
-        # Nested list redaction: the matched element is replaced in place,
-        # its benign sibling survives.
-        self.assert_equal_withheld(
-            payload["capabilities"], [REDACTED, "review docs"], "capabilities"
-        )
-        out, err = self.aos_warned(
-            "agent", "update", "codex", "--notes", f"new {FAKE_ASSIGNMENT}"
-        )
-        self.assert_warning(err, "agent", ["notes"], ["credential-assignment"])
-        payload = self.latest_payload("agent", "update")
-        self.assert_metadata(payload, ["notes"], ["credential-assignment"])
-        self.assertEqual(payload["agent"], "codex")
+        # The canonical passport document keeps the accepted text; the
+        # event carries only the safe metadata and closed enums.
+        self.assertNotIn("role", payload)
+        self.assertNotIn("mission", payload)
 
     def test_token_shaped_agent_name_warns(self):
-        out, err = self.aos_warned("agent", "add", FAKE_GHP)
+        out, err = self.aos_warned("agent", "create", FAKE_GHP)
         self.assert_warning(err, "agent", ["name"], ["github-token"])
-        payload = self.latest_payload("agent", "add")
+        payload = self.latest_payload("agent", "create")
         self.assert_metadata(payload, ["name"], ["github-token"])
         self.assert_redacted(payload, "agent")
 
-    def test_agent_update_never_copies_a_secret_shaped_name_forward(self):
+    def test_publish_never_copies_a_secret_shaped_name_forward(self):
         # A secret-shaped identifier accepted by an earlier warned write
         # must not resurface in a later event payload (D-v0.2.21).
-        self.aos_warned("agent", "add", FAKE_GHP)
-        out, err = self.aos_warned(
-            "agent", "update", FAKE_GHP, "--notes", "perfectly benign note"
-        )
+        self.aos_warned("agent", "create", FAKE_GHP)
+        out, err = self.aos_warned("agent", "passport", "publish", FAKE_GHP)
         self.assert_warning(err, "agent", ["name"], ["github-token"])
-        payload = self.latest_payload("agent", "update")
+        payload = self.latest_payload("agent", "publish")
         self.assert_metadata(payload, ["name"], ["github-token"])
         self.assert_redacted(payload, "agent")
-        self.assertEqual(payload["changed"], ["notes"])
+        self.assertEqual(payload["to_lifecycle"], "active")
 
     def test_done_override_reason_warns_and_marks_the_override_event(self):
         events_before = len(self.event_rows())
@@ -929,11 +923,12 @@ class TestDoctorSecretSweep(WarnCase):
         self.assertTrue(self.sweep_line(out).startswith("[PASS]"))
         # 18 → 20 → 21 → 25 → 30 → 31: the two U-H2 warn-only checks, the
         # U-E2 runtime power state check, U-M2's four memory-claim checks,
-        # U-M3's five memory-graph checks, then U-M5's retrieval benchmark
-        # registry check joined the mandated set (D-W8.1 pattern — the pin
-        # moves UP with mandated new checks).
+        # U-M3's five memory-graph checks, U-M5's retrieval benchmark
+        # registry check, then U-A1's three agent-registry checks joined the
+        # mandated set (D-W8.1 pattern — the pin moves UP with mandated new
+        # checks).
         self.assertEqual(
-            len([l for l in out.strip().splitlines() if l]), 31
+            len([l for l in out.strip().splitlines() if l]), 34
         )
 
     def test_domain_row_finding_names_id_field_pattern_only(self):
@@ -1155,7 +1150,7 @@ class TestDoctorSecretSweep(WarnCase):
         # The name field is itself scanned, so agents (and projects) are
         # identified by row id — a token-shaped name must not leak through
         # the identifier of its own finding.
-        self.aos_warned("agent", "add", FAKE_GHP)
+        self.aos_warned("agent", "create", FAKE_GHP)
         out = self.doctor_ok()
         line = self.sweep_line(out)
         self.assertTrue(line.startswith("[WARN]"))

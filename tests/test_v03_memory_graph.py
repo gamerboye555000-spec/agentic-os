@@ -98,10 +98,13 @@ class V2FixtureTestCase(unittest.TestCase):
             )
         ]
 
-    def migrate(self) -> None:
-        code, _, err = self.aos("migrate", "apply")
+    def migrate(self, target: str = "3") -> None:
+        # Default target 3: this suite's migration proofs are about the
+        # 2→3 step, and U-A1 added a 3→4 step after them. Tests that need
+        # a CURRENT database (doctor, parity) pass "4".
+        code, _, err = self.aos("migrate", "apply", "--target", target)
         self.assertEqual(code, 0, err)
-        self.assertEqual(self.version(), "3")
+        self.assertEqual(self.version(), target)
 
 
 class V3WorkspaceTestCase(unittest.TestCase):
@@ -244,12 +247,12 @@ class V3WorkspaceTestCase(unittest.TestCase):
 # (1)(2) Schema version 3 and the production registry
 
 class SchemaVersionTest(V3WorkspaceTestCase):
-    def test_fresh_init_creates_schema_version_three(self):
-        """(1)"""
-        self.assertEqual(db.SCHEMA_VERSION, "3")
+    def test_fresh_init_creates_the_current_schema_version(self):
+        """(1) — the literal moved 3 → 4 at U-A1, mechanically."""
+        self.assertEqual(db.SCHEMA_VERSION, "4")
         self.assertEqual(
             self.query("SELECT value FROM meta WHERE key='schema_version'")[0][0],
-            "3",
+            "4",
         )
 
     def test_fresh_init_creates_the_three_graph_tables(self):
@@ -262,7 +265,7 @@ class SchemaVersionTest(V3WorkspaceTestCase):
             {"memory_sources", "memory_source_links", "memory_edges"}, names
         )
 
-    def test_production_registry_is_exactly_the_two_steps_in_order(self):
+    def test_production_registry_is_exactly_the_steps_in_order(self):
         """(2)"""
         self.assertEqual(
             [
@@ -272,6 +275,7 @@ class SchemaVersionTest(V3WorkspaceTestCase):
             [
                 (1, 2, "u-m2-memory-claims-v2"),
                 (2, 3, "u-m3-memory-graph-v3"),
+                (3, 4, "u-a1-agent-passports-v4"),
             ],
         )
         migrations.validate_registry()
@@ -279,12 +283,12 @@ class SchemaVersionTest(V3WorkspaceTestCase):
     def test_latest_version_is_derived_from_the_one_schema_declaration(self):
         """(2) A bump that lands in only one of two places fails here."""
         self.assertEqual(migrations.LATEST_VERSION, int(db.SCHEMA_VERSION))
-        self.assertEqual(migrations.LATEST_VERSION, 3)
+        self.assertEqual(migrations.LATEST_VERSION, 4)
 
-    def test_no_version_four_transition_exists(self):
+    def test_no_version_five_transition_exists(self):
         """(2)"""
         self.assertEqual(
-            [m.to_version for m in migrations.MIGRATIONS if m.to_version > 3], []
+            [m.to_version for m in migrations.MIGRATIONS if m.to_version > 4], []
         )
 
     def test_fresh_v3_memory_table_carries_sensitivity(self):
@@ -301,15 +305,19 @@ class SchemaVersionTest(V3WorkspaceTestCase):
 # (3)(4)(5) Status, plan and the pre-mutation snapshot
 
 class StatusAndPlanTest(V2FixtureTestCase):
-    def test_v2_fixture_reports_exactly_one_pending_migration(self):
+    def test_v2_fixture_reports_exactly_the_pending_migrations(self):
         """(3)"""
         report = migrations.status(self.db_path)
         self.assertEqual(report["current_version"], 2)
-        self.assertEqual(report["latest_version"], 3)
+        self.assertEqual(report["latest_version"], 4)
         self.assertTrue(report["pending"])
         self.assertEqual(
             report["plan"],
-            [{"from": 2, "to": 3, "migration_id": "u-m3-memory-graph-v3"}],
+            [
+                {"from": 2, "to": 3, "migration_id": "u-m3-memory-graph-v3"},
+                {"from": 3, "to": 4,
+                 "migration_id": "u-a1-agent-passports-v4"},
+            ],
         )
 
     def test_plan_shows_exactly_two_to_three_and_writes_nothing(self):
@@ -330,7 +338,7 @@ class StatusAndPlanTest(V2FixtureTestCase):
         code, out, err = self.aos("migrate", "status")
         self.assertEqual(code, 0, err)
         self.assertIn("schema version:  2", out)
-        self.assertIn("build supports:  3", out)
+        self.assertIn("build supports:  4", out)
         self.assertIn("pending:         yes", out)
 
     def test_apply_verifies_a_v2_snapshot_before_it_mutates(self):
@@ -499,7 +507,7 @@ class MigrationPreservationTest(V2FixtureTestCase):
         self.migrate()
         rows = self.query("SELECT value FROM meta WHERE key='schema_version'")
         self.assertEqual([tuple(r) for r in rows], [("3",)])
-        code, out, _ = self.aos("migrate", "apply")
+        code, out, _ = self.aos("migrate", "apply", "--target", "3")
         self.assertEqual(code, 0)
         self.assertIn("No migrations pending", out)
         self.assertEqual(len(self.migrate_events()), 1)
@@ -700,8 +708,9 @@ class MigrationFailureTest(V2FixtureTestCase):
         """(15)"""
         self._apply_failing()
         self.assertEqual(self.version(), "2")
-        self.migrate()  # the real step, unpatched
-        self.assertEqual(len(self.migrate_events()), 1)
+        self.migrate(target="4")  # the real steps, unpatched
+        ids = [e["migration_id"] for e in self.migrate_events()]
+        self.assertEqual(ids.count("u-m3-memory-graph-v3"), 1)
         self.assertEqual(
             self.query("SELECT COUNT(*) AS n FROM memory")[0]["n"], 6
         )
@@ -2030,11 +2039,11 @@ class DoctorTest(V3WorkspaceTestCase):
         ):
             self.assertIn(name, out)
 
-    def test_doctor_check_count_is_thirty_one(self):
+    def test_doctor_check_count_is_thirty_four(self):
         """(47) 25 → 30 → 31: five mandated memory-graph checks joined the
         set, then U-M5's one retrieval-benchmark registry check."""
         out = self.doctor_lines()
-        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 31)
+        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 34)
 
     def test_doctor_reports_damaged_records_by_safe_ids_only(self):
         """(47)"""
@@ -2618,7 +2627,7 @@ class EntrypointParityTest(V2FixtureTestCase):
     def test_parity_on_the_read_only_graph_commands(self):
         """(54) Reads are naturally repeatable, so all three run against the
         same workspace and must agree byte for byte."""
-        self.migrate()
+        self.migrate(target="4")
         self.aos("memory", "classify", "M-0001", "confidential")
         self.aos(
             "memory", "source", "add", "--kind", "url", "--locator", "https://a.test"
@@ -2680,7 +2689,7 @@ class EntrypointParityTest(V2FixtureTestCase):
 
     def test_parity_on_doctor_after_migration(self):
         """(54)"""
-        self.migrate()
+        self.migrate(target="4")
         self._assert_parity(["doctor"], self.root)
 
     def test_zipapp_contains_implementation_but_no_data(self):

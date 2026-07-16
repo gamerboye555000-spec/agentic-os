@@ -235,21 +235,53 @@ printed backup: `cp <backup> <settings>`. Compatibility is capability-based:
 the hooks need a Claude Code that provides Stop/SessionEnd command hooks
 with JSON on stdin and `last_assistant_message` in the Stop input.
 
-## Agent registry
+## Governed agent registry (U-A1)
 
-Records only — Agentic OS never executes agents.
+Records and declarations only — Agentic OS never executes, routes, schedules
+or authorizes agents. An agent is a governed IDENTITY row plus an immutable
+history of **passports**: versioned `beast.agent-passport/v1` declarations
+(role, mission, capabilities, requirements, limits) stored as canonical
+protocol artifacts and bound by the same record-hash discipline as memory.
 
 ```bash
-python aos.py agent add codex --kind cloud --notes "cloud runner" \
-    --capability code --capability review
-python aos.py agent update codex --notes "new notes" --capability docs
+# Create a DRAFT identity with a draft v1 passport, then publish it:
+python aos.py agent create codex --class specialist \
+    --role "coding agent" --mission "ship the work"
+python aos.py agent passport publish codex          # draft → active, v1 frozen
+
+# Inspect, export, evolve:
 python aos.py agent list --json
 python aos.py agent show codex --json
+python aos.py agent export codex > codex.json       # stored canonical bytes
+python aos.py agent passport publish codex --file codex-v2.json   # version 2
+python aos.py agent passport history codex
+
+# Exchange between workspaces (the file is inert — nothing it names is
+# opened, fetched, resolved or executed):
+python aos.py agent import codex.json
+
+# Lifecycle (published passports are immutable; `revoke` is terminal):
+python aos.py agent suspend codex && python aos.py agent restore codex
+python aos.py agent archive codex
+python aos.py agent revoke codex
+python aos.py agent discard scratch   # never-published, never-referenced drafts only
 ```
 
-Registered agents get generated `AOS/Agents/<name>.md` notes on sync. There
-is deliberately no `--trust-level` flag anywhere: autonomy is earned through
-the ladder, never set by hand.
+Everything a passport declares is inert stored text: `autonomy`, skill/tool
+requirements and provider compatibility grant nothing and are consumed by no
+code path in this unit. Credential-shaped fields are structurally
+unrepresentable in the schema. Every authoritative agent write first verifies
+the identity hash and the whole passport history — a tampered record cannot
+receive a new version on top (doctor checks 32–33 report it; recovery mode
+is the exit).
+
+The ungoverned v3 verbs (`agent add`, `agent update`) are retired. Migrated
+v3 agents survive with `origin=legacy` and their old fields (`kind`, `notes`,
+`capabilities`, `trust_level`, `invoke_hint`) carried verbatim as permanently
+inert history — no passport is fabricated for them; publish one when you are
+ready to govern them. Registered agents get generated `AOS/Agents/<name>.md`
+notes on sync. There is deliberately no `--trust-level` flag anywhere:
+autonomy is earned through the ladder, never set by hand.
 
 ## Weekend commands
 
@@ -513,10 +545,11 @@ reports damage by id and reason code, never by echoing what it found.
 
 ## Schema migrations (U-M1)
 
-**Schema version 3 is current.** A workspace created by this build starts at
-3 and never migrates. An older workspace has one or two migrations pending —
-`u-m2-memory-claims-v2` (memory claims) and `u-m3-memory-graph-v3` (the memory
-graph) — the production migrations the U-M1 machinery carries.
+**Schema version 4 is current.** A workspace created by this build starts at
+4 and never migrates. An older workspace has up to three migrations pending —
+`u-m2-memory-claims-v2` (memory claims), `u-m3-memory-graph-v3` (the memory
+graph) and `u-a1-agent-passports-v4` (the governed agent registry) — the
+production migrations the U-M1 machinery carries.
 
 ```bash
 # Where am I, what does this build support, is anything pending?
@@ -524,7 +557,7 @@ python aos.py migrate status
 
 # What exactly would run, in order? (read-only; writes nothing)
 python aos.py migrate plan
-#   2 → 3  u-m3-memory-graph-v3
+#   3 → 4  u-a1-agent-passports-v4
 
 # Run it. Snapshots and verifies the database first.
 python aos.py migrate apply
@@ -543,6 +576,16 @@ The three graph tables arrive **empty** — a v2 claim has no recorded
 provenance, and inventing one from its `source` field or its evidence would be
 a guess wearing a fact's clothes. Nothing is inferred from your text here
 either.
+
+The 3 → 4 migration rebuilds `agents` as the governed identity table. Every
+v3 row survives with the same id and name and its old fields (`kind`,
+`invoke_hint`, `capabilities_json`, `trust_level`, `notes`) carried verbatim
+as permanently inert history; the new facts are constants (`origin=legacy`,
+`lifecycle=active`, class `custom`, global scope) plus one clock reading.
+`agent_passports` arrives **empty** — no passport is synthesized from
+`capabilities_json` or `trust_level`, because interpreting untrusted legacy
+text as a governed declaration would be the same guess in different clothes.
+Legacy `trust_level` never gains behavior.
 
 `status` and `plan` are read-only *byte-for-byte*: they open the database
 through a connection SQLite itself refuses writes on, and leave no `-wal`,
@@ -692,13 +735,14 @@ python aos.py protocol verify-registry
 
 ### The artifacts are inert
 
-Three schemas, all of them declarations rather than actions:
+Four schemas, all of them declarations rather than actions:
 
 | Schema | What it is |
 |---|---|
 | `beast.work-spec/v1` | An inert declaration of requested work: goal, acceptance criteria, constraints, declared input references, the expected result contract. |
 | `beast.result-envelope/v1` | An inert, proof-carrying report bound to the exact WorkSpec content hash: honest outcome, evidence references, bounded errors, retryability. |
 | `beast.interrupt/v1` | An inert request to pause, ask, seek approval, cancel, or resume — bound to an exact artifact hash. |
+| `beast.agent-passport/v1` | An inert, versioned declaration of an agent's identity, mission and requirements (U-A1). A reduced envelope — a passport is not a task message — and no field that can carry a credential, an endpoint, or an approval. |
 
 **Validation does not execute or import anything, and it does not import
 results into the ledger.** That is the whole boundary, and it is worth stating

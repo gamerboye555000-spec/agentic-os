@@ -16,7 +16,6 @@ from pathlib import Path
 
 from . import db, events, ids, obsidian, protocols, secretscan, utils
 from .models import (
-    AGENT_KINDS,
     EVIDENCE_KINDS,
     MEMORY_CONFIDENCES,
     MEMORY_EDGE_CONTRADICTS,
@@ -52,7 +51,6 @@ from .models import (
     hash_prefix,
     is_claim_hash,
     sensitivity_rank,
-    validate_agent_name,
     validate_enum,
     validate_provenance,
     validate_slug,
@@ -3037,147 +3035,18 @@ def mark_done(
 
 # ---------------------------------------------------------------------------
 # Agent registry (registry only — Agentic OS never executes agents)
+#
+# U-A1 retired the ungoverned v3 writers (`add_agent`, `update_agent`): the
+# governed verbs live in passports.py, which owns identity creation, the
+# immutable passport history, lifecycle transitions and the no-laundering
+# gate. This lookup stays here because domain code below (and passports.py
+# itself) needs it without a dependency cycle.
 
 def get_agent(conn: sqlite3.Connection, name: str) -> Agent | None:
     row = conn.execute(
         "SELECT * FROM agents WHERE name = ?", (name,)
     ).fetchone()
     return Agent.from_row(row) if row else None
-
-
-def agent_public(agent: Agent) -> dict:
-    return {
-        "name": agent.name,
-        "kind": agent.kind,
-        "capabilities": agent.capabilities(),
-        "notes": agent.notes,
-        "invoke_hint": agent.invoke_hint,
-        "trust_level": agent.trust_level,
-    }
-
-
-def _clean_capabilities(capabilities: list[str] | None) -> list[str]:
-    cleaned = []
-    for capability in capabilities or []:
-        capability = " ".join(capability.split())
-        if not capability:
-            raise AosError("--capability values must not be empty.")
-        cleaned.append(capability)
-    return cleaned
-
-
-def add_agent(
-    conn: sqlite3.Connection,
-    *,
-    name: str,
-    kind: str = "generic",
-    notes: str | None = None,
-    capabilities: list[str] | None = None,
-) -> Agent:
-    validate_agent_name(name)
-    validate_enum(kind, AGENT_KINDS, "agent kind")
-    caps = _clean_capabilities(capabilities)
-    if get_agent(conn, name) is not None:
-        raise AosError(
-            f"Agent '{name}' already exists. "
-            f"Run: python aos.py agent update {name}"
-        )
-    import json
-
-    secret_meta, secret_warning = _scan_trusted_write(
-        "agent",
-        [
-            ("name", name),
-            ("notes", notes),
-            ("capabilities", "\n".join(caps) if caps else None),
-        ],
-    )
-    with db.transaction(conn):
-        cursor = conn.execute(
-            "INSERT INTO agents (name, kind, capabilities_json, notes) "
-            "VALUES (?, ?, ?, ?)",
-            (name, kind, json.dumps(caps), notes),
-        )
-        payload = {"agent": name, "kind": kind, "capabilities": caps}
-        if secret_meta:
-            payload.update(secret_meta)
-        events.emit(
-            conn,
-            actor=ACTOR_HUMAN,
-            entity="agent",
-            entity_id=cursor.lastrowid,
-            action="add",
-            payload=payload,
-        )
-    _warn_secret(secret_warning)
-    return get_agent(conn, name)
-
-
-def update_agent(
-    conn: sqlite3.Connection,
-    *,
-    name: str,
-    notes: str | None = None,
-    capabilities: list[str] | None = None,
-) -> tuple[Agent, list[str]]:
-    agent = get_agent(conn, name)
-    if agent is None:
-        raise AosError(
-            f"No agent '{name}'. Run: python aos.py agent add {name}"
-        )
-    import json
-
-    updates: dict[str, object] = {}
-    changed: list[str] = []
-    caps = None
-    if notes is not None:
-        if not notes.strip():
-            raise AosError("--notes must not be empty.")
-        updates["notes"] = notes
-        changed.append("notes")
-    if capabilities is not None:
-        caps = _clean_capabilities(capabilities)
-        updates["capabilities_json"] = json.dumps(caps)
-        changed.append("capabilities")
-    if not updates:
-        raise AosError(
-            "Nothing to update: pass at least one of --notes/--capability."
-        )
-    # The (pre-existing) name is scanned too: a secret-shaped identifier
-    # accepted by an earlier warned write must mark — and be redacted
-    # from — every later event payload it would be copied into.
-    secret_meta, secret_warning = _scan_trusted_write(
-        "agent",
-        [
-            ("name", name),
-            ("notes", notes),
-            ("capabilities", "\n".join(caps) if caps else None),
-        ],
-    )
-    with db.transaction(conn):
-        assignments = ", ".join(f"{column} = ?" for column in updates)
-        conn.execute(
-            f"UPDATE agents SET {assignments} WHERE id = ?",
-            (*updates.values(), agent.id),
-        )
-        payload = {"agent": name, "changed": changed}
-        if secret_meta:
-            payload.update(secret_meta)
-        events.emit(
-            conn,
-            actor=ACTOR_HUMAN,
-            entity="agent",
-            entity_id=agent.id,
-            action="update",
-            payload=payload,
-        )
-    _warn_secret(secret_warning)
-    return get_agent(conn, name), changed
-
-
-def list_agents(conn: sqlite3.Connection) -> list[dict]:
-    rows = conn.execute("SELECT * FROM agents ORDER BY name").fetchall()
-    return [agent_public(Agent.from_row(row)) for row in rows]
 
 
 # ---------------------------------------------------------------------------

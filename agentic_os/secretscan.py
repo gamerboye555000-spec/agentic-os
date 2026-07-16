@@ -60,26 +60,35 @@ TRUSTED_FIELD_LABELS = frozenset(
         "acceptance",
         "agent",
         "alternatives",
+        # U-A1 passport free-text declarations. role/mission are prose the
+        # operator typed about an agent; a limitation, approval action or
+        # task family is a short string — all reach the mirror and exports,
+        # so all are scanned at the write boundary.
+        "approval",
         "capabilities",
         "claim",
         "decision",
         "from_agent",
         "key",
+        "limitation",
         # U-M3 memory sources. A locator is a path, URL or command string the
         # operator asked the ledger to remember — exactly the shape that
         # carries a token in a query string.
         "locator",
+        "mission",
         "name",
         "notes",
         "provenance",
         "reason",
         "ref",
         "repo_path",
+        "role",
         "slug",
         "source",
         "spec",
         "state",
         "summary",
+        "task_family",
         "title",
         "to_agent",
         "value",

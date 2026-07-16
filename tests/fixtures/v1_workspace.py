@@ -52,7 +52,7 @@ import io
 import sqlite3
 from pathlib import Path
 
-from agentic_os import cli, db, events, ops, utils
+from agentic_os import cli, db, events, migrations, ops, utils
 
 #: Every table whose contents the preservation proof compares.
 FIXTURE_TABLES = (
@@ -121,6 +121,14 @@ def _install_v1_memory_schema(db_path: Path) -> None:
     was migrated all the way forward. The list is db.MEMORY_GRAPH_TABLES
     rather than three literals, so a fourth graph table cannot be added
     without this fixture dropping it too.
+
+    U-A1 adds the agent tables to what must go, for the same reason: a "v1"
+    workspace with a v4 `agents` table (or any `agent_passports`) would not
+    be one, and the 3→4 step would fail on its CREATE when this fixture was
+    migrated forward. The v3 agents DDL comes from
+    migrations._V3_AGENTS_DDL — the same frozen text the 3→4 step documents
+    as its input shape — so the fixture and the migration agree about v3 by
+    construction. Rows follow via the frozen v3 agent writer below.
     """
     conn = db.connect(db_path)
     try:
@@ -131,14 +139,65 @@ def _install_v1_memory_schema(db_path: Path) -> None:
                     "v1 fixture: memory must be empty when the v1 schema is "
                     f"installed (found {rows} rows)"
                 )
+            agent_rows = conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
+            if agent_rows:
+                raise AssertionError(
+                    "v1 fixture: agents must be empty when the v1 schema is "
+                    f"installed (found {agent_rows} rows)"
+                )
             for table, _ddl in reversed(db.MEMORY_GRAPH_TABLES):
                 conn.execute(f"DROP TABLE {table}")
             conn.execute("DROP TABLE memory_evidence")
             conn.execute("DROP TABLE memory")
             conn.execute(V1_MEMORY_SQL)
+            conn.execute("DROP TABLE agent_passports")
+            conn.execute("DROP TABLE agents")
+            conn.execute(migrations._V3_AGENTS_DDL.format(table="agents"))
             conn.execute(
                 "UPDATE meta SET value = ? WHERE key = 'schema_version'",
                 (V1_SCHEMA_VERSION,),
+            )
+    finally:
+        conn.close()
+
+
+def _v1_agent_add(
+    db_path: Path,
+    *,
+    name: str,
+    kind: str = "generic",
+    notes: str | None = None,
+    capabilities: tuple[str, ...] = (),
+) -> None:
+    """v1's `agent add`, frozen.
+
+    A verbatim replica of ops.add_agent as of 2d242ab (the U-A1 baseline;
+    the agents table and its writer were unchanged from Night-1 through v3):
+    the same INSERT, the same event payload, through the unchanged
+    events.emit. It exists only because U-A1 retired the ungoverned writer
+    and a v4 build cannot address a v3 table.
+    """
+    import json
+
+    conn = db.connect(db_path)
+    try:
+        with conn:
+            cursor = conn.execute(
+                "INSERT INTO agents (name, kind, capabilities_json, notes) "
+                "VALUES (?, ?, ?, ?)",
+                (name, kind, json.dumps(list(capabilities)), notes),
+            )
+            events.emit(
+                conn,
+                actor=ops.ACTOR_HUMAN,
+                entity="agent",
+                entity_id=cursor.lastrowid,
+                action="add",
+                payload={
+                    "agent": name,
+                    "kind": kind,
+                    "capabilities": list(capabilities),
+                },
             )
     finally:
         conn.close()
@@ -228,11 +287,6 @@ def build_v1_workspace(root: Path) -> Path:
             "--repo", str(legacy_repo),
         )
 
-        _run("agent", "add", "claude-code", "--kind", "local",
-             "--notes", "primary coding agent", "--capability", "code")
-        _run("agent", "add", "reviewer", "--kind", "cloud",
-             "--notes", "review only")
-
         # T-0001: the full done-with-evidence flow.
         _run("task", "add", "Historical v1 task", "-p", "demo",
              "--accept", "pack + evidence flow works")
@@ -265,10 +319,21 @@ def build_v1_workspace(root: Path) -> Path:
         # The last v2-code step, with memory still empty.
         _run("sync")
 
-        # Step 3: the memory table becomes v1, and so does the version.
+        # Step 3: the memory and agent tables become v1, and so does the
+        # version.
         db_path = root / utils.AOS_DIR_NAME / utils.DB_FILENAME
         demo_id = _project_id(db_path, "demo")
         _install_v1_memory_schema(db_path)
+
+        # Step 4a: the two registered agents, through v1's frozen writer —
+        # exactly the workspace of a v1 user who ran `agent add` after their
+        # last `sync`, like the memory rows below.
+        _v1_agent_add(
+            db_path, name="claude-code", kind="local",
+            notes="primary coding agent", capabilities=("code",),
+        )
+        _v1_agent_add(db_path, name="reviewer", kind="cloud",
+                      notes="review only")
 
         # Step 4: the memory rows, through v1's frozen writer.
 

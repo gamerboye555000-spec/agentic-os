@@ -26,7 +26,12 @@ from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
 
-from .models import EVIDENCE_KINDS, RUN_OUTCOMES
+from .models import (
+    AGENT_CLASSES,
+    EVIDENCE_KINDS,
+    MEMORY_SCOPES,
+    RUN_OUTCOMES,
+)
 from .utils import AosError
 
 # ---------------------------------------------------------------------------
@@ -114,6 +119,9 @@ REASON_HINTS: dict[str, str] = {
         "protocol_version disagrees with the major version in the schema name."
     ),
     "binding_mismatch": "The artifact does not bind to the document it names.",
+    "scope_level_mismatch": (
+        "agent_scope.project must be present exactly when level is 'project'."
+    ),
     # Filesystem
     "unsafe_input": "Only a regular file is accepted here.",
     "unreadable": "The file cannot be read.",
@@ -381,6 +389,7 @@ SUPPORTED_MAJORS = frozenset({1})
 COMPAT_STATUSES = ("active", "deprecated")
 
 REQUIRED_IDENTITIES = (
+    "beast.agent-passport/v1",
     "beast.interrupt/v1",
     "beast.result-envelope/v1",
     "beast.work-spec/v1",
@@ -971,6 +980,282 @@ _INTERRUPT_V1 = _artifact_schema(
 
 
 # ---------------------------------------------------------------------------
+# beast.agent-passport/v1 (U-A1)
+#
+# A passport is NOT a task message, so it carries a REDUCED envelope: no
+# aos_task_id, no trace, no idempotency_key, no audience, no scope object, no
+# permitted_destinations — requiring those would force fabricated data into
+# every declaration. Everything in the body is an inert declaration: no field
+# grants execution, approval, credentials or routing, and no code path in
+# U-A1 consumes `autonomy` for anything.
+
+AGENT_AUTONOMY_LEVELS = ("declare_only", "suggest", "supervised", "scoped")
+AGENT_ESCALATIONS = ("halt", "ask_human", "handoff")
+AGENT_PROVENANCE_METHODS = ("create", "import", "publish")
+AGENT_MODALITIES = ("text", "code", "image", "audio")
+
+#: models.AGENT_NAME_RE narrowed to the 64-char new-name bound. The document
+#: binds the agent name internally (like each schema pinning its own
+#: identity), so a digest cannot be transplanted across agents.
+AGENT_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+TASK_FAMILY_PATTERN = r"^[a-z][a-z0-9._-]{1,63}$"
+#: A schema identity as a declared reference (never resolved here).
+PROTOCOL_ID_PATTERN = r"^[a-z][a-z0-9]*(\.[a-z0-9-]+)+/v[1-9][0-9]{0,3}$"
+#: A skill/tool requirement: a slug, optionally version-pinned. A stored
+#: string — U-A1 ships no resolver (deferred to U-K1/U-T1).
+REQUIREMENT_PATTERN = r"^[a-z][a-z0-9._-]{1,63}(/v[1-9][0-9]{0,3})?$"
+PROVIDER_PATTERN = r"^[a-z][a-z0-9._-]{1,63}$"
+MODEL_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+
+_AGENT_PASSPORT_V1 = {
+    "title": "Agent Passport v1",
+    "description": (
+        "An inert, versioned declaration of an agent's identity, mission and "
+        "requirements. It carries no credential, no endpoint, no environment "
+        "map, no approval boolean and no executable field — these are "
+        "unrepresentable, not merely discouraged. Nothing here grants "
+        "permission to execute, route or spend; autonomy and escalation are "
+        "declarations a future unit may read, and this one does not."
+    ),
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "schema",
+        "protocol_version",
+        "content_hash_alg",
+        "content_sha256",
+        "created_at",
+        "issuer",
+        "agent",
+        "passport_version",
+        "agent_class",
+        "agent_scope",
+        "role",
+        "mission",
+        "autonomy",
+        "escalation",
+        "provenance",
+    ],
+    "properties": {
+        "schema": {"type": "string", "const": "beast.agent-passport/v1"},
+        "protocol_version": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 999,
+            "description": "The major version; must equal the major in `schema`.",
+        },
+        "content_hash_alg": {"type": "string", "const": CONTENT_HASH_ALG},
+        "content_sha256": _ref("Sha256"),
+        "created_at": _ref("Timestamp"),
+        "expires_at": _ref("Timestamp"),
+        "issuer": _ref("Issuer"),
+        "data_classification": _enum(DATA_CLASSIFICATIONS),
+        "agent": _string(
+            min_len=1,
+            max_len=64,
+            pattern=AGENT_NAME_PATTERN,
+            description="The registry name this passport declares for. Bound "
+            "into the hashed body, so a digest cannot be transplanted "
+            "between agents.",
+        ),
+        "passport_version": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 999999,
+            "description": "This declaration's position in the agent's "
+            "immutable version history. Bound into the hashed body.",
+        },
+        "agent_class": _enum(
+            AGENT_CLASSES, description="IS models.AGENT_CLASSES."
+        ),
+        "agent_scope": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["level"],
+            "properties": {
+                "level": _enum(("global", "project")),
+                "project": _string(
+                    min_len=1,
+                    max_len=64,
+                    pattern=PROJECT_SCOPE_PATTERN,
+                    description="Required exactly when level is 'project' "
+                    "(cross-field check). A filing statement, never an "
+                    "access grant.",
+                ),
+            },
+        },
+        "role": _string(min_len=1, max_len=256),
+        "mission": _string(min_len=1, max_len=4096),
+        "autonomy": _enum(
+            AGENT_AUTONOMY_LEVELS,
+            description="An inert declaration. No schedule, execution right "
+            "or approval follows from it; nothing in U-A1 reads it.",
+        ),
+        "escalation": _enum(AGENT_ESCALATIONS),
+        "provenance": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["created_by", "method"],
+            "properties": {
+                "created_by": _string(
+                    min_len=5, max_len=70, pattern=PROVENANCE_PATTERN
+                ),
+                "method": _enum(AGENT_PROVENANCE_METHODS),
+            },
+        },
+        "task_families": _array(
+            _string(min_len=2, max_len=64, pattern=TASK_FAMILY_PATTERN),
+            min_items=1,
+            max_items=32,
+        ),
+        "protocols": _array(
+            _string(min_len=6, max_len=132, pattern=PROTOCOL_ID_PATTERN),
+            min_items=1,
+            max_items=16,
+        ),
+        "capabilities": _array(
+            _string(min_len=2, max_len=64, pattern=CAPABILITY_PATTERN),
+            min_items=1,
+            max_items=32,
+        ),
+        "skill_requirements": _array(
+            _string(min_len=2, max_len=70, pattern=REQUIREMENT_PATTERN),
+            min_items=1,
+            max_items=32,
+        ),
+        "tool_requirements": _array(
+            _string(min_len=2, max_len=70, pattern=REQUIREMENT_PATTERN),
+            min_items=1,
+            max_items=32,
+        ),
+        "provider_compat": _array(
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["provider"],
+                "properties": {
+                    "provider": _string(
+                        min_len=2, max_len=64, pattern=PROVIDER_PATTERN
+                    ),
+                    "models": _array(
+                        _string(
+                            min_len=1, max_len=128, pattern=MODEL_ID_PATTERN
+                        ),
+                        min_items=1,
+                        max_items=16,
+                    ),
+                },
+                "description": "A DECLARED compatibility statement. Nothing "
+                "here names an endpoint, and nothing resolves it.",
+            },
+            min_items=1,
+            max_items=16,
+        ),
+        "model_requirements": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [],
+            "properties": {
+                "min_context_tokens": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 99999999,
+                },
+                "modalities": _array(
+                    _enum(AGENT_MODALITIES),
+                    min_items=1,
+                    max_items=len(AGENT_MODALITIES),
+                ),
+            },
+        },
+        "memory_scopes": _array(
+            _enum(MEMORY_SCOPES, description="IS models.MEMORY_SCOPES."),
+            min_items=1,
+            max_items=len(MEMORY_SCOPES),
+        ),
+        "data_classifications": _array(
+            _enum(DATA_CLASSIFICATIONS),
+            min_items=1,
+            max_items=len(DATA_CLASSIFICATIONS),
+        ),
+        "approvals_required": _array(
+            _string(min_len=1, max_len=128),
+            min_items=1,
+            max_items=16,
+            # Declared actions the agent says need human approval. NOT an
+            # approval grant; this protocol has no field that can make that
+            # claim.
+        ),
+        "evidence_expectations": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["evidence_kinds", "min_evidence_count"],
+            "properties": {
+                "evidence_kinds": _array(
+                    _enum(
+                        EVIDENCE_KINDS,
+                        description="IS models.EVIDENCE_KINDS (D-v0.3.10).",
+                    ),
+                    min_items=1,
+                    max_items=len(EVIDENCE_KINDS),
+                ),
+                "min_evidence_count": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 32,
+                },
+            },
+        },
+        "evaluation_refs": _array(
+            _ref("OpaqueRef"), min_items=1, max_items=16
+        ),
+        "limitations": _array(
+            _string(min_len=1, max_len=1024), min_items=1, max_items=32
+        ),
+        "limits": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [],
+            "properties": {
+                "max_context_tokens": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 99999999,
+                },
+                "max_task_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 604800,
+                },
+                "max_cost_microusd": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1000000000000,
+                },
+            },
+        },
+    },
+    "$defs": {
+        "Timestamp": _string(
+            min_len=20,
+            max_len=20,
+            pattern=RFC3339_PATTERN,
+            description="UTC RFC3339, second precision, literal Z.",
+        ),
+        "Sha256": _string(min_len=64, max_len=64, pattern=SHA256_PATTERN),
+        "Issuer": _string(min_len=3, max_len=64, pattern=ISSUER_PATTERN),
+        "OpaqueRef": _string(
+            min_len=3,
+            max_len=132,
+            pattern=OPAQUE_REF_PATTERN,
+            description="An opaque versioned reference to a record owned by "
+            "another system. Never dereferenced here.",
+        ),
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Registry (contract §4)
 
 @dataclass(frozen=True)
@@ -1000,6 +1285,7 @@ _DEFINITIONS: tuple[tuple[str, int, str, dict], ...] = (
     ("beast.work-spec", 1, "active", _WORK_SPEC_V1),
     ("beast.result-envelope", 1, "active", _RESULT_ENVELOPE_V1),
     ("beast.interrupt", 1, "active", _INTERRUPT_V1),
+    ("beast.agent-passport", 1, "active", _AGENT_PASSPORT_V1),
 )
 
 
@@ -1210,7 +1496,13 @@ def _parse_instant(text: str, path: str, where: str) -> datetime:
 
 
 def _check_semantics(document: dict, entry: SchemaEntry) -> None:
-    """The cross-field invariants a schema cannot express (contract §7.4)."""
+    """The cross-field invariants a schema cannot express (contract §7.4).
+
+    Field-specific checks are guarded on PRESENCE, not on identity: the
+    three task-message schemas require `trace` structurally, so their
+    behavior is unchanged, while a schema with a reduced envelope (the agent
+    passport) is not crashed by a dereference of a field it never carries.
+    """
     where = entry.identity
 
     if document["protocol_version"] != entry.major:
@@ -1225,8 +1517,17 @@ def _check_semantics(document: dict, entry: SchemaEntry) -> None:
     if deadline is not None:
         _parse_instant(deadline, "/retry/deadline_at", where)
 
-    if document["trace"]["trace_id"] == "0" * 32:
+    if "trace" in document and document["trace"]["trace_id"] == "0" * 32:
         raise _refuse("pattern_mismatch", "/trace/trace_id", where=where)
+
+    # U-A1: a project-scoped declaration must name its project, a global one
+    # must not. A schema of the supported keyword subset cannot express
+    # "required iff", so the rule lives here with the other cross-field ones.
+    agent_scope = document.get("agent_scope")
+    if agent_scope is not None:
+        has_project = "project" in agent_scope
+        if (agent_scope.get("level") == "project") != has_project:
+            raise _refuse("scope_level_mismatch", "/agent_scope", where=where)
 
     _check_content_hash(document, where)
 

@@ -119,10 +119,10 @@ class TestInit(CliTestCase):
             ["memory", "retire", "M-0001"],
             ["ingest", "dropfile", "drop.md"],
             ["evidence", "git", "T-0001", "HEAD"],
-            ["agent", "add", "codex"],
+            ["agent", "create", "codex"],
             ["agent", "list"],
             ["agent", "show", "codex"],
-            ["agent", "update", "codex", "--notes", "n"],
+            ["agent", "passport", "publish", "codex"],
             ["search", "anything"],
             ["review", "build"],
             ["review", "weekly"],
@@ -570,12 +570,12 @@ class TestEventPerMutatingCommand(CliTestCase):
             ),
             (["memory", "retire", "M-0002"], [("memory", "retire")]),
             (
-                ["agent", "add", "codex", "--kind", "cloud"],
-                [("agent", "add")],
+                ["agent", "create", "codex", "--class", "specialist"],
+                [("agent", "create")],
             ),
             (
-                ["agent", "update", "codex", "--capability", "code"],
-                [("agent", "update")],
+                ["agent", "passport", "publish", "codex"],
+                [("agent", "publish")],
             ),
             (
                 ["ingest", "dropfile", str(dropfile)],
@@ -827,10 +827,10 @@ class TestDoctor(CliTestCase):
         # (R-0001's evidence is attributable and no ref is blank). The
         # power line is [PASS] "standard (default)": this fixture never
         # writes power.json, and reading it must not create it.
-        # 21 → 25 → 30 → 31: U-M2's four mandated memory-claim checks joined
+        # 21 → 25 → 30 → 34: U-M2's four mandated memory-claim checks joined
         # the set, then U-M3's five memory-graph checks, then U-M5's
         # retrieval benchmark registry check.
-        self.assertEqual(len(lines), 31)
+        self.assertEqual(len(lines), 34)
         warn_lines = [l for l in lines if l.startswith("[WARN]")]
         self.assertEqual(len(warn_lines), 1)
         self.assertIn("code tasks done without commit evidence", warn_lines[0])

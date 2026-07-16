@@ -196,9 +196,9 @@ class ProductionRegistryTest(MigrationTestCase):
         # If this fails, a migration was added without raising SCHEMA_VERSION
         # with it — or the reverse.
         self.assertEqual(migrations.LATEST_VERSION, int(db.SCHEMA_VERSION))
-        self.assertEqual(migrations.LATEST_VERSION, 3)
+        self.assertEqual(migrations.LATEST_VERSION, 4)
 
-    def test_production_registry_is_the_two_production_steps(self):
+    def test_production_registry_is_the_three_production_steps(self):
         self.assertEqual(
             [
                 (m.from_version, m.to_version, m.migration_id)
@@ -207,6 +207,7 @@ class ProductionRegistryTest(MigrationTestCase):
             [
                 (1, 2, "u-m2-memory-claims-v2"),
                 (2, 3, "u-m3-memory-graph-v3"),
+                (3, 4, "u-a1-agent-passports-v4"),
             ],
         )
         migrations.validate_registry()
@@ -221,13 +222,14 @@ class ProductionRegistryTest(MigrationTestCase):
     def test_production_registry_reports_the_pending_migrations(self):
         report = migrations.status(self.db_path)
         self.assertEqual(report["current_version"], 1)
-        self.assertEqual(report["latest_version"], 3)
+        self.assertEqual(report["latest_version"], 4)
         self.assertTrue(report["pending"])
         self.assertEqual(
             report["plan"],
             [
                 {"from": 1, "to": 2, "migration_id": "u-m2-memory-claims-v2"},
                 {"from": 2, "to": 3, "migration_id": "u-m3-memory-graph-v3"},
+                {"from": 3, "to": 4, "migration_id": "u-a1-agent-passports-v4"},
             ],
         )
 
@@ -1064,11 +1066,19 @@ class RegistryValidationTest(MigrationTestCase):
         # compiled into source.
         self.assertEqual(
             [m.migration_id for m in migrations.MIGRATIONS],
-            ["u-m2-memory-claims-v2", "u-m3-memory-graph-v3"],
+            [
+                "u-m2-memory-claims-v2",
+                "u-m3-memory-graph-v3",
+                "u-a1-agent-passports-v4",
+            ],
         )
         self.assertEqual(
             [s["migration_id"] for s in migrations.status(self.db_path)["plan"]],
-            ["u-m2-memory-claims-v2", "u-m3-memory-graph-v3"],
+            [
+                "u-m2-memory-claims-v2",
+                "u-m3-memory-graph-v3",
+                "u-a1-agent-passports-v4",
+            ],
         )
 
 
@@ -1419,7 +1429,9 @@ class NoRegressionTest(MigrationTestCase):
         after = core_schema(self.db_path)
         self.assertEqual(set(after), set(before))
         for table, sql in before.items():
-            if table == "memory":
+            # `memory` is what 1→2/2→3 rebuild; `agents` is what 3→4
+            # rebuilds. Everything else must be byte-identical.
+            if table in ("memory", "agents"):
                 self.assertNotEqual(after[table], sql)
                 continue
             self.assertEqual(after[table], sql, f"{table} drifted")

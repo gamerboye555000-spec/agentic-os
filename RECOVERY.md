@@ -124,11 +124,17 @@ schema change programmatically is guesswork, and doing it automatically
 would silently bypass the snapshot taken to protect you. The snapshot is the
 rollback.
 
-This drill is no longer theoretical. There are two production migrations —
-**1 → 2, `u-m2-memory-claims-v2`** (memory claims) and **2 → 3,
-`u-m3-memory-graph-v3`** (the memory graph) — so `migrate apply` on an older
-workspace really does take a snapshot and really does change the memory table.
-Everything below applies to both exactly.
+This drill is no longer theoretical. There are three production migrations —
+**1 → 2, `u-m2-memory-claims-v2`** (memory claims), **2 → 3,
+`u-m3-memory-graph-v3`** (the memory graph) and **3 → 4,
+`u-a1-agent-passports-v4`** (the governed agent registry) — so
+`migrate apply` on an older workspace really does take a snapshot and really
+does rebuild tables. Everything below applies to all three exactly.
+
+A tampered agent registry deserves the same posture as a tampered memory
+claim: doctor checks 32/33 name the damage, every `agent` write refuses on
+it (the no-laundering gate), and the exit is this file's restore drill —
+never a write that would recompute the hashes over the edit and hide it.
 
 Each step leaves a database that genuinely **is** its own version: a snapshot
 taken before 2 → 3 is a real v2 database, not a v3 database wearing a v2
