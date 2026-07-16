@@ -65,6 +65,10 @@ TRUSTED_FIELD_LABELS = frozenset(
         "decision",
         "from_agent",
         "key",
+        # U-M3 memory sources. A locator is a path, URL or command string the
+        # operator asked the ledger to remember — exactly the shape that
+        # carries a token in a query string.
+        "locator",
         "name",
         "notes",
         "provenance",

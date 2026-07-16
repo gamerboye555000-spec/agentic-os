@@ -113,7 +113,7 @@ class TestDbInvariants(CoreTestCase):
 
     def test_schema_version_recorded(self):
         self.assertEqual(db.get_meta(self.conn, "schema_version"), db.SCHEMA_VERSION)
-        self.assertEqual(db.SCHEMA_VERSION, "2")
+        self.assertEqual(db.SCHEMA_VERSION, "3")
 
     def test_open_db_rejects_version_mismatch(self):
         with self.conn:

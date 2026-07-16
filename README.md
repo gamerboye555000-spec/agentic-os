@@ -365,12 +365,158 @@ python aos.py memory list --status retired  # administrative: history included
 python aos.py memory list --pinned
 ```
 
+## The memory graph (U-M3)
+
+Schema v3 adds four things to a claim: how sensitive it is, where it came
+from, what it relates to, and what it contradicts. All four are recorded by
+you and interpreted by nobody.
+
+### Sensitivity
+
+Every claim carries exactly one level, and they are ordered:
+
+| level | in packs, search snippets and mirror bodies? |
+|---|---|
+| `public` | yes |
+| `internal` | yes — **the default** |
+| `confidential` | yes |
+| `restricted` | **never** |
+
+`memory add` defaults to `internal`; pass `--sensitivity` to say otherwise.
+Public, internal and confidential claims behave exactly as they did before.
+
+**`restricted` means restricted from automatic context, not hidden from you.**
+A restricted claim never enters a context pack, a search snippet, a generated
+summary or a mirror body. It still appears in `memory list`, `memory show`,
+`memory graph` and `doctor` — as **metadata only**: its id, scope, kind,
+status, sensitivity, timestamps, counts and hash are shown; its key, value,
+source and evidence refs are not.
+
+```bash
+python aos.py memory add --scope global --kind fact --key salary-band \
+    --value "..." --source human --confidence confirmed --sensitivity restricted
+
+# Raise a claim's classification. Increases ONLY.
+python aos.py memory classify M-0007 confidential
+python aos.py memory classify M-0007 public   # refuses: see U-S6
+```
+
+Classification only ever goes **up** (`public → internal → confidential →
+restricted`). Re-classifying to the level a claim already has changes nothing
+and writes no event. Lowering one is an authorization decision and belongs to
+U-S6, which this build does not ship — so it refuses, unchanged.
+
+Pinning does not override any of this. A pin is ordering among claims that are
+already eligible; it never forces a restricted claim into context.
+
+### Sources: where a claim came from
+
+A **source** is a normalized provenance record. It names where something came
+from without copying it:
+
+| kind | carries |
+|---|---|
+| `evidence` | an evidence id (`--evidence E-0001`), and nothing else about that row |
+| `file` `url` `command` `human` `agent` `artifact` | an inert `--locator` string |
+
+```bash
+# An evidence-backed source, and an inert external one:
+python aos.py memory source add --kind evidence --evidence E-0001
+python aos.py memory source add --kind url --locator "https://example.com/rfc" \
+    --observed-at 2026-07-16 --valid-until 2027-01-01
+
+python aos.py memory source list --active-only
+python aos.py memory source show MS-0001
+
+# Attach a source to a claim: supports | disputes | context | derived_from
+python aos.py memory source link M-0001 MS-0001 --relation supports
+```
+
+> **References are inert. Nothing follows them.** A locator is a string the
+> ledger agreed to remember. No command opens that file, resolves that URL,
+> runs that command string, reads that evidence row's text, or touches the
+> network — not `source show`, not `graph`, not `doctor`, not `pack build`.
+>
+> `source list` and `source show` deliberately **never print the locator or
+> the provenance**. A URL with a token in its query string, or a path through
+> your home directory, does not belong in a listing you scroll past. The id is
+> enough to correlate; the ledger holds the rest.
+
+Two rules are enforced before any link is written: a **project** source may
+back only claims in the same project (a **global** source may back anything),
+and a source may **not be more sensitive than the claim it backs** — otherwise
+the link would be a way to reach a restricted source through a public claim.
+
+### Relationships and contradictions
+
+An **edge** records that two claims relate:
+
+| relation | direction |
+|---|---|
+| `supports` `refines` `depends_on` | directional — the order you give is kept |
+| `contradicts` `related` | **symmetric** — A↔B and B↔A are one edge |
+
+```bash
+python aos.py memory edge add M-0001 M-0002 --relation refines
+python aos.py memory edge add M-0003 M-0004 --relation contradicts \
+    --valid-from 2026-07-16
+
+python aos.py memory edge list --relation contradicts --active-only
+python aos.py memory graph M-0001              # depth 1 (default)
+python aos.py memory graph M-0001 --depth 2 --json
+python aos.py memory contradictions            # active ones; --all for history
+```
+
+Because `contradicts` and `related` are symmetric, their endpoints are stored
+lowest-id-first, so adding `B contradicts A` after `A contradicts B` is an
+idempotent no-op rather than a second row for the same fact.
+
+> **A contradiction is a record, not a verdict.** `memory contradictions`
+> tells you that you declared two claims to disagree, and shows you both
+> claims' status and sensitivity — usually enough to see that one is already
+> retired. It does **not** decide which is true, resolve anything, or change a
+> claim. **Nothing is ever inferred**: no contradiction is detected from keys,
+> values, dates, sources or models. Every edge in the graph was typed by a
+> human.
+>
+> More generally: **graph records do not automate truth decisions.** An edge
+> triggers no workflow. Adding `contradicts` does not quarantine, retire,
+> contest or reorder anything, and `superseded_by` remains the one mechanism
+> that retires a claim.
+
+`memory graph` is a bounded, read-only, deterministic view: depth 1 or 2 only,
+at most 64 nodes and 128 edges. It prints ids, relations, direction, status,
+sensitivity and active state — never a claim's key or value, never a locator,
+never a full hash. If it hits a cap it truncates and says so, rather than
+pretending you saw the whole neighbourhood.
+
+Packs do **no graph expansion**: linking a source or an edge to a claim never
+pulls its neighbours into an agent's context.
+
+### Temporal validity
+
+Sources and edges may carry `--valid-from` / `--valid-until` (`YYYY-MM-DD` or
+`YYYY-MM-DDTHH:MM:SSZ`). An expired source or edge is **inactive, not gone**:
+it stays queryable history, drops out of `--active-only` listings and out of
+`memory contradictions` by default, and an expired source stops counting as
+active support. Nothing is ever deleted.
+
+### Integrity
+
+Sources, links and edges each carry a `content_sha256` binding every
+authoritative field, exactly as claims do — and the claim hash now binds
+`sensitivity` too, so tampering with the field that decides whether an agent
+sees a claim breaks its hash like any other. Every write against an existing
+record verifies its stored hash first and refuses on mismatch, so no
+mutation can quietly certify an edit made behind Agentic OS's back. `doctor`
+reports damage by id and reason code, never by echoing what it found.
+
 ## Schema migrations (U-M1)
 
-**Schema version 2 is current.** A workspace created by this build starts at
-2 and never migrates. A workspace from an earlier build is at version 1 and
-has exactly one migration pending: `u-m2-memory-claims-v2` (memory claims —
-see above), the first production migration the U-M1 machinery carries.
+**Schema version 3 is current.** A workspace created by this build starts at
+3 and never migrates. An older workspace has one or two migrations pending —
+`u-m2-memory-claims-v2` (memory claims) and `u-m3-memory-graph-v3` (the memory
+graph) — the production migrations the U-M1 machinery carries.
 
 ```bash
 # Where am I, what does this build support, is anything pending?
@@ -378,7 +524,7 @@ python aos.py migrate status
 
 # What exactly would run, in order? (read-only; writes nothing)
 python aos.py migrate plan
-#   1 → 2  u-m2-memory-claims-v2
+#   2 → 3  u-m3-memory-graph-v3
 
 # Run it. Snapshots and verifies the database first.
 python aos.py migrate apply
@@ -389,6 +535,14 @@ same timestamps — and derives curation from what v1 already knew: a
 superseded or expired row becomes `retired`, every other row becomes `live`,
 every row starts unpinned, no evidence link is invented, and every row gets a
 valid hash. Nothing is inferred from your text.
+
+The 2 → 3 migration does the same on the same terms: every claim keeps its id,
+text, timestamps, status and pin; every evidence link survives untouched;
+every claim becomes `internal`; every hash is recomputed under the v3 payload.
+The three graph tables arrive **empty** — a v2 claim has no recorded
+provenance, and inventing one from its `source` field or its evidence would be
+a guess wearing a fact's clothes. Nothing is inferred from your text here
+either.
 
 `status` and `plan` are read-only *byte-for-byte*: they open the database
 through a connection SQLite itself refuses writes on, and leave no `-wal`,

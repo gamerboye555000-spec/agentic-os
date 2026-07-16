@@ -1,5 +1,6 @@
 """Human-facing IDs: T-0001 tasks, R-0001 runs, D-0001 decisions,
-E-0001 evidence, H-0001 handoffs, P-0001 packs, M-0001 memory.
+E-0001 evidence, H-0001 handoffs, P-0001 packs, M-0001 memory, and the U-M3
+graph records — MS-0001 memory sources, ML-0001 source links, ME-0001 edges.
 
 Render: prefix + zero-padded integer, minimum width 4, growing naturally
 past 9999. Parse: strict — correct prefix for the command (case-insensitive),
@@ -21,6 +22,12 @@ PREFIXES = {
     "handoff": "H",
     "pack": "P",
     "memory": "M",
+    # U-M3 graph records. Two letters, not one: the parser compares the whole
+    # prefix, so MS-0001 can never be misread as memory M-0001 (or the
+    # reverse) however carelessly it is typed.
+    "memory_source": "MS",
+    "memory_source_link": "ML",
+    "memory_edge": "ME",
 }
 
 #: Upper bound for parsed ids (D-v0.2.2): SQLite INTEGER is a signed 64-bit

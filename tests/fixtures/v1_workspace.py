@@ -107,13 +107,20 @@ def _run(*argv: str) -> None:
 
 
 def _install_v1_memory_schema(db_path: Path) -> None:
-    """Replace the empty v2 memory table with its historical v1 definition,
-    drop the v2 link table, and set schema_version back to 1.
+    """Replace the empty current-schema memory table with its historical v1
+    definition, drop every table v1 never had, and set schema_version back to 1.
 
     Runs while `memory` holds NO rows, so nothing is rewritten or
     reverse-migrated: this is DDL on an empty table, which is why it is
     honest. What comes out is byte-for-byte the v1 schema, and the rows that
     follow are written by the frozen v1 writer.
+
+    U-M3 (M3.12) adds the graph tables to what must go. A "v1" workspace that
+    still carried memory_sources would not be one — and the 2→3 step, which
+    creates those tables, would fail on the second CREATE when this fixture
+    was migrated all the way forward. The list is db.MEMORY_GRAPH_TABLES
+    rather than three literals, so a fourth graph table cannot be added
+    without this fixture dropping it too.
     """
     conn = db.connect(db_path)
     try:
@@ -124,6 +131,8 @@ def _install_v1_memory_schema(db_path: Path) -> None:
                     "v1 fixture: memory must be empty when the v1 schema is "
                     f"installed (found {rows} rows)"
                 )
+            for table, _ddl in reversed(db.MEMORY_GRAPH_TABLES):
+                conn.execute(f"DROP TABLE {table}")
             conn.execute("DROP TABLE memory_evidence")
             conn.execute("DROP TABLE memory")
             conn.execute(V1_MEMORY_SQL)

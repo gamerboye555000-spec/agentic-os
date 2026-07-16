@@ -2593,3 +2593,143 @@ rewriting prior entries.
   automatic promotion, contradiction detection, distillation, or agent memory
   writer. Storage that anticipates a workflow is cheap; a workflow invented
   ahead of its unit is a design nobody reviewed.
+
+## U-M3 — provenance, temporal, relationship and contradiction memory graph
+
+Contract: `agentic-os-v0.3-u-m3-memory-graph-contract.md`. Schema version 3.
+
+- **D-v0.3.31 — Sensitivity is a closed, ORDERED vocabulary:
+  `public < internal < confidential < restricted`.** The order is not
+  cosmetic; it is what "classification increases only" and "a source must not
+  be more sensitive than the claim it backs" are expressed in. Both a CHECK
+  constraint and the domain enum enforce membership, so neither a careless
+  caller nor a direct SQL writer can invent a level.
+
+- **D-v0.3.32 — Sensitivity defaults to `internal`, and `restricted` is the
+  only level excluded from automatic context.** `public` is a deliberate act
+  of publication, not something a claim falls into by omission. Public,
+  internal and confidential claims keep exactly the pack, search and mirror
+  behavior they had; restricted claims never enter a context pack, a search
+  snippet, a generated summary or a mirror body. Administrative surfaces still
+  LIST them — metadata only, never their key, value, source or evidence refs.
+  This is a safe local baseline, not the U-S6 authorization system.
+
+- **D-v0.3.33 — The exclusion lives in the eligibility predicate, not in the
+  renderers.** `ops.claim_is_eligible` and `ops.memory_for_project` both learned
+  about `restricted`, so `memory show`'s "retrieved: yes", the pin gate and the
+  pack builder cannot disagree about who sees what. A filter added at the pack
+  renderer would hold only for that renderer, and the next caller would
+  reopen the hole without noticing. Pinning still never overrides sensitivity:
+  it is ordering among eligible claims, and it always was.
+
+- **D-v0.3.34 — A source row copies no text from what it references.** An
+  `evidence` source carries an evidence id and nothing else about that row —
+  not its claim, ref, sha or body. Every other kind carries an inert `locator`.
+  A structural CHECK enforces the split at the storage boundary as well as in
+  `ops`, so a row that copied a ref into `locator` cannot exist.
+
+- **D-v0.3.35 — Contradictions are typed edges, not a second table and not a
+  verdict.** A contradiction IS an active `contradicts` edge. There is no
+  resolution column, no winner, and no truth decision anywhere in U-M3:
+  `memory contradictions` reports that a human declared two claims to
+  disagree, shows both claims' lifecycle and sensitivity, and stops. Nothing
+  is ever inferred — not from keys, values, dates, sources or models. A tool
+  that guessed here would be believed.
+
+- **D-v0.3.36 — Graph relations are descriptive and trigger no workflow.**
+  Adding a `contradicts` edge does not quarantine, retire, contest or reorder
+  anything. `memory.superseded_by` remains the one lifecycle supersession
+  mechanism and is deliberately NOT duplicated as a graph relation — two
+  mechanisms for one truth is how a ledger starts disagreeing with itself.
+
+- **D-v0.3.37 — Symmetric relations canonicalize their endpoints (lower id
+  first).** `contradicts` and `related` are symmetric, so A↔B and B↔A are one
+  logical edge; the endpoints are ordered before every lookup and insert, and
+  a CHECK pins the canonical form in storage. A reverse duplicate therefore
+  collides with the UNIQUE constraint instead of quietly becoming a second row
+  for the same fact.
+
+- **D-v0.3.38 — Every graph reference is inert.** No command follows a file
+  locator, resolves a URL, executes a command string, reads an evidence ref,
+  or opens an artifact path. They are strings the ledger agreed to remember.
+  This is what keeps the graph inspection commands genuinely read-only rather
+  than read-mostly.
+
+- **D-v0.3.39 — SQLite graph records are canonical; graph engines are
+  derived.** The three tables are ledger data with integrity hashes, not a
+  disposable visual index. Any external graph engine, visualization or index
+  is rebuildable from them and carries no truth of its own.
+
+- **D-v0.3.40 — Traversal caps truncate deterministically and say so.**
+  `memory graph` is bounded at depth 2, 64 nodes and 128 edges. It truncates
+  rather than refusing — an inspector that gives up on a large graph is
+  useless exactly when it matters — and reports `truncated`, because a silent
+  stop reads as "that is the whole neighbourhood".
+
+- **D-v0.3.41 — A shipped migration is history and gets frozen in place.**
+  U-M2 wrote the 1→2 step against the shared `db.MEMORY_CLAIM_DDL` so a
+  migrated table could not drift from a fresh one. That was right while v2 was
+  current and stopped being right the moment v3 existed: a shared constant
+  follows the schema FORWARD, so 1→2 would have built a v3-shaped table,
+  stamped `schema_version = 2` on it, and hashed its claims under the v3
+  payload — and U-M1's guarantee that a failure inside 2→3 leaves a valid v2
+  database would have been false, because there would never have been one. The
+  v2 DDL and the v2 claim-hash payload are now frozen copies in
+  `migrations.py`. The cost is one duplication per schema version; each step
+  now leaves a database that genuinely is what it says it is.
+
+- **D-v0.3.42 — The 2→3 step rebuilds the memory table, and the migration
+  connection runs with `foreign_keys=OFF` plus a `foreign_key_check` before
+  every commit.** The rebuild is D-v0.3.23's reasoning applied again: building
+  from the one fresh-v3 DDL constant is what makes a migrated table and a
+  born-v3 table the same table. But `memory_evidence` now holds foreign keys
+  into `memory`, so DROPping the old table is an instant violation.
+  `PRAGMA foreign_keys=OFF` inside a transaction is a silent no-op, and
+  `PRAGMA defer_foreign_keys=ON` looks like the subtler answer and is not one
+  — it counts the violations the DROP causes and never decrements them when
+  the RENAME puts the table back, so the COMMIT fails anyway (measured, not
+  assumed). So the pragma is set before the transaction opens, and the
+  compensating control is strictly broader than what was switched off: EVERY
+  step, present and future, is followed by a `foreign_key_check` over the whole
+  database inside its own transaction, before its commit. Per-statement
+  enforcement would have refused the legal intermediate state; this refuses any
+  illegal final one.
+
+- **D-v0.3.43 — No provenance is invented during migration.** The three graph
+  tables come out of 2→3 EMPTY, and every migrated claim becomes `internal` by
+  constant, never by inspecting its text. A v2 claim has no recorded
+  provenance; deriving one from `memory.source` or from linked evidence would
+  put a guess into the ledger wearing the same clothes as a fact. Existing
+  evidence links survive untouched — the step does not address that table at
+  all.
+
+- **D-v0.3.44 — Doctor's restricted-in-context check warns, never fails.** A
+  pack built BEFORE a claim was classified restricted legitimately contains
+  it: the operator did nothing wrong and no invariant was violated at the
+  time. It is still a real leak on disk worth surfacing, and `pack build` /
+  `sync` regenerate it away. Same rule as D-v0.3.22 — a check that turns red
+  because history happened is a broken check.
+
+- **D-v0.3.45 — No explicit indexes are added.** This schema has never carried
+  a `CREATE INDEX`; every hot column is scanned. The graph tables follow that
+  established design rather than introducing a new one: the UNIQUE constraints
+  already provide the implicit indexes the traversal's outbound lookups use,
+  the caps bound every traversal, and a personal ledger lacks the row count
+  that would make this matter. Fewer objects also means fewer things the
+  migration must replicate exactly — fresh/upgrade identity is preserved by
+  construction rather than by vigilance.
+
+- **D-v0.3.46 — Classification increases only; downgrades and authorization
+  policy belong to U-S6.** `memory classify` raises a claim's sensitivity,
+  treats same-state as a no-op that writes nothing and emits no event, and
+  REFUSES to lower one. Reducing the protection on a claim is an authorization
+  decision, and U-M3 ships no authorization system to answer it with.
+
+- **D-v0.3.47 — U-M4 (workflow), U-M5 (retrieval evaluation) and U-M6
+  (receipts) remain deferred.** U-M3 ships the graph those units need and none
+  of their behavior: no proposal/approve/reject/contest, no automatic
+  contradiction detection, no automatic source extraction, no interviews, no
+  embeddings or vector retrieval, no graph ranking, no Context Hydration
+  Receipts, and no agent-written memory. Packs do no graph expansion at all.
+  Storage that anticipates a workflow is cheap; a workflow invented ahead of
+  its unit is a design nobody reviewed.

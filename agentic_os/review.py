@@ -24,6 +24,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from . import ids, obsidian
+from .models import MEMORY_SENSITIVITY_RESTRICTED
 from .utils import AosError
 
 NOTES_HEADING = b"## Notes"
@@ -35,6 +36,22 @@ STALE_MEMORY_DAYS = 30
 
 def _one_line(text: str) -> str:
     return " ".join(text.split())
+
+
+def _memory_label(row: sqlite3.Row) -> str:
+    """A claim's key, or the placeholder if the claim is restricted (U-M3
+    M3.2/M3.13).
+
+    A review note is a GENERATED CONTEXT SUMMARY that lands in the vault and
+    syncs wherever the vault syncs, so a restricted claim's key must not reach
+    one. The claim is still listed — an operator whose restricted claim has
+    gone stale needs to know that, and the wikilink still resolves — with its
+    id, confidence and staleness reason, which are the facts the section is
+    for.
+    """
+    if row["sensitivity"] == MEMORY_SENSITIVITY_RESTRICTED:
+        return f"({MEMORY_SENSITIVITY_RESTRICTED})"
+    return _one_line(row["key"])
 
 
 def _notes_tail(data: bytes) -> bytes | None:
@@ -124,8 +141,8 @@ def _head_text(
 
     stale_memory = []
     for row in conn.execute(
-        "SELECT m.id, m.key, m.confidence, m.valid_until, m.updated_at "
-        "FROM memory m "
+        "SELECT m.id, m.key, m.confidence, m.valid_until, m.updated_at, "
+        "m.sensitivity FROM memory m "
         "WHERE ((m.valid_until IS NOT NULL "
         "AND substr(m.valid_until, 1, 10) <= ?) "
         "OR (m.valid_until IS NULL AND substr(m.updated_at, 1, 10) <= ?)) "
@@ -138,7 +155,7 @@ def _head_text(
         else:
             detail = f"not updated since {row['updated_at']}"
         stale_memory.append(
-            f"- [[{memory_hid}]] {_one_line(row['key'])} "
+            f"- [[{memory_hid}]] {_memory_label(row)} "
             f"· [{row['confidence']}] · {detail}"
         )
 
@@ -217,10 +234,11 @@ def _head_text(
     # tests), refresh candidates are LIVE rows only: superseded and retired
     # rows need no refresh — their successors do.
     memory_refresh = [
-        f"- [[{ids.render_id('memory', row['id'])}]] {_one_line(row['key'])} "
+        f"- [[{ids.render_id('memory', row['id'])}]] {_memory_label(row)} "
         f"· [{row['confidence']}] · not updated since {row['updated_at']}"
         for row in conn.execute(
-            "SELECT m.id, m.key, m.confidence, m.updated_at FROM memory m "
+            "SELECT m.id, m.key, m.confidence, m.updated_at, m.sensitivity "
+            "FROM memory m "
             "WHERE m.superseded_by IS NULL "
             "AND (m.valid_until IS NULL OR substr(m.valid_until, 1, 10) > ?) "
             "AND substr(m.updated_at, 1, 10) <= ? "

@@ -15,7 +15,15 @@ import traceback
 from pathlib import Path
 
 from . import db, ids, obsidian, ops, power, utils
-from .models import MEMORY_STATUSES
+from .models import (
+    MEMORY_EDGE_RELATIONS,
+    MEMORY_SENSITIVITIES,
+    MEMORY_SENSITIVITY_DEFAULT,
+    MEMORY_SENSITIVITY_RESTRICTED,
+    MEMORY_SOURCE_KINDS,
+    MEMORY_SOURCE_RELATIONS,
+    MEMORY_STATUSES,
+)
 from .utils import AosError
 
 
@@ -550,6 +558,7 @@ def cmd_memory_add(args) -> int:
             supersedes_id=supersedes_id,
             pin=args.pin,
             evidence_ids=evidence_ids,
+            sensitivity=args.sensitivity,
         )
         print(ids.render_id("memory", item.id))
     return 0
@@ -563,6 +572,12 @@ def _memory_state(item: dict) -> str:
     if item["status"] != "live":
         return f"{item['status']} {_dash(item['valid_until'])}"
     if not item["live"]:
+        # `live` is now the full eligibility answer, so a live claim can be
+        # ineligible for two different reasons. Say which: a restricted claim
+        # reported as `live·expired` would send its owner looking for an
+        # expiry date that does not exist (M3.2).
+        if item["sensitivity"] == MEMORY_SENSITIVITY_RESTRICTED:
+            return "live·restricted"
         return f"live·expired {_dash(item['valid_until'])}"
     return "live"
 
@@ -584,12 +599,16 @@ def cmd_memory_list(args) -> int:
             print("(no memory)")
             return 0
         for item in items:
+            # ops.memory_public has already reduced a restricted claim to
+            # metadata — key, value and source are the placeholder by the time
+            # they reach here, so this line cannot print one by accident.
             value_one_line = " ".join(item["value_md"].split())
             print(
                 f"{item['id']:<8} {'PIN' if item['pinned'] else '   '} "
                 f"{item['scope']:<8} "
                 f"{_dash(item['project']):<16} {item['kind']:<11} "
-                f"[{item['confidence']}] {_memory_state(item):<26} "
+                f"[{item['confidence']}] {item['sensitivity']:<13} "
+                f"{_memory_state(item):<26} "
                 f"{item['key']}: {value_one_line}"
             )
     return 0
@@ -605,6 +624,7 @@ def cmd_memory_show(args) -> int:
         print(f"{doc['id']} {doc['key']}")
         print(f"  status:     {doc['status']}")
         print(f"  pinned:     {'yes' if doc['pinned'] else 'no'}")
+        print(f"  sensitive:  {doc['sensitivity']}")
         print(f"  retrieved:  {'yes' if doc['live'] else 'no'} (normal packs)")
         print(f"  scope:      {doc['scope']}")
         print(f"  project:    {_dash(doc['project'])}")
@@ -664,6 +684,260 @@ def cmd_memory_retire(args) -> int:
             f"{ids.render_id('memory', item.id)} retired "
             f"(valid_until {item.valid_until})"
         )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# U-M3 memory graph (contract M3.8)
+#
+# Every command below prints ids, closed enum names, timestamps, counts and
+# bounded hash prefixes. None prints a claim key or value, a source locator or
+# provenance, or an evidence ref — and none opens, fetches or executes
+# anything a source points at (D-v0.3.47).
+
+def cmd_memory_classify(args) -> int:
+    memory_id = ids.parse_id(args.id, "memory")
+    with _ledger(args) as (aos_dir, conn):
+        item, changed = ops.classify_memory(
+            conn, memory_id=memory_id, level=args.level
+        )
+        hid = ids.render_id("memory", item.id)
+        if changed:
+            print(f"{hid} classified {item.sensitivity}")
+        else:
+            print(
+                f"{hid} is already {item.sensitivity}; nothing changed."
+            )
+    return 0
+
+
+def cmd_memory_source_add(args) -> int:
+    evidence_id = (
+        ids.parse_id(args.evidence, "evidence")
+        if args.evidence is not None
+        else None
+    )
+    with _ledger(args) as (aos_dir, conn):
+        item = ops.add_memory_source(
+            conn,
+            kind=args.kind,
+            project_slug=args.project,
+            evidence_id=evidence_id,
+            locator=args.locator,
+            provenance=args.provenance,
+            sensitivity=args.sensitivity,
+            observed_at=args.observed_at,
+            valid_from=args.valid_from,
+            valid_until=args.valid_until,
+        )
+        print(ids.render_id("memory_source", item.id))
+    return 0
+
+
+def _source_line(doc: dict) -> str:
+    return (
+        f"{doc['id']:<9} {doc['kind']:<9} {_dash(doc['project']):<16} "
+        f"{doc['sensitivity']:<13} {'active' if doc['active'] else 'expired':<8} "
+        f"{doc['observed_at']:<21} {doc['link_count']} link(s)  "
+        f"{doc['hash_prefix']}…"
+    )
+
+
+def cmd_memory_source_list(args) -> int:
+    with _ledger(args) as (aos_dir, conn):
+        docs = ops.list_memory_sources(
+            conn,
+            project_slug=args.project,
+            kind=args.kind,
+            active_only=args.active_only,
+        )
+        if args.json:
+            _print_json({"sources": docs})
+            return 0
+        if not docs:
+            print("(no memory sources)")
+            return 0
+        for doc in docs:
+            print(_source_line(doc))
+    return 0
+
+
+def cmd_memory_source_show(args) -> int:
+    source_id = ids.parse_id(args.id, "memory_source")
+    with _ledger(args) as (aos_dir, conn):
+        doc = ops.show_memory_source(conn, source_id)
+        if args.json:
+            _print_json(doc)
+            return 0
+        print(f"{doc['id']} {doc['kind']}")
+        print(f"  project:     {_dash(doc['project'])}")
+        print(f"  sensitivity: {doc['sensitivity']}")
+        # The evidence ROW is named. Its claim, ref and body are not read, and
+        # neither is anything it points at (M3.8).
+        print(f"  evidence:    {_dash(doc['evidence'])}")
+        print(f"  observed:    {doc['observed_at']}")
+        print(f"  valid:       {_dash(doc['valid_from'])} → {_dash(doc['valid_until'])}")
+        print(f"  active:      {'yes' if doc['active'] else 'no'}")
+        print(f"  created:     {doc['created_at']}")
+        print(f"  hash:        {doc['hash_prefix']}… ({doc['integrity']})")
+        if doc["links"]:
+            print("  links:")
+            for link in doc["links"]:
+                print(f"    {link['id']} {link['relation']:<12} {link['memory']}")
+        else:
+            print("  links:       -")
+        # No locator and no provenance line, by contract. The source's
+        # identity is its id; what it points at stays in the ledger.
+    return 0
+
+
+def cmd_memory_source_link(args) -> int:
+    memory_id = ids.parse_id(args.id, "memory")
+    source_id = ids.parse_id(args.source_id, "memory_source")
+    with _ledger(args) as (aos_dir, conn):
+        link, changed = ops.link_memory_source(
+            conn, memory_id=memory_id, source_id=source_id, relation=args.relation
+        )
+        mhid = ids.render_id("memory", memory_id)
+        shid = ids.render_id("memory_source", source_id)
+        if changed:
+            print(
+                f"{ids.render_id('memory_source_link', link.id)} "
+                f"{mhid} ←{link.relation}— {shid}"
+            )
+        else:
+            print(
+                f"{mhid} is already linked to {shid} as '{link.relation}'; "
+                "nothing changed."
+            )
+    return 0
+
+
+def cmd_memory_edge_add(args) -> int:
+    from_id = ids.parse_id(args.from_id, "memory")
+    to_id = ids.parse_id(args.to_id, "memory")
+    with _ledger(args) as (aos_dir, conn):
+        edge, changed = ops.add_memory_edge(
+            conn,
+            from_memory_id=from_id,
+            to_memory_id=to_id,
+            relation=args.relation,
+            valid_from=args.valid_from,
+            valid_until=args.valid_until,
+        )
+        hid = ids.render_id("memory_edge", edge.id)
+        arrow = (
+            f"{ids.render_id('memory', edge.from_memory_id)} "
+            f"—{edge.relation}→ {ids.render_id('memory', edge.to_memory_id)}"
+        )
+        if changed:
+            print(f"{hid} {arrow}")
+        else:
+            print(f"{hid} already records {arrow}; nothing changed.")
+    return 0
+
+
+def _edge_line(doc: dict) -> str:
+    return (
+        f"{doc['id']:<9} {doc['from']:<8} {doc['relation']:<11} {doc['to']:<8} "
+        f"{'active' if doc['active'] else 'expired':<8} "
+        f"{doc['created_at']:<21} {doc['hash_prefix']}…"
+    )
+
+
+def cmd_memory_edge_list(args) -> int:
+    with _ledger(args) as (aos_dir, conn):
+        docs = ops.list_memory_edges(
+            conn,
+            relation=args.relation,
+            project_slug=args.project,
+            active_only=args.active_only,
+        )
+        if args.json:
+            _print_json({"edges": docs})
+            return 0
+        if not docs:
+            print("(no memory edges)")
+            return 0
+        for doc in docs:
+            print(_edge_line(doc))
+    return 0
+
+
+def _node_line(node: dict) -> str:
+    if node.get("missing"):
+        return f"  {node['id']:<8} depth {node['depth']}  (missing claim)"
+    return (
+        f"  {node['id']:<8} depth {node['depth']}  {node['status']:<11} "
+        f"{node['sensitivity']:<13} {'live' if node['live'] else 'not retrieved':<14}"
+        f"{'PIN' if node['pinned'] else ''}"
+    )
+
+
+def cmd_memory_graph(args) -> int:
+    memory_id = ids.parse_id(args.id, "memory")
+    with _ledger(args) as (aos_dir, conn):
+        doc = ops.memory_graph(conn, memory_id=memory_id, depth=args.depth)
+        if args.json:
+            _print_json(doc)
+            return 0
+        print(f"{doc['memory']} neighbourhood (depth {doc['depth']})")
+        print()
+        print("nodes:")
+        for node in doc["nodes"]:
+            print(_node_line(node))
+        print()
+        print("edges:")
+        if not doc["edges"]:
+            print("  (none)")
+        for edge in doc["edges"]:
+            print(
+                f"  {edge['id']:<9} {edge['from']:<8} {edge['relation']:<11} "
+                f"{edge['to']:<8} {edge['direction']:<4} depth {edge['depth']}  "
+                f"{'active' if edge['active'] else 'expired'}"
+            )
+        if doc["truncated"]:
+            # Bounded AND honest about it: a silent stop reads as "that is the
+            # whole neighbourhood" (D-v0.3.42).
+            print()
+            print(
+                f"(truncated at the traversal caps: "
+                f"{doc['limits']['nodes']} nodes / {doc['limits']['edges']} "
+                "edges. This is a bounded view, not the whole graph.)"
+            )
+    return 0
+
+
+def cmd_memory_contradictions(args) -> int:
+    with _ledger(args) as (aos_dir, conn):
+        docs = ops.list_contradictions(
+            conn, project_slug=args.project, include_inactive=args.all
+        )
+        if args.json:
+            _print_json({"contradictions": docs})
+            return 0
+        if not docs:
+            scope = "" if args.all else "active "
+            print(f"(no {scope}contradictions)")
+            return 0
+        for doc in docs:
+            print(
+                f"{doc['id']:<9} {doc['claims'][0]['id']} ⇄ "
+                f"{doc['claims'][1]['id']}  "
+                f"{'active' if doc['active'] else 'expired'}"
+            )
+            for claim in doc["claims"]:
+                if claim.get("missing"):
+                    print(f"    {claim['id']:<8} (missing claim)")
+                    continue
+                print(
+                    f"    {claim['id']:<8} {claim['status']:<11} "
+                    f"{claim['sensitivity']:<13} "
+                    f"{'retrieved' if claim['live'] else 'not retrieved'}"
+                )
+        # Deliberately no verdict line: this command reports that two claims
+        # were declared to disagree. Which one is true is a human's call, and
+        # a tool that guessed here would be believed (D-v0.3.38).
     return 0
 
 
@@ -1439,6 +1713,13 @@ def build_parser() -> _Parser:
     p_memory_add.add_argument("--valid-until", dest="valid_until", default=None)
     p_memory_add.add_argument("--supersedes", default=None)
     p_memory_add.add_argument(
+        "--sensitivity",
+        choices=list(MEMORY_SENSITIVITIES),
+        default=MEMORY_SENSITIVITY_DEFAULT,
+        help="claim sensitivity (default: internal). 'restricted' claims "
+        "never enter context packs, search snippets or mirror bodies.",
+    )
+    p_memory_add.add_argument(
         "--pin", action="store_true",
         help="pin the new claim (ordering only; refused if it would already "
         "be ineligible for retrieval)",
@@ -1497,6 +1778,140 @@ def build_parser() -> _Parser:
     )
     p_memory_retire.add_argument("id")
     p_memory_retire.set_defaults(func=cmd_memory_retire)
+
+    # --- U-M3 memory graph (contract M3.8)
+
+    p_memory_classify = memory_sub.add_parser(
+        "classify",
+        help="raise a claim's sensitivity (increases only; U-S6 owns "
+        "down-classification)",
+    )
+    p_memory_classify.add_argument("id", metavar="MEMORY_ID")
+    p_memory_classify.add_argument(
+        "level", metavar="LEVEL", choices=list(MEMORY_SENSITIVITIES)
+    )
+    p_memory_classify.set_defaults(func=cmd_memory_classify)
+
+    p_memory_source = memory_sub.add_parser(
+        "source", help="normalized provenance sources for memory claims"
+    )
+    source_sub = p_memory_source.add_subparsers(
+        dest="subsubcommand", metavar="SUBCOMMAND", required=True
+    )
+    p_source_add = source_sub.add_parser(
+        "add",
+        help="record a provenance source (references are inert: never "
+        "opened, fetched or executed)",
+    )
+    p_source_add.add_argument(
+        "--kind", required=True, choices=list(MEMORY_SOURCE_KINDS)
+    )
+    p_source_add.add_argument("-p", "--project", default=None)
+    p_source_add.add_argument(
+        "--evidence", default=None,
+        help="required for --kind evidence, forbidden otherwise",
+    )
+    p_source_add.add_argument(
+        "--locator", default=None,
+        help="required for every kind except evidence, forbidden for it",
+    )
+    p_source_add.add_argument("--provenance", default="human")
+    p_source_add.add_argument(
+        "--sensitivity",
+        choices=list(MEMORY_SENSITIVITIES),
+        default=MEMORY_SENSITIVITY_DEFAULT,
+    )
+    p_source_add.add_argument("--observed-at", dest="observed_at", default=None)
+    p_source_add.add_argument("--valid-from", dest="valid_from", default=None)
+    p_source_add.add_argument("--valid-until", dest="valid_until", default=None)
+    p_source_add.set_defaults(func=cmd_memory_source_add)
+
+    p_source_list = source_sub.add_parser(
+        "list", help="list provenance sources (metadata only)"
+    )
+    p_source_list.add_argument("-p", "--project", default=None)
+    p_source_list.add_argument("--kind", default=None)
+    p_source_list.add_argument(
+        "--active-only", dest="active_only", action="store_true"
+    )
+    p_source_list.add_argument("--json", action="store_true")
+    p_source_list.set_defaults(func=cmd_memory_source_list)
+
+    p_source_show = source_sub.add_parser(
+        "show",
+        help="one source's metadata and integrity verdict (never its "
+        "locator or provenance)",
+    )
+    p_source_show.add_argument("id", metavar="SOURCE_ID")
+    p_source_show.add_argument("--json", action="store_true")
+    p_source_show.set_defaults(func=cmd_memory_source_show)
+
+    p_source_link = source_sub.add_parser(
+        "link", help="link a source to a memory claim"
+    )
+    p_source_link.add_argument("id", metavar="MEMORY_ID")
+    p_source_link.add_argument("source_id", metavar="SOURCE_ID")
+    p_source_link.add_argument(
+        "--relation", required=True, choices=list(MEMORY_SOURCE_RELATIONS)
+    )
+    p_source_link.set_defaults(func=cmd_memory_source_link)
+
+    p_memory_edge = memory_sub.add_parser(
+        "edge", help="typed relationships between memory claims"
+    )
+    edge_sub = p_memory_edge.add_subparsers(
+        dest="subsubcommand", metavar="SUBCOMMAND", required=True
+    )
+    p_edge_add = edge_sub.add_parser(
+        "add",
+        help="record a relationship (descriptive only: triggers no workflow "
+        "and decides nothing)",
+    )
+    p_edge_add.add_argument("from_id", metavar="FROM_MEMORY_ID")
+    p_edge_add.add_argument("to_id", metavar="TO_MEMORY_ID")
+    p_edge_add.add_argument(
+        "--relation", required=True, choices=list(MEMORY_EDGE_RELATIONS)
+    )
+    p_edge_add.add_argument("--valid-from", dest="valid_from", default=None)
+    p_edge_add.add_argument("--valid-until", dest="valid_until", default=None)
+    p_edge_add.set_defaults(func=cmd_memory_edge_add)
+
+    p_edge_list = edge_sub.add_parser("list", help="list memory relationships")
+    p_edge_list.add_argument("--relation", default=None)
+    p_edge_list.add_argument("-p", "--project", default=None)
+    p_edge_list.add_argument(
+        "--active-only", dest="active_only", action="store_true"
+    )
+    p_edge_list.add_argument("--json", action="store_true")
+    p_edge_list.set_defaults(func=cmd_memory_edge_list)
+
+    p_memory_graph = memory_sub.add_parser(
+        "graph",
+        help="a bounded, read-only neighbourhood of one claim (ids and "
+        "relations only)",
+    )
+    p_memory_graph.add_argument("id", metavar="MEMORY_ID")
+    p_memory_graph.add_argument(
+        "--depth",
+        type=int,
+        default=1,
+        choices=list(range(1, ops.MAX_GRAPH_DEPTH + 1)),
+    )
+    p_memory_graph.add_argument("--json", action="store_true")
+    p_memory_graph.set_defaults(func=cmd_memory_graph)
+
+    p_memory_contra = memory_sub.add_parser(
+        "contradictions",
+        help="list declared contradictions (reports; never decides which "
+        "claim is true)",
+    )
+    p_memory_contra.add_argument("-p", "--project", default=None)
+    p_memory_contra.add_argument(
+        "--all", action="store_true",
+        help="include expired contradiction edges (default: active only)",
+    )
+    p_memory_contra.add_argument("--json", action="store_true")
+    p_memory_contra.set_defaults(func=cmd_memory_contradictions)
 
     p_agent = sub.add_parser(
         "agent", help="agent registry (records only; never executes agents)"

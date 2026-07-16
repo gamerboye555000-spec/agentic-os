@@ -32,6 +32,53 @@ MEMORY_STATUSES = ("proposed", "live", "contested", "quarantined", "retired")
 #: The only status ordinary retrieval will look at (M2.7).
 MEMORY_STATUS_LIVE = "live"
 MEMORY_STATUS_RETIRED = "retired"
+
+#: U-M3 sensitivity (M3.2, D-v0.3.31). Closed here AND by a CHECK constraint,
+#: like every other memory vocabulary. This tuple is ORDERED, and the order is
+#: authoritative: it is what "classification increases only" and "a source's
+#: sensitivity must not exceed its claim's" are expressed in. Reordering it
+#: would silently redefine both rules, so it is never sorted or rebuilt.
+MEMORY_SENSITIVITIES = ("public", "internal", "confidential", "restricted")
+#: The default (D-v0.3.32): `public` is a deliberate act of publication, not
+#: something a claim falls into by omission.
+MEMORY_SENSITIVITY_DEFAULT = "internal"
+#: The level excluded from every automatic context surface (M3.2).
+MEMORY_SENSITIVITY_RESTRICTED = "restricted"
+
+#: U-M3 provenance sources (M3.3). `evidence` is structurally different from
+#: every other kind: it names a ledger row, not an inert external string.
+MEMORY_SOURCE_KINDS = (
+    "evidence",
+    "file",
+    "url",
+    "command",
+    "human",
+    "agent",
+    "artifact",
+)
+MEMORY_SOURCE_KIND_EVIDENCE = "evidence"
+
+#: How a source relates to a claim (M3.4). Descriptive only: U-M3 records what
+#: the operator asserts and judges none of it.
+MEMORY_SOURCE_RELATIONS = ("supports", "disputes", "context", "derived_from")
+
+#: How one claim relates to another (M3.5). Note the absence of a supersession
+#: relation: `memory.superseded_by` is the canonical lifecycle mechanism and
+#: U-M3 does not duplicate it as a graph edge (D-v0.3.37).
+MEMORY_EDGE_RELATIONS = (
+    "supports",
+    "contradicts",
+    "refines",
+    "depends_on",
+    "related",
+)
+#: Symmetric relations: A↔B and B↔A are ONE logical edge, canonicalized as
+#: lower memory id first (D-v0.3.36). The rest preserve their direction.
+MEMORY_EDGE_SYMMETRIC = ("contradicts", "related")
+#: A contradiction IS an active edge with this relation — there is no second
+#: table and no verdict column (D-v0.3.38).
+MEMORY_EDGE_CONTRADICTS = "contradicts"
+
 AGENT_KINDS = ("local", "cloud", "human", "generic")
 
 #: All user-input validators anchor with \Z, never $ (D-v0.2.3) — '$' admits
@@ -48,6 +95,22 @@ def validate_enum(value: str, allowed: tuple[str, ...], what: str) -> str:
     if value not in allowed:
         raise AosError(f"Unknown {what} {value!r}. Allowed: {'|'.join(allowed)}")
     return value
+
+
+def sensitivity_rank(level: str) -> int:
+    """Where `level` sits on the public → restricted ladder (M3.2).
+
+    Raises rather than returning a sentinel: a caller comparing an unknown
+    level would silently get an ordering answer, and every rule built on this
+    (classify-increases-only, source-not-above-claim) would quietly weaken.
+    """
+    try:
+        return MEMORY_SENSITIVITIES.index(level)
+    except ValueError:
+        raise AosError(
+            f"Unknown memory sensitivity {level!r}. Allowed: "
+            + "|".join(MEMORY_SENSITIVITIES)
+        )
 
 
 def validate_slug(slug: str) -> str:
@@ -172,10 +235,10 @@ class Handoff(_Row):
 
 @dataclass
 class MemoryItem(_Row):
-    """A v2 memory claim. Every v1 field keeps its v1 meaning (D-v0.3.15):
+    """A v3 memory claim. Every v1 field keeps its v1 meaning (D-v0.3.15):
     `kind` is the closed claim type, `key` the stable claim key/subject,
-    `value_md` the human-readable claim value. U-M2 adds curation state, not
-    a new data model."""
+    `value_md` the human-readable claim value. U-M2 added curation state and
+    U-M3 adds sensitivity — neither is a new data model."""
 
     id: int
     scope: str
@@ -191,6 +254,63 @@ class MemoryItem(_Row):
     updated_at: str
     status: str
     pinned: int
+    sensitivity: str
+    content_sha256: str
+
+
+@dataclass
+class MemorySource(_Row):
+    """A normalized provenance record (U-M3, M3.3).
+
+    Deliberately holds no text copied from what it references (D-v0.3.34): an
+    `evidence` source carries `evidence_id` and nothing else about that row;
+    every other kind carries an INERT `locator` string that no command in this
+    system ever opens, fetches or executes (D-v0.3.47).
+    """
+
+    id: int
+    project_id: int | None
+    source_kind: str
+    evidence_id: int | None
+    locator: str | None
+    provenance: str
+    sensitivity: str
+    observed_at: str
+    valid_from: str | None
+    valid_until: str | None
+    created_at: str
+    content_sha256: str
+
+
+@dataclass
+class MemorySourceLink(_Row):
+    """A claim↔source link (U-M3, M3.4). Two ids, a relation, a timestamp and
+    a hash — never a copy of the source's or the claim's text."""
+
+    id: int
+    memory_id: int
+    source_id: int
+    relation: str
+    created_at: str
+    content_sha256: str
+
+
+@dataclass
+class MemoryEdge(_Row):
+    """A typed claim↔claim relationship (U-M3, M3.5).
+
+    Descriptive only: an edge triggers no workflow, resolves nothing, and
+    decides nothing. A `contradicts` edge records that a human said two claims
+    disagree — not which one is true (D-v0.3.38).
+    """
+
+    id: int
+    from_memory_id: int
+    to_memory_id: int
+    relation: str
+    valid_from: str | None
+    valid_until: str | None
+    created_at: str
     content_sha256: str
 
 
@@ -241,12 +361,15 @@ class Event(_Row):
 
 
 # ---------------------------------------------------------------------------
-# Memory claim hash vocabulary (U-M2, contract M2.6). The hash ITSELF is
-# computed in ops.memory_claim_digest: it needs U-X1's canonical serializer,
-# and protocols imports this module, so the dependency can only run one way.
+# Memory record hash vocabulary (U-M2 M2.6; U-M3 M3.6). The hashes THEMSELVES
+# are computed in ops: they need U-X1's canonical serializer, and protocols
+# imports this module, so the dependency can only run one way.
 
-#: A claim hash is exactly 64 lowercase hex characters. Uppercase, blank,
+#: A record hash is exactly 64 lowercase hex characters. Uppercase, blank,
 #: truncated and "sha256:"-prefixed spellings are malformed, not equivalent.
+#: One spelling rule for all four U-M3 record kinds (claim, source, link,
+#: edge) — a hash is a hash, and a second rule would only be a second thing
+#: to get wrong.
 CLAIM_HASH_RE = re.compile(r"^[0-9a-f]{64}\Z", re.ASCII)
 
 #: Shown when a hash must be named in human output: enough to correlate two
@@ -267,9 +390,13 @@ def hash_prefix(value: object) -> str:
 
 
 class ClaimHashError(AosError):
-    """A claim's stored fields cannot be hashed at all.
+    """A memory record's stored fields cannot be hashed at all.
 
     Distinct from a mismatch: the row holds something no honest write could
     have produced (a BLOB in a TEXT column, a non-integer pin). Carries the
-    memory id and the FIELD NAME only — never the value, whatever it is.
+    record id and the FIELD NAME only — never the value, whatever it is.
+
+    Raised for all four U-M3 record kinds. The name is U-M2's and stays: the
+    condition it describes is identical for a source, a link and an edge, and
+    four exception classes for one condition would only make callers choose.
     """

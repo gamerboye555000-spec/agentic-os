@@ -377,14 +377,100 @@ def handoff_note(handoff) -> str:
     return "\n".join(lines) + "\n"
 
 
-def memory_note(item, project_slug: str | None, evidence_ids=()) -> str:
+def _restricted_memory_note(item, project_slug: str | None, counts: dict) -> str:
+    """A restricted claim's note: METADATA ONLY (M3.13).
+
+    The mirror is a vault of plain files — synced, indexed by Obsidian, opened
+    by whatever else the human has pointed at that folder, and backed up
+    wherever that folder goes. A restricted claim's key, value, source and
+    evidence links do not belong in one. Its ID does: the note exists so the
+    claim is not invisible, and so a wikilink to it still resolves.
+
+    Bounded graph COUNTS are safe and useful here — "3 sources, 1 active
+    contradiction" says nothing about what the claim contains.
+    """
+    memory_hid = ids.render_id("memory", item.id)
+    head = frontmatter(
+        [
+            ("type", "memory"),
+            ("aos_id", memory_hid),
+            ("scope", item.scope),
+            ("project", project_slug),
+            ("kind", item.kind),
+            ("status", item.status),
+            ("pinned", "true" if item.pinned else "false"),
+            ("sensitivity", item.sensitivity),
+            ("confidence", item.confidence),
+            ("valid_from", item.valid_from),
+            ("valid_until", item.valid_until),
+            (
+                "superseded_by",
+                ids.render_id("memory", item.superseded_by)
+                if item.superseded_by
+                else None,
+            ),
+            ("evidence_count", str(counts["evidence"])),
+            ("source_count", str(counts["sources"])),
+            ("active_edge_count", str(counts["active_edges"])),
+            ("hash_prefix", models.hash_prefix(item.content_sha256)),
+            ("updated", item.updated_at),
+        ],
+        ["aos/memory", "aos/restricted"],
+    )
+    lines = [head, "", f"# {memory_hid}", ""]
+    lines += [f"- status: {item.status}"]
+    lines += [f"- sensitivity: {item.sensitivity}"]
+    lines += [f"- scope: {item.scope}"]
+    if project_slug:
+        lines += [f"- project: [[{project_slug}]]"]
+    lines += [f"- kind: {item.kind}"]
+    lines += [f"- confidence: {item.confidence}"]
+    lines += [f"- valid: {item.valid_from} → {item.valid_until or '-'}"]
+    if item.superseded_by:
+        lines += [
+            f"- superseded by: [[{ids.render_id('memory', item.superseded_by)}]]"
+        ]
+    lines += [f"- evidence: {counts['evidence']} link(s)"]
+    lines += [
+        f"- provenance: {counts['sources']} source(s), "
+        f"{counts['active_sources']} active"
+    ]
+    lines += [
+        f"- relationships: {counts['active_edges']} active, "
+        f"{counts['active_contradictions']} contradiction(s)"
+    ]
+    lines += [f"- hash: {models.hash_prefix(item.content_sha256)}…"]
+    lines += _section(
+        "Value",
+        "This claim is classified `restricted`. Its key, value, source and "
+        "evidence links are not projected into the mirror.\n\n"
+        f"Inspect it deliberately: `python aos.py memory show {memory_hid}`",
+    )
+    return "\n".join(lines) + "\n"
+
+
+def memory_note(item, project_slug: str | None, evidence_ids=(), counts=None) -> str:
     """A memory claim's note.
 
     U-M2 adds curation state: status, pin, evidence links (as ids — the note
     never copies an evidence claim, ref or body) and a BOUNDED hash prefix.
     The full hash is `memory show`'s business; a mirror note is a projection,
     not an integrity oracle.
+
+    U-M3 adds sensitivity, bounded graph counts, and one hard branch: a
+    `restricted` claim renders as metadata only. Public, internal and
+    confidential claims keep exactly the projection they had.
     """
+    if counts is None:
+        counts = {
+            "sources": 0,
+            "active_sources": 0,
+            "active_edges": 0,
+            "active_contradictions": 0,
+        }
+    counts = {**counts, "evidence": len(list(evidence_ids))}
+    if item.sensitivity == models.MEMORY_SENSITIVITY_RESTRICTED:
+        return _restricted_memory_note(item, project_slug, counts)
     memory_hid = ids.render_id("memory", item.id)
     evidence_hids = [ids.render_id("evidence", e) for e in evidence_ids]
     head = frontmatter(
@@ -397,6 +483,7 @@ def memory_note(item, project_slug: str | None, evidence_ids=()) -> str:
             ("key", item.key),
             ("status", item.status),
             ("pinned", "true" if item.pinned else "false"),
+            ("sensitivity", item.sensitivity),
             ("confidence", item.confidence),
             ("source", item.source),
             ("valid_from", item.valid_from),
@@ -408,6 +495,8 @@ def memory_note(item, project_slug: str | None, evidence_ids=()) -> str:
                 else None,
             ),
             ("evidence_count", str(len(evidence_hids))),
+            ("source_count", str(counts["sources"])),
+            ("active_edge_count", str(counts["active_edges"])),
             ("hash_prefix", models.hash_prefix(item.content_sha256)),
             ("updated", item.updated_at),
         ],
@@ -416,6 +505,7 @@ def memory_note(item, project_slug: str | None, evidence_ids=()) -> str:
     lines = [head, "", f"# {memory_hid} {_one_line(item.key)}", ""]
     lines += [f"- status: {item.status}"]
     lines += [f"- pinned: {'yes' if item.pinned else 'no'}"]
+    lines += [f"- sensitivity: {item.sensitivity}"]
     lines += [f"- scope: {item.scope}"]
     if project_slug:
         lines += [f"- project: [[{project_slug}]]"]

@@ -4,9 +4,9 @@ transaction helper that carries the domain-row + event-row invariant.
 Rules honored here:
 - WAL journal mode set at init.
 - PRAGMA foreign_keys=ON on EVERY connection; busy_timeout >= 3000ms.
-- meta.schema_version = "2" at init; a different version is a hard stop.
+- meta.schema_version = "3" at init; a different version is a hard stop.
   Normal commands NEVER auto-migrate: an older database is refused here and
-  the human is pointed at `migrate status/plan/apply` (U-M2, M2.5).
+  the human is pointed at `migrate status/plan/apply` (U-M2 M2.5; U-M3 M3.1).
 """
 
 from __future__ import annotations
@@ -17,16 +17,17 @@ from pathlib import Path
 
 from .utils import DB_FILENAME, AosError
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
-#: The v2 memory claim (U-M2, contract M2.2). The table name is parameterized
-#: for exactly one reason: the 1→2 migration builds the new table under a
-#: temporary name and renames it, so a MIGRATED table is created from this
-#: same DDL as a freshly initialized one and the two cannot drift.
+#: The v3 memory claim (U-M2 M2.2; U-M3 M3.2). The table name is parameterized
+#: for exactly one reason: the 1→2 and 2→3 migrations build the new table
+#: under a temporary name and rename it, so a MIGRATED table is created from
+#: this same DDL as a freshly initialized one and the two cannot drift.
 #:
 #: `content_sha256` has NO default on purpose — a claim without its integrity
 #: hash must be impossible to insert, so there is nothing for a careless
-#: writer to fall into.
+#: writer to fall into. `sensitivity` sits before it for the same reason the
+#: U-M2 columns do: the hash column stays last.
 MEMORY_CLAIM_DDL = """CREATE TABLE {table}(
   id INTEGER PRIMARY KEY,
   scope TEXT NOT NULL,
@@ -44,6 +45,8 @@ MEMORY_CLAIM_DDL = """CREATE TABLE {table}(
     CHECK (status IN ('proposed','live','contested','quarantined','retired')),
   pinned INTEGER NOT NULL DEFAULT 0
     CHECK (pinned IN (0, 1)),
+  sensitivity TEXT NOT NULL DEFAULT 'internal'
+    CHECK (sensitivity IN ('public','internal','confidential','restricted')),
   content_sha256 TEXT NOT NULL
 )"""
 
@@ -65,8 +68,105 @@ MEMORY_EVIDENCE_DDL = """CREATE TABLE {table}(
   FOREIGN KEY(evidence_id) REFERENCES evidence(id)
 )"""
 
+#: Normalized provenance sources (U-M3, M3.3).
+#:
+#: The structural CHECK is the point of the table: `evidence` sources name a
+#: ledger row and NOTHING else about it, every other kind carries an inert
+#: locator string. Enforcing that at the storage boundary as well as in `ops`
+#: means a row that copied an evidence ref into `locator`, or invented a
+#: locator for an evidence source, cannot exist — not even via raw SQL.
+#:
+#: `valid_from <= valid_until` is a CHECK for the same reason: an inverted
+#: window is not a claim anyone can make about time.
+MEMORY_SOURCES_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER,
+  source_kind TEXT NOT NULL
+    CHECK (source_kind IN
+      ('evidence','file','url','command','human','agent','artifact')),
+  evidence_id INTEGER,
+  locator TEXT,
+  provenance TEXT NOT NULL,
+  sensitivity TEXT NOT NULL
+    CHECK (sensitivity IN ('public','internal','confidential','restricted')),
+  observed_at TEXT NOT NULL,
+  valid_from TEXT,
+  valid_until TEXT,
+  created_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  CHECK (
+    (source_kind = 'evidence' AND evidence_id IS NOT NULL AND locator IS NULL)
+    OR
+    (source_kind <> 'evidence' AND evidence_id IS NULL AND locator IS NOT NULL)
+  ),
+  CHECK (valid_from IS NULL OR valid_until IS NULL OR valid_from <= valid_until),
+  FOREIGN KEY(project_id) REFERENCES projects(id),
+  FOREIGN KEY(evidence_id) REFERENCES evidence(id)
+)"""
+
+#: Claim↔source links (U-M3, M3.4). Two ids, a relation, a timestamp, a hash:
+#: no source or claim text can live here.
+#:
+#: UNIQUE(memory_id, source_id, relation) is what makes a duplicate LOGICAL
+#: link impossible at the storage layer (D-v0.3.35). Plain REFERENCES (NO
+#: ACTION) matches every other FK in this schema: with foreign_keys=ON,
+#: deleting a linked claim or source is REFUSED. No cascade — the ledger is
+#: append-only and has no delete path, so a cascade would only be a silent
+#: deletion mechanism for a caller that does not exist.
+MEMORY_SOURCE_LINKS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  memory_id INTEGER NOT NULL,
+  source_id INTEGER NOT NULL,
+  relation TEXT NOT NULL
+    CHECK (relation IN ('supports','disputes','context','derived_from')),
+  created_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  UNIQUE(memory_id, source_id, relation),
+  FOREIGN KEY(memory_id) REFERENCES memory(id),
+  FOREIGN KEY(source_id) REFERENCES memory_sources(id)
+)"""
+
+#: Typed claim↔claim relationships (U-M3, M3.5).
+#:
+#: Four CHECKs, each pinning one rule the domain layer also enforces — so a
+#: writer that bypassed `ops` still cannot store a self-edge, an inverted
+#: window, or a symmetric edge written the wrong way round (D-v0.3.36). The
+#: last one is why a reverse-duplicate `contradicts` collides with the UNIQUE
+#: constraint instead of quietly becoming a second row for the same fact.
+MEMORY_EDGES_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  from_memory_id INTEGER NOT NULL,
+  to_memory_id INTEGER NOT NULL,
+  relation TEXT NOT NULL
+    CHECK (relation IN
+      ('supports','contradicts','refines','depends_on','related')),
+  valid_from TEXT,
+  valid_until TEXT,
+  created_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  UNIQUE(from_memory_id, to_memory_id, relation),
+  CHECK (from_memory_id <> to_memory_id),
+  CHECK (valid_from IS NULL OR valid_until IS NULL OR valid_from <= valid_until),
+  CHECK (relation NOT IN ('contradicts','related')
+         OR from_memory_id < to_memory_id),
+  FOREIGN KEY(from_memory_id) REFERENCES memory(id),
+  FOREIGN KEY(to_memory_id) REFERENCES memory(id)
+)"""
+
 MEMORY_TABLE = "memory"
 MEMORY_EVIDENCE_TABLE = "memory_evidence"
+MEMORY_SOURCES_TABLE = "memory_sources"
+MEMORY_SOURCE_LINKS_TABLE = "memory_source_links"
+MEMORY_EDGES_TABLE = "memory_edges"
+
+#: The three tables U-M3 adds, paired with their DDL. The 2→3 migration
+#: iterates this rather than repeating the CREATEs, so a fresh v3 schema and a
+#: migrated one cannot carry different graph tables (M3.12).
+MEMORY_GRAPH_TABLES: tuple[tuple[str, str], ...] = (
+    (MEMORY_SOURCES_TABLE, MEMORY_SOURCES_DDL),
+    (MEMORY_SOURCE_LINKS_TABLE, MEMORY_SOURCE_LINKS_DDL),
+    (MEMORY_EDGES_TABLE, MEMORY_EDGES_DDL),
+)
 
 _SCHEMA_HEAD = """
 CREATE TABLE IF NOT EXISTS meta(
@@ -192,14 +292,18 @@ CREATE TABLE IF NOT EXISTS agents(
 );
 """
 
-#: The canonical v2 schema. Composed rather than typed as one literal so the
+#: The canonical v3 schema. Composed rather than typed as one literal so the
 #: memory tables have exactly ONE definition in the codebase, shared with the
-#: 1→2 migration (M2.3).
+#: 1→2 (M2.3) and 2→3 (M3.11) migrations.
 SCHEMA_SQL = (
     _SCHEMA_HEAD
     + MEMORY_CLAIM_DDL.format(table=MEMORY_TABLE)
     + ";\n\n"
     + MEMORY_EVIDENCE_DDL.format(table=MEMORY_EVIDENCE_TABLE)
+    + ";\n\n"
+    + ";\n\n".join(
+        ddl.format(table=table) for table, ddl in MEMORY_GRAPH_TABLES
+    )
     + ";\n"
     + _SCHEMA_TAIL
 )
