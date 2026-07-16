@@ -941,6 +941,239 @@ def cmd_memory_contradictions(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# U-M5 retrieval evaluation (contract M5.13)
+#
+# Four read_only leaves. `benchmark *` opens no database at all — it evaluates
+# embedded synthetic fixtures in memory (D-v0.3.60) — and `retrieval query`
+# issues SELECT only. None of them changes what `aos search` or `pack build`
+# returns: U-M5 measures retrieval, it does not adopt it (D-v0.3.52).
+
+def cmd_retrieval_benchmark_list(args) -> int:
+    from . import retrieval
+
+    index = retrieval.registry_index()
+    if args.json:
+        _print_json(index)
+        return 0
+    for row in index["benchmarks"]:
+        print(
+            f"{row['name']:<18} v{row['dataset_version']}  "
+            f"{row['cases']:>2} case(s)  {row['fixture_claims']:>2} claim(s)  "
+            f"{row['fixture_edges']:>2} edge(s)  {row['sha256']}"
+        )
+    print(f"registry {index['content_sha256']}")
+    return 0
+
+
+def cmd_retrieval_benchmark_show(args) -> int:
+    from . import retrieval
+
+    dataset = retrieval.get_benchmark(args.name)
+    # Metadata and case IDs only. The synthetic fixture bodies are not here
+    # and there is no flag that puts them here: retrieval_benchmarks/<name>.json
+    # is the checked-in, digest-verified place to read a fixture (M5.13).
+    doc = {
+        "benchmark": dataset["benchmark"],
+        "dataset_version": dataset["dataset_version"],
+        "description": dataset["description"],
+        "thresholds": dataset["thresholds"],
+        "fixture_claims": len(dataset["fixture"]["claims"]),
+        "fixture_edges": len(dataset["fixture"]["edges"]),
+        "projects": list(dataset["fixture"]["projects"]),
+        "cases": [case["case"] for case in dataset["cases"]],
+        "content_sha256": dataset["content_sha256"],
+    }
+    if args.json:
+        _print_json(doc)
+        return 0
+    print(f"{doc['benchmark']}  v{doc['dataset_version']}  {doc['content_sha256']}")
+    print(f"  {doc['description']}")
+    print(
+        f"  fixture: {doc['fixture_claims']} claim(s), {doc['fixture_edges']} "
+        f"edge(s), project(s): {', '.join(doc['projects'])}"
+    )
+    print(
+        f"  thresholds: min_hit_rate {doc['thresholds']['min_hit_rate']} · "
+        f"min_mrr {doc['thresholds']['min_mrr']}"
+    )
+    print("  cases:")
+    for case in doc["cases"]:
+        print(f"    {case}")
+    return 0
+
+
+def _print_benchmark_report(report: dict) -> None:
+    print(
+        f"{report['benchmark']}  v{report['dataset_version']}  k={report['k']}  "
+        f"{report['dataset_sha256']}"
+    )
+    header = (
+        f"{'candidate':<12} {'hit':>7} {'prec':>7} {'rec':>7} {'mrr':>7} "
+        f"{'ndcg':>7} {'avg':>6}  gate"
+    )
+    print()
+    print(header)
+    for name, doc in report["candidates"].items():
+        agg = doc["aggregate"]
+        gate = doc["gate"]
+        # `baseline` is the measured reference and is never gated for
+        # promotion (D-v0.3.62) — the column says so rather than showing a
+        # verdict nobody can act on.
+        verdict = "n/a (reference)" if name == "baseline" else (
+            "PASS" if gate["gate"] else "FAIL"
+        )
+        print(
+            f"{name:<12} {_dash(agg['hit_at_k']):>7} "
+            f"{_dash(agg['precision_at_k']):>7} {_dash(agg['recall_at_k']):>7} "
+            f"{_dash(agg['mrr']):>7} {_dash(agg['ndcg_at_k']):>7} "
+            f"{_dash(doc['avg_results']):>6}  {verdict}"
+        )
+
+    print()
+    print("leakage (any non-zero is an automatic gate failure):")
+    for name, doc in report["candidates"].items():
+        counters = doc["counters"]
+        print(
+            f"  {name:<12} "
+            + " · ".join(
+                f"{cls.replace('_', ' ')} {counters[cls]}"
+                for cls in ("forbidden_results", "wrong_project_leaks",
+                            "restricted_leaks", "lifecycle_leaks",
+                            "hash_invalid_included")
+            )
+            + f" · truncations {counters['truncations']}"
+        )
+
+    if report["deltas"]:
+        print()
+        print("delta vs baseline:")
+        for name, delta in report["deltas"].items():
+            print(
+                f"  {name:<12} hit {_dash(delta['hit_at_k'])} · "
+                f"prec {_dash(delta['precision_at_k'])} · "
+                f"rec {_dash(delta['recall_at_k'])} · "
+                f"mrr {_dash(delta['mrr'])} · ndcg {_dash(delta['ndcg_at_k'])}"
+            )
+
+    print()
+    rec = report["recommendation"]
+    print(f"recommendation: {rec['recommendation']} ({rec['reason']})")
+    print(
+        "(advisory: nothing here changes packs, `aos search`, or any "
+        "configuration. Adoption is a human decision.)"
+    )
+
+
+def cmd_retrieval_benchmark_run(args) -> int:
+    from . import retrieval
+
+    report = retrieval.run_benchmark(args.name, candidate=args.candidate, k=args.k)
+    if args.json:
+        _print_json(report)
+    else:
+        _print_benchmark_report(report)
+    if report["passed"]:
+        return 0
+    # The report still went to stdout — the report IS the finding. One
+    # actionable line on stderr, exit 1 (M5.13).
+    failed = [
+        name
+        for name in report["gated_candidates"]
+        if not report["candidates"][name]["gate"]["gate"]
+    ]
+    print(
+        f"Promotion gate FAILED for {', '.join(failed)} on "
+        f"{report['benchmark']}. The full report is on stdout. Any leakage "
+        "counter above zero fails the gate regardless of relevance.",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def cmd_retrieval_query(args) -> int:
+    from . import retrieval
+
+    as_of = args.as_of or utils.utc_now_iso()
+    utils.validate_instant(as_of, "--as-of")
+    with _ledger(args) as (aos_dir, conn):
+        corpus = retrieval.corpus_from_db(conn)
+        retrieved = retrieval.retrieve(
+            corpus,
+            query=args.query,
+            as_of=as_of,
+            limit=args.limit,
+            graph_depth=args.graph_depth,
+            candidate=retrieval.CANDIDATE_1 if args.graph_depth else retrieval.CANDIDATE_0,
+            project=args.project,
+        )
+        doc = retrieved.document()
+        doc["as_of"] = as_of
+        doc["project"] = args.project
+        doc["graph_depth"] = args.graph_depth
+        if args.show_key:
+            # The one administrative content flag (D-v0.3.64): the claim KEY,
+            # for claims that are eligible by construction — never value_md,
+            # a locator, provenance text or an evidence ref. Strictly less
+            # than `memory show` prints for exactly this population.
+            keys = {claim.id: claim.key for claim in corpus.claims}
+            for result, scored in zip(doc["results"], retrieved.results):
+                result["key"] = keys[scored.claim.id]
+        if args.json:
+            _print_json(doc)
+            return 0
+        if doc["reason"] == retrieval.REASON_NO_TOKENS:
+            print(
+                "(no usable terms: every word was a stopword or punctuation. "
+                "Nothing was searched.)"
+            )
+            return 0
+        if not doc["results"]:
+            print("(no results)")
+            return 0
+        for result in doc["results"]:
+            line = (
+                f"{result['rank']:>2}. {result['memory']:<8} "
+                f"score {result['score']:>4}  {result['origin']:<8} "
+                f"{result['scope']:<7} {_dash(result['project']):<10} "
+                f"{result['sensitivity']:<12} "
+                f"{'pinned' if result['pinned'] else '-':<6} "
+                f"{result['hash_prefix']}"
+            )
+            if args.show_key:
+                line += f"  {result['key']}"
+            print(line)
+            print(f"      reasons: {', '.join(result['reasons'])}")
+            # Only the components that MOVED the score: a row of ten zeros is
+            # noise, and the full component set is one --json away.
+            moved = " ".join(
+                f"{name}={value}"
+                for name, value in result["components"].items()
+                if value
+            )
+            print(f"      components: {moved or '(none)'}")
+            origin = result["graph_origin"]
+            if origin:
+                print(
+                    f"      via {origin['via']} on {origin['edge']} "
+                    f"({origin['relation']}, {origin['direction']})"
+                )
+            if result["contradictions"]:
+                # A count, never a verdict (D-v0.3.59).
+                print(
+                    f"      contradicted by {result['contradictions']} active "
+                    "edge(s) — recorded disagreement, not a ruling"
+                )
+        if doc["truncation"]:
+            print()
+            print(
+                "(truncated: "
+                + ", ".join(f"{k}" for k in doc["truncation"])
+                + ". This is a bounded view.)"
+            )
+    return 0
+
+
 def cmd_search(args) -> int:
     with _ledger(args) as (aos_dir, conn):
         from . import search
@@ -2238,7 +2471,89 @@ def build_parser() -> _Parser:
     _hooks_common(p_hooks_uninstall)
     p_hooks_uninstall.set_defaults(func=cmd_hooks_uninstall)
 
+    # U-M5 retrieval evaluation (M5.13). Four read_only leaves; none of them
+    # changes what `aos search` or `pack build` returns (D-v0.3.52).
+    p_retrieval = sub.add_parser(
+        "retrieval",
+        help="evaluate candidate memory retrieval (measurement only; changes "
+        "no pack and no search)",
+    )
+    retrieval_sub = p_retrieval.add_subparsers(
+        dest="subcommand", metavar="SUBCOMMAND", required=True
+    )
+
+    p_benchmark = retrieval_sub.add_parser(
+        "benchmark", help="deterministic retrieval benchmarks"
+    )
+    benchmark_sub = p_benchmark.add_subparsers(
+        dest="subsubcommand", metavar="SUBCOMMAND", required=True
+    )
+
+    p_bench_list = benchmark_sub.add_parser(
+        "list", help="list benchmarks with versions, counts and digests"
+    )
+    p_bench_list.add_argument("--json", action="store_true")
+    p_bench_list.set_defaults(func=cmd_retrieval_benchmark_list)
+
+    p_bench_show = benchmark_sub.add_parser(
+        "show", help="show one benchmark's metadata and case ids"
+    )
+    p_bench_show.add_argument("name")
+    p_bench_show.add_argument("--json", action="store_true")
+    p_bench_show.set_defaults(func=cmd_retrieval_benchmark_show)
+
+    p_bench_run = benchmark_sub.add_parser(
+        "run", help="evaluate candidates against a benchmark (read-only)"
+    )
+    p_bench_run.add_argument("name")
+    p_bench_run.add_argument("--json", action="store_true")
+    p_bench_run.add_argument(
+        "--candidate",
+        default="all",
+        choices=list(_retrieval_candidate_choices()),
+        help="which retriever(s) to evaluate (default: all)",
+    )
+    p_bench_run.add_argument(
+        "--k",
+        type=int,
+        default=5,
+        metavar="N",
+        help="metric cutoff, 1..10 (default: 5)",
+    )
+    p_bench_run.set_defaults(func=cmd_retrieval_benchmark_run)
+
+    p_query = retrieval_sub.add_parser(
+        "query", help="run the candidate retriever against this workspace"
+    )
+    p_query.add_argument("query")
+    p_query.add_argument("--project", default=None, metavar="SLUG")
+    p_query.add_argument(
+        "--as-of", dest="as_of", default=None, metavar="TS",
+        help="evaluate temporal validity at this instant (default: now)",
+    )
+    p_query.add_argument("--limit", type=int, default=5, metavar="N")
+    p_query.add_argument(
+        "--graph-depth", dest="graph_depth", type=int, default=0, choices=[0, 1],
+        help="0 = lexical/temporal only; 1 = bounded expansion over active edges",
+    )
+    p_query.add_argument("--json", action="store_true")
+    p_query.add_argument(
+        "--show-key", dest="show_key", action="store_true",
+        help="also print each result's claim key (eligible claims only; never "
+        "the value, a locator, provenance or an evidence ref)",
+    )
+    p_query.set_defaults(func=cmd_retrieval_query)
+
     return parser
+
+
+def _retrieval_candidate_choices() -> tuple[str, ...]:
+    """Imported lazily and via the module, so the parser's choices ARE the
+    retriever's vocabulary — a new candidate cannot exist that `--candidate`
+    refuses, and vice versa."""
+    from . import retrieval
+
+    return retrieval.CANDIDATE_CHOICES
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1375,3 +1375,148 @@ a tool that is meant to.
 For the same reason `memory source list` and `memory source show` never print
 the locator or the provenance — a URL with a token in its query string does not
 belong in a listing you scroll past.
+
+## Retrieval evaluation (U-M5)
+
+### The model in one paragraph
+
+`aos retrieval` **measures** retrieval; it never changes it. `aos search`,
+`pack build` and pack MEMORY inclusion behave exactly as they did before this
+unit existed, and no `retrieval` command writes anything: the three `benchmark`
+leaves never open a database at all, and `retrieval query` issues `SELECT`
+only. There are no embeddings, no vector store, no model call and no network.
+Every weight is pinned in the contract, every score component is an integer,
+and every metric is an exact rational rendered to four decimals — so two runs
+on two machines produce the same bytes.
+
+### `retrieval query` returned fewer results than `aos search`
+
+Working as designed, and it is the whole point of the unit. `aos search`
+deliberately surfaces history: it applies **no** eligibility filter, so it
+returns retired, expired, superseded, wrong-project and hash-invalid claims,
+plus restricted ones with their text suppressed. That is correct for an
+administrative search over a ledger, and wrong for anything feeding an agent.
+
+`retrieval query` returns only claims that are `live`, unsuperseded, unexpired
+at `--as-of`, not `restricted`, hash-valid, and either global or in the
+requested project. Run `python3 aos.py retrieval benchmark run core-retrieval`
+to see the size of the gap measured on synthetic fixtures.
+
+### My claim did not come back and I am sure it matches
+
+Work down the eligibility rules in order — the first one that fails is the
+reason, and it is the same list for a primary hit and a graph neighbour:
+
+```bash
+python3 aos.py memory show M-0007      # status, sensitivity, window, `retrieved`
+python3 aos.py doctor                  # hash integrity, check 22-31
+```
+
+- **status** — only `live` is retrievable. `proposed`, `contested`,
+  `quarantined` and `retired` are not.
+- **superseded** — a superseded claim is still `status=live`. Supersession is
+  a pointer, not a status, which is exactly why this one surprises people.
+- **restricted** — excluded from every automatic context surface (U-M3).
+- **temporal** — the window must be open at `--as-of`, which defaults to now.
+  Both ends count: a claim whose `valid_from` is in the future is not a fact
+  about the requested instant either.
+- **hash** — a claim whose stored hash does not verify is not retrievable.
+  `pack build` deliberately does not re-verify (one damaged row must not block
+  every pack); retrieval can afford to be stricter because its pool is bounded.
+- **project** — global, or the requested project. Without `--project`, only
+  global claims are eligible.
+
+Beyond eligibility, a primary hit needs **every** query term to appear in
+`key + value`. Both live search backends already work that way; retrieval does
+not silently relax it.
+
+### My query returned nothing and printed "no usable terms"
+
+Every word was a stopword or punctuation. That is an empty result, not an
+error — `retrieval query "the"` behaves like a search that found nothing.
+Stopwords are dropped so that an English query's score is not dominated by the
+articles every claim contains.
+
+### "Query is N bytes / characters / has N distinct terms; the maximum is …"
+
+Query bounds **refuse** rather than truncate, because a truncated query
+silently answers a different question than the one you asked. Bytes and
+characters are both measured because neither bounds the other. Nothing was
+searched, and the refusal never echoes your query back — a query can itself be
+sensitive.
+
+Corpus and graph bounds do the opposite: they truncate and *say so*, because
+you wrote the query and can fix it, while you did not write the ledger and
+cannot.
+
+### Graph expansion did not bring in the claim I expected
+
+Depth-1 expansion is deliberately narrow. A neighbour is included only if:
+
+- an **active** edge connects it to a primary hit — the edge's own window
+  decides, independently of whether the claim is fine;
+- the neighbour is **eligible** by every rule above — there is no second,
+  weaker gate on the expansion path;
+- it shares **at least one query term**. A well-connected claim that matches
+  nothing is noise, and degree buys it nothing.
+
+There is no depth 2 in U-M5. (`memory graph --depth 2` exists for human
+inspection and is a different tool with a different purpose.)
+
+### A graph neighbour ranked below a worse-looking direct match
+
+By construction. Every expanded result ranks below every primary result, so
+expansion adds recall at the tail and never disturbs the head. It is not a
+weighting accident and it is not tunable.
+
+### A contradicted claim was still returned
+
+Correct. A `contradicts` edge records that a human said two claims disagree —
+not which one is true. Retrieval subtracts a small, capped number of points and
+returns the claim, with the contradiction count in its metadata. A retriever
+that dropped a contradicted claim would be answering that question by
+omission. The same holds for `disputes` provenance: it ranks, it never hides.
+
+### "Promotion gate FAILED for candidate-0 …"
+
+The full report is still on stdout — the report *is* the finding. Any single
+forbidden, wrong-project, restricted, lifecycle or hash-invalid result fails
+the gate no matter how good the relevance numbers are: one is a bug, the other
+is a score. There is no weighting between them and no override flag.
+
+The gate also fails on a non-deterministic replay, an unmet threshold, a
+regression against the baseline, or a bounds violation.
+
+### `benchmark run` reports the baseline leaking, and still exits 0
+
+Intended. `baseline` is the measured **reference** — it is what production does
+today, it cannot be "promoted", and gating it would mean exiting 1 forever the
+moment production was measured to leak. Its counters are printed at full
+severity because they are the finding; only the candidates drive the exit code.
+
+### "checked-in retrieval benchmarks match the embedded definitions" fails
+
+The projection under `retrieval_benchmarks/` has drifted from the canonical
+Python in `agentic_os/retrieval.py`. The Python is the source of truth:
+
+```bash
+python3 tools/gen_retrieval_benchmarks.py            # verify (writes nothing)
+python3 tools/gen_retrieval_benchmarks.py --write    # regenerate
+```
+
+Inside `aos.pyz` there is no `retrieval_benchmarks/` directory and the check
+reports the comparison as unavailable and **passes** — the embedded
+definitions are canonical there, and a check that failed for running the
+supported artifact is one people learn to ignore.
+
+### The recommendation says "promote candidate-0" but I want the graph one
+
+The recommendation is a deterministic function of the gates, not a preference.
+`promote candidate-1` requires candidate-1 to pass its gate *and* beat
+candidate-0 on relevance. On a benchmark whose fixture has no edges, expansion
+cannot do anything, so it cannot win — and the recommendation says so rather
+than preferring the newer thing.
+
+It is advisory in the strongest sense: **no command acts on it**. Nothing in
+U-M5 changes packs, `aos search`, or any configuration file. Adoption is a
+human decision.

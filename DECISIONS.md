@@ -1,3 +1,155 @@
+# DECISIONS — Agentic OS v0.3 U-M5 retrieval evaluations
+
+This section continues the `D-v0.3.*` series for the U-M5 pass executed per
+`agentic-os-v0.3-u-m5-retrieval-evals-contract.md` on branch
+`v0.3-u-m5-retrieval-evals` (2026-07-16). Prepended per the established
+precedent (D-W0.4, reaffirmed in D-v0.2.7); everything below stays
+byte-identical.
+
+## D-v0.3 decisions (U-M5)
+
+- **D-v0.3.52 — U-M5 measures; it does not adopt.** The unit ships an explicit
+  candidate retriever, datasets, a report and a gate. It ships no switch.
+  `search.py` and `pack.py` were not modified — not one line, verified by a
+  test that diffs them against the baseline commit. A pass that both proposed a
+  retriever and wired it into `pack build` would be a pass whose benchmark
+  could never fail in a way anyone acted on: the code would already be in
+  production while the report was still being read. `benchmark run` prints a
+  recommendation and changes nothing. Adoption is a human decision, taken after
+  this report, in a later unit.
+
+- **D-v0.3.53 — The baseline is measured as it is, not rewritten to be easy.**
+  The baseline candidate re-expresses the LIKE backend's memory semantics over
+  the shared corpus, and a test proves it returns the same memory result SET as
+  the live `search.search()` for a matrix of queries against a real workspace.
+  Reimplementing rather than importing was the only honest option available:
+  `search.search()` needs a `sqlite3.Connection` and returns rendered snippets,
+  and the benchmark corpus is deliberately not a database (D-v0.3.60).
+  Reimplementing *and asserting equivalence* is a proof; editing production so
+  the benchmark can call it is a way of making the baseline whatever the
+  candidate needs it to be. The baseline reproduces the LIKE fallback's
+  ascending-id order rather than FTS5's `rank`, because a benchmark whose
+  ranking depends on which SQLite the runner happens to have is not a
+  benchmark; the fidelity test compares SETS, which is the backend-independent
+  part.
+
+- **D-v0.3.54 — Integers, ordinals and rationals. No float ever.** Every score
+  component is an integer, the sort key is a tuple of three integers, and every
+  metric is a `fractions.Fraction` rendered by integer arithmetic to a
+  fixed-width decimal STRING. Strings and not JSON numbers, because a JSON
+  number is a float to almost every consumer — the no-float rule has to survive
+  the reader too, not just the writer. A test re-parses the real `--json`
+  stdout with a hook that rejects every float literal. A benchmark whose digits
+  depend on the platform's libm is not a benchmark.
+
+- **D-v0.3.55 — nDCG's log2 discounts are a checked-in table, not
+  `math.log2`.** `math.log2` is a libm call: correctly rounded on most
+  platforms, not guaranteed identical on all. `_LOG2_SCALED` pins log2(2) …
+  log2(11) as integers scaled by 10^12, written out as source literals, and the
+  discount is the exact rational `Fraction(10**12, _LOG2_SCALED[i])`. The table
+  is a *definition* of this metric, not an approximation of another one: two
+  runs on two platforms agree because they compute the same rational number,
+  not because their libms happened to. A test compares the table to
+  `math.log2` on the local platform to catch a transcription typo — that is the
+  table checking the transcription, not the transcription trusting the
+  platform. (Two of the eleven values were mistranscribed by hand on the first
+  attempt; the test caught both, which is the argument for the test.)
+
+- **D-v0.3.56 — Eligibility is one predicate, strictly stricter than the
+  pack's.** `retrieval.eligibility()` returns a reason code from a closed,
+  ORDERED set, applies U-M2/U-M3's lifecycle rules with the same spelling
+  `ops.claim_is_eligible` uses, and reuses `ops.window_is_active` for the
+  window. It adds three things ordinary pack inclusion does not need:
+  hash validity (`memory_for_project` deliberately does not re-verify —
+  D-v0.3.21: one damaged row must not block every pack; retrieval can afford to
+  be stricter because its pool is bounded and its exclusions are counted and
+  reported), `valid_from <= as-of` (a claim whose window has not opened is not
+  a fact about the requested instant), and project compatibility. A test proves
+  the implication that matters over the whole fixture matrix:
+  `retrieval_eligible(c, t)` ⟹ `ops.claim_is_eligible(c, t)`. U-M5 can refuse
+  what the pack would carry; it can never carry what the pack would refuse.
+
+- **D-v0.3.57 — Every expanded result ranks below every primary result.** The
+  sort key's first element is the origin ordinal. This makes "a graph neighbour
+  must not outrank a strong direct lexical match" true by construction rather
+  than by weight-tuning, and it makes the property testable with one assertion
+  instead of a tournament of fixtures. Expansion in U-M5 is a **recall
+  instrument**: it appends to the tail, it never reorders the head. If a later
+  unit wants interleaved ranking, it will have this report to argue from.
+
+- **D-v0.3.58 — A primary hit is conjunctive; a graph neighbour needs one
+  token.** Primary inclusion requires every query token — the semantics both
+  live backends already have (FTS5 ANDs its terms; the LIKE fallback requires
+  each as a substring). Expansion's documented minimum relevance signal is at
+  least one token. That gap is the whole point of expansion: a claim that
+  partially matches and is connected by an active edge to a full match is
+  exactly the recall a lexical retriever loses. A neighbour with zero query
+  tokens is graph noise and is never included, whatever its degree — the
+  graph-expansion fixture's noise claim has the highest degree of any
+  non-anchor in it, and a test asserts that fact before asserting its
+  exclusion.
+
+- **D-v0.3.59 — Disputes and contradictions rank; they never judge and never
+  exclude.** An active `disputes` source link and an active `contradicts` edge
+  each subtract a bounded, pinned number of points. Neither makes a claim
+  ineligible, neither hides it, neither resolves anything. U-M3 pinned that a
+  contradiction records that a human said two claims disagree, not which one is
+  true (D-v0.3.38); a retriever that dropped a contradicted claim would be
+  answering that question by omission. Provenance and graph signals are capped
+  at three occurrences each, so link count cannot become the ranking.
+
+- **D-v0.3.60 — The benchmark corpus is memory, never a database.**
+  `benchmark run` builds its corpus from the embedded fixture definitions and
+  never opens `aos.db`. This is what makes "creates no database rows, files,
+  ledger events or workspace state" a structural fact rather than a promise:
+  there is no connection to write through, proven by a test that patches
+  `db.open_db` to raise and watches the run succeed anyway. It also makes the
+  run byte-identical inside a workspace, outside one, in recovery mode, and
+  inside `aos.pyz`. `retrieval query` is the surface that reads a real ledger,
+  and it only reads — it does not even touch the derived FTS index or its
+  watermark, which `search` legitimately does.
+
+- **D-v0.3.61 — The embedded datasets are canonical; `retrieval_benchmarks/`
+  is a projection.** Exactly the U-X1 mechanic (D-v0.3.2/D-v0.3.3), for exactly
+  the U-X1 reason: `aos.pyz` carries `.py` files and nothing else, so a JSON
+  file could not be the source of truth without either breaking the zipapp or
+  widening its allowlist. The Python definitions are the one editable registry;
+  `tools/gen_retrieval_benchmarks.py --write` projects them; doctor and the
+  tests verify byte-for-byte. There is no second editable registry, and
+  `tools/` is outside the package allowlist so the writer never ships. No
+  packaging change was needed or made — the existing `.py`-under-package
+  allowlist already excludes the JSON by construction.
+
+- **D-v0.3.62 — `baseline` is reported, never gated.** `benchmark run`'s exit
+  code is driven by validation plus the promotion gate of the CANDIDATES.
+  `baseline` is the measured reference: it is what production does today, it
+  cannot be "promoted", and gating it would make `--candidate all` exit 1
+  forever the moment the baseline was measured to leak — which is the finding,
+  not a malfunction. And it does leak: on the core benchmark the baseline
+  returns 8 wrong-project, 2 restricted, 8 lifecycle and 2 hash-invalid
+  results. Every one of those numbers is printed, at full severity. One number
+  is simply not wired to the exit code.
+
+- **D-v0.3.63 — Truncation is reported, never silent, and never averaged.**
+  Every bound truncates deterministically and increments a named counter that
+  appears next to the metric it affected. Leakage counters are integer sums
+  over cases and are never divided by anything: an average is how a leak in one
+  case out of forty disappears. The counters are also computed from the CLAIMS
+  themselves rather than from the case's `forbidden` list — a leak is counted
+  because the claim IS restricted, not because the dataset author remembered to
+  list its id. An author's omission cannot hide a leak, which is the only way
+  the number is worth printing.
+
+- **D-v0.3.64 — `--show-key` shows a key, and only for claims already
+  eligible.** Human output defaults to metadata only. The one administrative
+  content flag prints the claim `key` — never `value_md`, a source locator,
+  provenance text or an evidence ref. It is consistent with `memory show`,
+  which prints key AND value unredacted for exactly this population, because
+  every result is eligible by construction and `restricted` is an eligibility
+  exclusion: a restricted claim cannot reach the renderer to be redacted by it.
+  The flag shows strictly less than the command that already exists, and the
+  protection is structural rather than a redaction pass that could be forgotten.
+
 # DECISIONS — Agentic OS v0.2 U-P1 packaging run
 
 This section continues the `D-v0.2.*` series for the U-P1 pass executed per

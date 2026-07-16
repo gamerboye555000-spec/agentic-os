@@ -939,13 +939,14 @@ class DoctorIntegrationTests(PowerCase):
         self.assertNotIn('{"version"', line)
         self.assertNotIn(str(self.aos_dir), line)
 
-    def test_doctor_check_count_is_thirty(self):
-        """(25) 20 → 21 → 25 → 30: the mandated power check joined the set at
-        U-E2, then U-M2's four memory-claim checks, then U-M3's five
-        memory-graph checks (the D-W8.1 pattern — the pin moves UP with a
-        mandated new check)."""
+    def test_doctor_check_count_is_thirty_one(self):
+        """(25) 20 → 21 → 25 → 30 → 31: the mandated power check joined the
+        set at U-E2, then U-M2's four memory-claim checks, then U-M3's five
+        memory-graph checks, then U-M5's one retrieval-benchmark registry
+        check (the D-W8.1 pattern — the pin moves UP with a mandated new
+        check)."""
         out = self.aos("doctor")
-        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 30)
+        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 31)
 
     def test_doctor_still_passes_cleanly_on_the_baseline_fixture(self):
         """(25) The new checks do not disturb the ones already there."""

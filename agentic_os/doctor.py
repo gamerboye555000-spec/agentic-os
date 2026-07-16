@@ -797,8 +797,57 @@ def run_checks(conn: sqlite3.Connection, aos_dir: Path) -> list[Check]:
 
     checks.extend(_memory_claim_checks(conn))
     checks.extend(_memory_graph_checks(conn, aos_dir, aos_root))
+    checks.append(_retrieval_benchmark_check())
 
     return checks
+
+
+def _retrieval_benchmark_check() -> Check:
+    """31. U-M5's one line: the retrieval benchmark registry is intact
+    (M5.14).
+
+    ONE check, and it does not run a benchmark. Doctor is a health check, not
+    a CI job; a doctor that evaluated nineteen cases on every invocation would
+    be a doctor people stop running.
+
+    Unlike U-X1, U-M5 ships no `verify-registry` command — so without this
+    line a drifted projection would be invisible outside the test suite, which
+    is exactly the justification for spending a check on it.
+
+    The PASSING detail is a function of the EMBEDDED definitions alone, and
+    deliberately so: doctor's stdout is an entrypoint-parity surface (a script
+    and aos.pyz must print the same bytes), and aos.pyz legitimately has no
+    retrieval_benchmarks/ directory to compare against (D-v0.3.2/D-v0.3.61).
+    A detail that said "compared 3 artifacts" in a checkout and "nothing to
+    compare" in the archive would make one true sentence out of two different
+    doctors. The embedded definitions ARE canonical in both, so the line
+    reports what is true in both and stays silent about the rest.
+
+    Where a source checkout EXISTS the projection is still compared, and drift
+    still FAILS — that comparison just cannot be what the healthy line says.
+
+    Names files, counts and conditions. Never a fixture body, a query or a
+    synthetic value.
+    """
+    from . import retrieval
+
+    problems = retrieval.verify_embedded()
+    source = retrieval.source_benchmarks_dir()
+    if source is not None:
+        problems += retrieval.verify_source_benchmarks(source)
+    if problems:
+        return Check(
+            "retrieval benchmark registry verified",
+            False,
+            _bounded_problems(problems)
+            + " — regenerate: python3 tools/gen_retrieval_benchmarks.py",
+        )
+    return Check(
+        "retrieval benchmark registry verified",
+        True,
+        f"{len(retrieval.benchmark_names())} benchmark(s), "
+        f"{sum(len(d['cases']) for d in retrieval.registry().values())} case(s)",
+    )
 
 
 # ---------------------------------------------------------------------------
