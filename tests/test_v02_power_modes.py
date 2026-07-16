@@ -696,6 +696,15 @@ class RecoveryTests(PowerCase):
         (("memory", "unpin"), ("memory", "unpin", "M-0001")),
         (("memory", "link-evidence"),
          ("memory", "link-evidence", "M-0001", "E-0001")),
+        # U-M3 graph writes: each mutates a canonical row, its integrity hash
+        # and an event in one transaction.
+        (("memory", "classify"), ("memory", "classify", "M-0001", "restricted")),
+        (("memory", "source", "add"),
+         ("memory", "source", "add", "--kind", "url", "--locator", "https://x.test")),
+        (("memory", "source", "link"),
+         ("memory", "source", "link", "M-0001", "MS-0001", "--relation", "supports")),
+        (("memory", "edge", "add"),
+         ("memory", "edge", "add", "M-0001", "M-0002", "--relation", "related")),
         (("agent", "add"), ("agent", "add", "newbot")),
         (("agent", "update"), ("agent", "update", "newbot", "--notes", "n")),
         (("ingest", "dropfile"), ("ingest", "dropfile", "SELF")),
@@ -930,15 +939,16 @@ class DoctorIntegrationTests(PowerCase):
         self.assertNotIn('{"version"', line)
         self.assertNotIn(str(self.aos_dir), line)
 
-    def test_doctor_check_count_is_twenty_five(self):
-        """(25) 20 → 21 → 25: the mandated power check joined the set at
-        U-E2, and U-M2's four mandated memory-claim checks joined it after
-        (the D-W8.1 pattern — the pin moves UP with a mandated new check)."""
+    def test_doctor_check_count_is_thirty(self):
+        """(25) 20 → 21 → 25 → 30: the mandated power check joined the set at
+        U-E2, then U-M2's four memory-claim checks, then U-M3's five
+        memory-graph checks (the D-W8.1 pattern — the pin moves UP with a
+        mandated new check)."""
         out = self.aos("doctor")
-        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 25)
+        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 30)
 
     def test_doctor_still_passes_cleanly_on_the_baseline_fixture(self):
-        """(25) The new check does not disturb the other twenty."""
+        """(25) The new checks do not disturb the ones already there."""
         out = self.aos("doctor")
         self.assertEqual(out.count("[FAIL]"), 0)
 
@@ -1326,7 +1336,7 @@ class ExclusionTests(PowerCase):
         """(25) U-E2 changed no schema, and must not. U-M2 owns the version:
         this pins that power modes follow it rather than declaring their own.
         """
-        self.assertEqual(db.SCHEMA_VERSION, "2")
+        self.assertEqual(db.SCHEMA_VERSION, "3")
         self.assertEqual(migrations.LATEST_VERSION, int(db.SCHEMA_VERSION))
 
     def test_power_state_lives_beside_the_ledger_not_inside_it(self):

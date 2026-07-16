@@ -17,6 +17,7 @@ import re
 import sqlite3
 
 from . import db, ids
+from .models import MEMORY_SENSITIVITY_RESTRICTED
 from .utils import AosError
 
 FTS_TABLE = "search_index"
@@ -80,18 +81,67 @@ def _documents(conn: sqlite3.Connection) -> list[tuple[str, int, str, str]]:
     # ledger search), so every memory hit carries its curation status in the
     # title — a retired or quarantined claim can never be read off a results
     # list as live context.
+    #
+    # U-M3: a RESTRICTED claim still matches administratively — an operator
+    # must be able to discover that something on their topic exists — but its
+    # title and snippet are the fixed placeholder. The body is still indexed,
+    # which is what makes the match possible; the index is derived state
+    # inside the same database that already holds the value, so indexing it
+    # exposes nothing new. The output is where the boundary is (M3.13).
     for row in conn.execute(
-        "SELECT id, key, value_md, status FROM memory ORDER BY id"
+        "SELECT id, key, value_md, status, sensitivity FROM memory ORDER BY id"
     ):
+        restricted = row["sensitivity"] == MEMORY_SENSITIVITY_RESTRICTED
+        title = (
+            f"[{row['status']}] ({MEMORY_SENSITIVITY_RESTRICTED})"
+            if restricted
+            else f"[{row['status']}] {row['key']}"
+        )
         docs.append(
             (
                 "memory",
                 row["id"],
-                f"[{row['status']}] {row['key']}",
+                title,
                 row["key"] + "\n" + row["value_md"],
             )
         )
     return docs
+
+
+def _restricted_memory_ids(conn: sqlite3.Connection) -> set[int]:
+    """The claims whose search snippets must be suppressed (M3.13).
+
+    Read at RESULT time, never trusted from the index: the FTS table is
+    derived state that a stale watermark could leave behind a `memory
+    classify`, and a snippet suppressed by a stale index is a snippet not
+    suppressed at all.
+    """
+    return {
+        row["id"]
+        for row in conn.execute(
+            "SELECT id FROM memory WHERE sensitivity = ?",
+            (MEMORY_SENSITIVITY_RESTRICTED,),
+        )
+    }
+
+
+def _suppress_restricted(conn: sqlite3.Connection, results: list[dict]) -> list[dict]:
+    """Blank the title and snippet of every restricted memory hit.
+
+    The hit itself stays: the id, the type and the fact that it matched are
+    administrative metadata. Its text is not.
+    """
+    restricted = _restricted_memory_ids(conn)
+    if not restricted:
+        return results
+    placeholder = f"({MEMORY_SENSITIVITY_RESTRICTED})"
+    for result in results:
+        if result["type"] != "memory":
+            continue
+        if ids.parse_id(result["id"], "memory") in restricted:
+            result["title"] = placeholder
+            result["snippet"] = placeholder
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -220,4 +270,12 @@ def search(conn: sqlite3.Connection, query: str) -> dict:
     else:
         backend = "like"
         results = _like_search(conn, query)
-    return {"query": query, "backend": backend, "results": results}
+    # One suppression pass over BOTH backends' results, at the single point
+    # where they converge (M3.13). Suppressing inside each backend would mean
+    # two implementations of one rule, and the fallback is exactly the path
+    # that gets tested least.
+    return {
+        "query": query,
+        "backend": backend,
+        "results": _suppress_restricted(conn, results),
+    }

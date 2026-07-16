@@ -13,6 +13,7 @@ from pathlib import Path, PurePath
 
 from . import ids, render, utils
 from .models import (
+    MEMORY_SENSITIVITY_RESTRICTED,
     Agent,
     Decision,
     Evidence,
@@ -219,13 +220,17 @@ def _index_note_contents(conn: sqlite3.Connection, aos_root: Path) -> dict[str, 
     memory = []
     for row in conn.execute(
         "SELECT m.id, m.key, m.scope, m.confidence, m.valid_until, "
-        "m.superseded_by, m.status, m.pinned, "
+        "m.superseded_by, m.status, m.pinned, m.sensitivity, "
         "(SELECT COUNT(*) FROM memory_evidence me WHERE me.memory_id = m.id) "
         "AS evidence_count "
         "FROM memory m ORDER BY m.id"
     ):
+        # The index is a body projection too — a restricted claim's key must
+        # not reach it any more than its note (M3.13).
+        restricted = row["sensitivity"] == MEMORY_SENSITIVITY_RESTRICTED
+        label = f"({MEMORY_SENSITIVITY_RESTRICTED})" if restricted else one(row["key"])
         bullet = (
-            f"- [[{ids.render_id('memory', row['id'])}]] {one(row['key'])} "
+            f"- [[{ids.render_id('memory', row['id'])}]] {label} "
             f"· {row['scope']} · [{row['confidence']}] · {row['status']}"
         )
         if row["pinned"]:
@@ -429,6 +434,8 @@ def sync_vault(conn: sqlite3.Connection, aos_dir: Path) -> tuple[int, int]:
             render.handoff_note(handoff),
         )
 
+    from . import ops  # local: ops imports this module, so the graph stays acyclic
+
     evidence_by_memory: dict[int, list[int]] = {}
     for row in _rows(
         conn,
@@ -447,6 +454,10 @@ def sync_vault(conn: sqlite3.Connection, aos_dir: Path) -> tuple[int, int]:
                 item,
                 slug_by_project_id.get(item.project_id),
                 evidence_by_memory.get(item.id, []),
+                # Bounded COUNTS, never neighbours (M3.13): the mirror says
+                # how much provenance a claim has, and the ledger says what it
+                # is. No source locator or provenance text reaches a note.
+                ops.memory_graph_counts(conn, item.id),
             ),
         )
 

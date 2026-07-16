@@ -663,33 +663,38 @@ No snapshot was taken and no event was written.
 means exactly what it says: no backup, no event, no byte changed. The
 no-op path never even opens the database read-write.
 
-### "Database schema_version is '1' but this build supports '2'."
+### "Database schema_version is '2' but this build supports '3'." (or '1')
 
 A **normal** command (`status`, `task list`, `sync`, `memory list`, …)
 refusing like this is correct and expected on any workspace created before
-U-M2. This build does not understand a v1 database. It will not guess, and
-it will not quietly migrate. Nothing was changed by the refusal.
+U-M3 (version 2) or before U-M2 (version 1). This build does not understand an
+older database. It will not guess, and it will not quietly migrate. Nothing
+was changed by the refusal.
 
 The fix is the three commands the message itself prints:
 
 ```bash
 python3 aos.py migrate status   # where am I, what is pending?
-python3 aos.py migrate plan     # exactly what would run: 1 → 2
+python3 aos.py migrate plan     # exactly what would run: 2 → 3
 python3 aos.py migrate apply    # snapshots + verifies first, then migrates
 ```
 
 `migrate apply` takes a verified snapshot before it changes anything (see
-RECOVERY.md), preserves every memory row's id and text exactly, and derives
-each claim's curation status from what v1 already recorded.
+RECOVERY.md). From version 2 it preserves every claim's id, text, timestamps,
+status and pin, leaves every evidence link untouched, sets every claim to
+`internal`, recomputes every hash under the v3 payload, and creates the three
+graph tables **empty**. From version 1 it runs 1 → 2 first, deriving each
+claim's curation status from what v1 already recorded. Nothing is inferred
+from your text at either step.
 
-- **Version is lower and a migration exists** (today: version 1) →
+- **Version is lower and a migration exists** (today: version 1 or 2) →
   `migrate plan`, then `migrate apply`.
 - **Version is lower and no migration exists** (today: any version below
   1) → this build cannot reach it. Use the build that wrote it, or restore
   a backup that verifies.
 - **Version is higher** → see below.
 
-### "Database schema version N is newer than this build supports (2)."
+### "Database schema version N is newer than this build supports (3)."
 
 The database was written by a newer Agentic OS. **Upgrade the tool, do not
 touch the database.** This build refuses to migrate, read, or "fix" it, and
@@ -1074,6 +1079,29 @@ Changing a schema changes its digest, and the digest is what a future consumer
 vendors. A digest change is a protocol change: if consumers already exist, mint
 a new major rather than editing a published one in place.
 
+### `test_the_aos_clock_emits_a_valid_protocol_timestamp` fails with `[expires_before_created]`
+
+A known **pre-existing test time bomb**, not a protocol or clock defect, and
+not caused by any change since. The WorkSpec fixture in
+`tests/test_v03_protocol_spine.py` hard-codes:
+
+```
+created_at: 2026-07-15T09:00:00Z
+expires_at: 2026-07-16T09:00:00Z
+```
+
+and that one test substitutes the LIVE clock for `created_at` while leaving
+`expires_at` at the fixture default. From 2026-07-16T09:00:00Z onward, "now"
+is later than the fixture's expiry, so the document is genuinely invalid and
+`validate_document` correctly refuses it. The schema, `validate_document` and
+`utils.utc_now_iso()` are all behaving exactly as specified — the fixture
+simply expired.
+
+The fix belongs to whichever unit owns the protocol tests: give that test a
+relative `expires_at` derived from the same clock reading it uses for
+`created_at`, rather than a fixed date. Until then this one test fails on any
+run after that instant, and it is the only test in the suite that does.
+
 ## Memory claims (U-M2)
 
 ### "Refusing to change memory M-0001: its content hash does not match its stored fields."
@@ -1171,3 +1199,179 @@ command that produces them, so on a v2 database from this build you will only
 ever see `live` and `retired` unless something wrote a status directly.
 
 `memory list --status quarantined` shows them; nothing else will.
+
+## The memory graph (U-M3)
+
+### The model in one paragraph
+
+Schema v3 adds claim **sensitivity**, provenance **sources**, claim↔source
+**links** and claim↔claim **edges**. Every one of those records carries a
+`content_sha256` over its authoritative fields, and every write against an
+existing record verifies that hash before touching it. Sources and edges may
+carry a validity window; expired means *inactive*, never *deleted*. Nothing
+in this unit follows a reference, infers a relationship, or decides which of
+two contradicting claims is true. Almost every message below is a **refusal**,
+and a refusal means nothing changed.
+
+### "Migration 'u-m3-memory-graph-v3' (2 → 3) failed (…) and was rolled back"
+
+The step is atomic: the rebuilt memory table, the new graph tables, the version
+bump and the migration event commit together or die together. After this
+message the database is still at **version 2**, its memory table and hashes are
+untouched, `memory_evidence` is intact, no graph table survives, and no
+migration event was written.
+
+The message names the exception CLASS only — never SQL or a row value. The
+verified pre-migration snapshot it points at is a real v2 database (each
+migration step leaves a database that genuinely is its own version). Your two
+options, in order:
+
+1. **Fix the cause and retry.** `migrate status` still says version 2 with one
+   pending step; `migrate apply` runs it again from a clean start and produces
+   no duplicate effects.
+2. **Restore the snapshot.** See RECOVERY.md — "Restoring the v2 pre-migration
+   snapshot (the 2 → 3 case), exactly".
+
+### "Refusing to use memory source MS-0001: its content hash does not match its stored fields."
+
+The source row was edited outside Agentic OS, or is damaged. The write was
+refused so it could not recompute the hash over the edited fields and thereby
+**certify** the edit. Nothing changed. Same message and same reasoning for
+`memory edge`, and for `memory` claims (see the U-M2 section above).
+
+```bash
+python3 aos.py doctor                     # which records, by id and reason
+python3 aos.py memory source show MS-0001 # metadata + integrity verdict
+```
+
+If you made the edit, restore from a verified backup (RECOVERY.md). Never
+"fix" a hash by hand: a hash you typed proves nothing.
+
+### "A source of kind 'evidence' requires --evidence E-XXXX" / "must not carry --locator"
+
+The two source shapes are exclusive, and both the CLI and a CHECK constraint
+enforce it:
+
+- `--kind evidence` → **must** have `--evidence`, **must not** have `--locator`.
+- every other kind → **must** have `--locator`, **must not** have `--evidence`.
+
+An evidence source names a ledger row; copying that row's ref into a locator
+would create a second copy of the same fact, and two copies of one fact
+eventually disagree.
+
+### "Refusing to link source MS-0001 (project 'other') to claim M-0001 (project 'demo')"
+
+A **project** source may back only claims in the same project — including not
+global ones. A **global** source (`memory source add` with no `--project`) may
+back anything. Nothing changed. Either add the source globally, or link it to a
+claim in its own project.
+
+Edges use a slightly looser rule for a reason: project-A ↔ project-B is
+refused, but global ↔ project is fine, because a global claim legitimately
+relates to a project one.
+
+### "Refusing to link source MS-0001 (restricted) to claim M-0001 (internal)"
+
+A source must not be more sensitive than the claim it backs, or the link
+becomes a way to reach the source through the claim. The message prints the
+fix:
+
+```bash
+python3 aos.py memory classify M-0001 restricted   # raise the claim, then link
+```
+
+### "Refusing to down-classify memory M-0001 from confidential to internal"
+
+`memory classify` raises a claim's sensitivity and never lowers it. Lowering
+the protection on a claim is an authorization decision; it belongs to U-S6,
+which this build does not ship. Nothing changed.
+
+Re-classifying to the level a claim already has is a no-op: it prints "already
+…; nothing changed", writes nothing, and emits no event.
+
+### "ME-0001 already records M-0001 —contradicts→ M-0002; nothing changed."
+
+You added a symmetric edge that already exists — possibly written the other way
+round. `contradicts` and `related` are symmetric, so A↔B and B↔A are **one**
+logical edge, stored lowest-id-first. `memory edge add M-0002 M-0001
+--relation contradicts` therefore finds the existing `M-0001 ↔ M-0002` row and
+does nothing. That is correct: two rows for one fact is how a ledger starts
+disagreeing with itself.
+
+Directional relations (`supports`, `refines`, `depends_on`) keep the order you
+gave, so `A supports B` and `B supports A` are two different edges.
+
+### "Refusing a self-edge on memory M-0001" / "Refusing an inverted validity window"
+
+A claim cannot relate to itself, and `--valid-from` cannot be after
+`--valid-until`. Both are refused before any write and both are also CHECK
+constraints, so neither can be created by raw SQL either.
+
+### My restricted claim is missing from a pack / search snippet / mirror note
+
+Working as designed. `restricted` claims never enter a context pack, a search
+snippet, a generated summary or a mirror body. They are not hidden from *you*:
+
+```bash
+python3 aos.py memory list            # shown as "live·restricted"
+python3 aos.py memory show M-0007     # metadata + value, deliberately
+```
+
+`memory list`, `search` and the mirror show a restricted claim's **metadata** —
+id, scope, kind, status, sensitivity, timestamps, counts, hash — and replace
+its key, value, source and evidence refs with `(restricted)`. `memory show`
+prints the value: it is the one command whose entire purpose is to show you
+your own claim.
+
+Note `memory list` reports `live·restricted`, not `live·expired` — a restricted
+claim is ineligible for retrieval without having expired.
+
+### doctor: "[WARN] restricted claims absent from generated context — M-0007 in T-0001-….md"
+
+A generated pack or mirror note on disk contains the text of a claim that is
+*now* restricted. The usual cause is honest: you built the pack, then
+classified the claim afterwards. Nothing was violated at the time, which is why
+this warns instead of failing.
+
+It is still a real leak on disk. Regenerate the surfaces:
+
+```bash
+python3 aos.py sync                    # rewrites mirror notes
+python3 aos.py pack build T-0001 --for claude-code   # rebuilds the pack
+```
+
+The warning names the claim id and the file name — never the text that
+matched.
+
+### doctor: "[FAIL] memory edges are well-formed — ME-0001: symmetric edge is not canonically ordered"
+
+Only reachable by writing a row directly to SQLite. A symmetric edge stored
+with the higher id first is not cosmetic: the UNIQUE constraint no longer
+collides with its mirror image, so the same contradiction can be stored twice.
+Restore from a verified backup (RECOVERY.md); do not hand-edit the row.
+
+### "(truncated at the traversal caps: 64 nodes / 128 edges…)"
+
+`memory graph` is a bounded diagnostic: depth 1 or 2, at most 64 nodes and 128
+edges. On reaching a cap it stops deterministically and tells you, rather than
+printing an unbounded ledger or silently implying you saw everything.
+
+Narrow the question instead of widening the tool:
+
+```bash
+python3 aos.py memory graph M-0001 --depth 1        # the immediate neighbours
+python3 aos.py memory edge list --relation contradicts --active-only
+python3 aos.py memory edge list --project demo --json
+```
+
+### Nothing followed my locator / my URL was not fetched
+
+Correct, and not a bug. Locators, URLs, command strings, evidence refs and
+artifact paths are **inert**: no U-M3 command opens, fetches, executes or
+resolves any of them, and none touches the network. A source records *that* a
+claim came from somewhere. Reading what is there is your job, deliberately, in
+a tool that is meant to.
+
+For the same reason `memory source list` and `memory source show` never print
+the locator or the provenance — a URL with a token in its query string does not
+belong in a listing you scroll past.

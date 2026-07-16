@@ -196,15 +196,18 @@ class ProductionRegistryTest(MigrationTestCase):
         # If this fails, a migration was added without raising SCHEMA_VERSION
         # with it — or the reverse.
         self.assertEqual(migrations.LATEST_VERSION, int(db.SCHEMA_VERSION))
-        self.assertEqual(migrations.LATEST_VERSION, 2)
+        self.assertEqual(migrations.LATEST_VERSION, 3)
 
-    def test_production_registry_is_the_one_u_m2_step(self):
+    def test_production_registry_is_the_two_production_steps(self):
         self.assertEqual(
             [
                 (m.from_version, m.to_version, m.migration_id)
                 for m in migrations.MIGRATIONS
             ],
-            [(1, 2, "u-m2-memory-claims-v2")],
+            [
+                (1, 2, "u-m2-memory-claims-v2"),
+                (2, 3, "u-m3-memory-graph-v3"),
+            ],
         )
         migrations.validate_registry()
 
@@ -215,20 +218,23 @@ class ProductionRegistryTest(MigrationTestCase):
         self.assertNotIn("0001-synthetic-v2", ids)
         self.assertNotIn("0002-synthetic-v3", ids)
 
-    def test_production_registry_reports_the_one_pending_migration(self):
+    def test_production_registry_reports_the_pending_migrations(self):
         report = migrations.status(self.db_path)
         self.assertEqual(report["current_version"], 1)
-        self.assertEqual(report["latest_version"], 2)
+        self.assertEqual(report["latest_version"], 3)
         self.assertTrue(report["pending"])
         self.assertEqual(
             report["plan"],
-            [{"from": 1, "to": 2, "migration_id": "u-m2-memory-claims-v2"}],
+            [
+                {"from": 1, "to": 2, "migration_id": "u-m2-memory-claims-v2"},
+                {"from": 2, "to": 3, "migration_id": "u-m3-memory-graph-v3"},
+            ],
         )
 
     def test_nothing_is_pending_once_the_fixture_is_current(self):
         self.migrate_to_current()
         report = migrations.status(self.db_path)
-        self.assertEqual(report["current_version"], 2)
+        self.assertEqual(report["current_version"], int(db.SCHEMA_VERSION))
         self.assertFalse(report["pending"])
         self.assertEqual(report["plan"], [])
 
@@ -1054,15 +1060,15 @@ class RegistryValidationTest(MigrationTestCase):
             conn.commit()
         finally:
             conn.close()
-        # The planted name is inert: the registry is still exactly the one
-        # step compiled into source.
+        # The planted name is inert: the registry is still exactly the steps
+        # compiled into source.
         self.assertEqual(
             [m.migration_id for m in migrations.MIGRATIONS],
-            ["u-m2-memory-claims-v2"],
+            ["u-m2-memory-claims-v2", "u-m3-memory-graph-v3"],
         )
         self.assertEqual(
             [s["migration_id"] for s in migrations.status(self.db_path)["plan"]],
-            ["u-m2-memory-claims-v2"],
+            ["u-m2-memory-claims-v2", "u-m3-memory-graph-v3"],
         )
 
 

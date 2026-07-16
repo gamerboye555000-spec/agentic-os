@@ -35,6 +35,14 @@ integrity, evidence-link resolution (both FAIL), plus two WARN-ONLY facts —
 pinned-but-ineligible claims, and non-retired claims past their valid_until.
 Same rule as every line above: M-XXXX/E-XXXX ids, closed-vocabulary status
 names and counts only. Never a key, value, source, evidence ref, or a hash.
+
+U-M3 adds five memory-graph lines (checks 26-30): sensitivity vocabulary,
+source shape/target/window/hash, source-link resolution plus project and
+sensitivity compatibility, edge shape/canonical-form/scope/hash (all FAIL),
+and one WARN-ONLY fact — restricted claim text found in a generated pack or
+mirror note, which a `pack build` predating the classification reaches
+honestly. Same rule again: ids, reason codes, generated file names and counts.
+Never a key, value, locator, provenance, evidence ref, or a hash.
 """
 
 from __future__ import annotations
@@ -45,15 +53,17 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import db, ids, obsidian, ops, power, secretscan, utils
+from . import db, ids, models, obsidian, ops, power, secretscan, utils
 from .models import (
     AGENT_KINDS,
     AGENT_NAME_RE,
+    MEMORY_SENSITIVITY_RESTRICTED,
     MEMORY_STATUS_RETIRED,
     MEMORY_STATUSES,
     TASK_STATUSES,
     MemoryItem,
 )
+from .utils import AosError
 
 # Shared generated-layout rules live in obsidian.py (public, also consumed
 # by the U-C4 mirror export); these aliases keep doctor's historical names.
@@ -140,6 +150,16 @@ _SWEEP_DOMAIN_FIELDS = (
         ("key", "key"),
         ("value", "value_md"),
         ("source", "source"),
+    )),
+    # U-M3 sources. A locator is a path, URL or command string the operator
+    # typed — the exact shape that carries a token in a query string — and the
+    # warn-on-write path already flags one at the CLI boundary. This is the
+    # half that finds the ones written directly, or written before the
+    # detector knew the pattern. The value is never echoed: the finding is
+    # MS-XXXX plus the field and pattern NAMES, like every line above.
+    ("memory_source", "memory_sources", (
+        ("locator", "locator"),
+        ("provenance", "provenance"),
     )),
 )
 
@@ -776,6 +796,7 @@ def run_checks(conn: sqlite3.Connection, aos_dir: Path) -> list[Check]:
         )
 
     checks.extend(_memory_claim_checks(conn))
+    checks.extend(_memory_graph_checks(conn, aos_dir, aos_root))
 
     return checks
 
@@ -914,4 +935,343 @@ def _memory_claim_checks(conn: sqlite3.Connection) -> list[Check]:
             _bounded_ids(expired_not_retired, "claim"),
             warn_only=True,
         ),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# U-M3 memory graph integrity (checks 26-30; contract M3.14)
+
+
+def _bounded_problems(problems: list[str]) -> str:
+    """The shared detail renderer for the graph checks: at most
+    UH2_DISPLAY_LIMIT findings, then a count. Output derived from ledger rows
+    stays bounded, however damaged the ledger is."""
+    if not problems:
+        return ""
+    extra = len(problems) - UH2_DISPLAY_LIMIT
+    return "; ".join(problems[:UH2_DISPLAY_LIMIT]) + (
+        f" (+{extra} more)" if extra > 0 else ""
+    )
+
+
+def _rank_or_none(level) -> int | None:
+    """The sensitivity ladder position, or None for a value that is not on it.
+
+    Never raises and never echoes the value: an unknown sensitivity is a
+    finding for check 26 to report by ID, not an exception that takes doctor
+    down with it.
+    """
+    if not isinstance(level, str):
+        return None
+    try:
+        return models.sensitivity_rank(level)
+    except AosError:
+        return None
+
+
+def _sensitivity_check(conn: sqlite3.Connection) -> Check:
+    """26. Every claim's and source's sensitivity is on the closed ladder.
+
+    Reachable only by editing the file — the CHECK constraints refuse the rest
+    — which is exactly why it is worth checking. A row whose sensitivity is
+    unreadable is a row whose exclusion from packs cannot be reasoned about.
+    """
+    problems: list[str] = []
+    for table, entity in (("memory", "memory"), ("memory_sources", "memory_source")):
+        for row in conn.execute(
+            f"SELECT id, sensitivity FROM {table} ORDER BY id"
+        ).fetchall():
+            if _rank_or_none(row["sensitivity"]) is None:
+                # The VALUE is not echoed: it is stored data, and stored data
+                # is exactly what must not reach a diagnostic line.
+                problems.append(
+                    f"{ids.render_id(entity, row['id'])}: unknown sensitivity"
+                )
+    return Check(
+        "memory sensitivity values are known",
+        not problems,
+        _bounded_problems(problems),
+    )
+
+
+def _source_checks(conn: sqlite3.Connection) -> Check:
+    """27. Sources are well-formed: shape, targets, window, hash."""
+    problems: list[str] = []
+    for row in conn.execute("SELECT * FROM memory_sources ORDER BY id").fetchall():
+        hid = ids.render_id("memory_source", row["id"])
+        found: list[str] = []
+        try:
+            item = models.MemorySource.from_row(row)
+        except (TypeError, KeyError):
+            problems.append(f"{hid}: unreadable row")
+            continue
+
+        if item.source_kind not in models.MEMORY_SOURCE_KINDS:
+            found.append("unknown source kind")
+        elif item.source_kind == models.MEMORY_SOURCE_KIND_EVIDENCE:
+            if item.evidence_id is None or item.locator is not None:
+                found.append("evidence source with a locator or no evidence id")
+        elif item.evidence_id is not None or item.locator is None:
+            found.append("non-evidence source with an evidence id or no locator")
+
+        if item.evidence_id is not None and conn.execute(
+            "SELECT 1 FROM evidence WHERE id = ?", (item.evidence_id,)
+        ).fetchone() is None:
+            # The evidence ID is named; the evidence row is never read.
+            found.append(
+                f"missing evidence {ids.render_id('evidence', item.evidence_id)}"
+            )
+        if item.project_id is not None and conn.execute(
+            "SELECT 1 FROM projects WHERE id = ?", (item.project_id,)
+        ).fetchone() is None:
+            found.append("missing project")
+
+        if (
+            isinstance(item.valid_from, str)
+            and isinstance(item.valid_until, str)
+            and item.valid_from > item.valid_until
+        ):
+            found.append("validity window is inverted")
+
+        state = ops.source_integrity(item)
+        if state != "ok":
+            found.append(_INTEGRITY_PROBLEM[state])
+
+        if found:
+            problems.append(f"{hid}: " + ", ".join(found))
+    return Check(
+        "memory sources are well-formed", not problems, _bounded_problems(problems)
+    )
+
+
+def _source_link_checks(conn: sqlite3.Connection) -> Check:
+    """28. Source links resolve, are unique, and respect project/sensitivity.
+
+    The compatibility rules are re-checked here rather than trusted: they are
+    enforced in `ops` before every write, so a violation found now means a
+    writer bypassed `ops` — which is the whole reason to look.
+    """
+    problems: list[str] = []
+    for row in conn.execute(
+        "SELECT l.*, m.project_id AS m_project, m.sensitivity AS m_sensitivity, "
+        "m.id AS m_ref, s.project_id AS s_project, "
+        "s.sensitivity AS s_sensitivity, s.id AS s_ref "
+        "FROM memory_source_links l "
+        "LEFT JOIN memory m ON m.id = l.memory_id "
+        "LEFT JOIN memory_sources s ON s.id = l.source_id "
+        "ORDER BY l.id"
+    ).fetchall():
+        hid = ids.render_id("memory_source_link", row["id"])
+        found: list[str] = []
+        if row["m_ref"] is None:
+            found.append(
+                f"missing claim {ids.render_id('memory', row['memory_id'])}"
+            )
+        if row["s_ref"] is None:
+            found.append(
+                f"missing source {ids.render_id('memory_source', row['source_id'])}"
+            )
+        if row["relation"] not in models.MEMORY_SOURCE_RELATIONS:
+            found.append("unknown relation")
+
+        if row["m_ref"] is not None and row["s_ref"] is not None:
+            if (
+                row["s_project"] is not None
+                and row["s_project"] != row["m_project"]
+            ):
+                found.append("project source linked outside its project")
+            source_rank = _rank_or_none(row["s_sensitivity"])
+            claim_rank = _rank_or_none(row["m_sensitivity"])
+            if (
+                source_rank is not None
+                and claim_rank is not None
+                and source_rank > claim_rank
+            ):
+                found.append("source is more sensitive than its claim")
+
+        try:
+            link = models.MemorySourceLink.from_row(
+                {k: row[k] for k in (
+                    "id", "memory_id", "source_id", "relation", "created_at",
+                    "content_sha256",
+                )}
+            )
+        except (TypeError, KeyError):
+            found.append("unreadable row")
+        else:
+            state = ops.source_link_integrity(link)
+            if state != "ok":
+                found.append(_INTEGRITY_PROBLEM[state])
+
+        if found:
+            problems.append(f"{hid}: " + ", ".join(found))
+
+    # Duplicates are impossible while the UNIQUE constraint stands; this finds
+    # the ones that got in if it was ever bypassed.
+    for row in conn.execute(
+        "SELECT memory_id, source_id, relation, COUNT(*) AS n "
+        "FROM memory_source_links GROUP BY memory_id, source_id, relation "
+        "HAVING n > 1 ORDER BY memory_id, source_id, relation"
+    ).fetchall():
+        problems.append(
+            f"{ids.render_id('memory', row['memory_id'])} → "
+            f"{ids.render_id('memory_source', row['source_id'])} × {row['n']}"
+        )
+    return Check(
+        "memory source links resolve", not problems, _bounded_problems(problems)
+    )
+
+
+def _edge_checks(conn: sqlite3.Connection) -> Check:
+    """29. Edges are well-formed: endpoints, relation, canonical form, window,
+    project scope, hash."""
+    problems: list[str] = []
+    for row in conn.execute(
+        "SELECT e.*, f.id AS from_ref, f.project_id AS from_project, "
+        "t.id AS to_ref, t.project_id AS to_project FROM memory_edges e "
+        "LEFT JOIN memory f ON f.id = e.from_memory_id "
+        "LEFT JOIN memory t ON t.id = e.to_memory_id ORDER BY e.id"
+    ).fetchall():
+        hid = ids.render_id("memory_edge", row["id"])
+        found: list[str] = []
+        try:
+            edge = models.MemoryEdge.from_row(
+                {k: row[k] for k in (
+                    "id", "from_memory_id", "to_memory_id", "relation",
+                    "valid_from", "valid_until", "created_at", "content_sha256",
+                )}
+            )
+        except (TypeError, KeyError):
+            problems.append(f"{hid}: unreadable row")
+            continue
+
+        if row["from_ref"] is None:
+            found.append(
+                f"missing claim {ids.render_id('memory', edge.from_memory_id)}"
+            )
+        if row["to_ref"] is None:
+            found.append(
+                f"missing claim {ids.render_id('memory', edge.to_memory_id)}"
+            )
+        if edge.from_memory_id == edge.to_memory_id:
+            found.append("self-edge")
+        if edge.relation not in models.MEMORY_EDGE_RELATIONS:
+            found.append("unknown relation")
+        elif (
+            edge.relation in models.MEMORY_EDGE_SYMMETRIC
+            and isinstance(edge.from_memory_id, int)
+            and isinstance(edge.to_memory_id, int)
+            and edge.from_memory_id > edge.to_memory_id
+        ):
+            # A symmetric edge stored the wrong way round is not cosmetic: the
+            # UNIQUE constraint no longer collides with its mirror image, so
+            # the same fact can be stored twice (D-v0.3.36).
+            found.append("symmetric edge is not canonically ordered")
+        if (
+            row["from_project"] is not None
+            and row["to_project"] is not None
+            and row["from_project"] != row["to_project"]
+        ):
+            found.append("edge crosses projects")
+        if (
+            isinstance(edge.valid_from, str)
+            and isinstance(edge.valid_until, str)
+            and edge.valid_from > edge.valid_until
+        ):
+            found.append("validity window is inverted")
+
+        state = ops.edge_integrity(edge)
+        if state != "ok":
+            found.append(_INTEGRITY_PROBLEM[state])
+
+        if found:
+            problems.append(f"{hid}: " + ", ".join(found))
+
+    for row in conn.execute(
+        "SELECT from_memory_id, to_memory_id, relation, COUNT(*) AS n "
+        "FROM memory_edges GROUP BY from_memory_id, to_memory_id, relation "
+        "HAVING n > 1 ORDER BY from_memory_id, to_memory_id, relation"
+    ).fetchall():
+        problems.append(
+            f"{ids.render_id('memory', row['from_memory_id'])} → "
+            f"{ids.render_id('memory', row['to_memory_id'])} × {row['n']}"
+        )
+    return Check(
+        "memory edges are well-formed", not problems, _bounded_problems(problems)
+    )
+
+
+def _restricted_context_check(
+    conn: sqlite3.Connection, aos_dir: Path, aos_root: Path
+) -> Check:
+    """30 (WARN). Restricted claim text sitting in a generated context surface.
+
+    WARN, never FAIL (D-v0.3.46): a pack built BEFORE a claim was classified
+    restricted legitimately contains it. The operator did nothing wrong and no
+    invariant was violated at the time — but it is a real leak on disk they
+    should know about, and `pack build` / `sync` regenerate it away. A check
+    that turns red because history happened is a broken check.
+
+    The claim's key is READ (it is in the same database) and never PRINTED:
+    the finding is the claim id and the file's name, never the text that
+    matched or the line it sat on.
+    """
+    restricted = [
+        (row["id"], row["key"])
+        for row in conn.execute(
+            "SELECT id, key FROM memory WHERE sensitivity = ? ORDER BY id",
+            (MEMORY_SENSITIVITY_RESTRICTED,),
+        ).fetchall()
+        if isinstance(row["key"], str) and row["key"].strip()
+    ]
+    if not restricted:
+        return Check("restricted claims absent from generated context", True, "")
+
+    findings: list[str] = []
+    surfaces = list((aos_dir / "packs").glob("*.md")) + list(
+        (aos_root / "Memory").glob("*.md")
+    )
+    for path in sorted(surfaces):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue  # unreadable file is check 2's problem, not this one's
+        for memory_id, key in restricted:
+            if key in text:
+                findings.append(
+                    f"{ids.render_id('memory', memory_id)} in {path.name}"
+                )
+    return Check(
+        "restricted claims absent from generated context",
+        not findings,
+        _bounded_problems(findings),
+        warn_only=True,
+    )
+
+
+#: How an integrity verdict reads in a diagnostic. Reason codes, never values.
+_INTEGRITY_PROBLEM = {
+    "malformed": "malformed content hash",
+    "mismatch": "content hash does not match the record",
+    "unhashable": "record fields cannot be hashed",
+}
+
+
+def _memory_graph_checks(
+    conn: sqlite3.Connection, aos_dir: Path, aos_root: Path
+) -> list[Check]:
+    """The five U-M3 lines (checks 26-30).
+
+    Every diagnostic below is an M-/MS-/ML-/ME-/E-XXXX id, a reason code from
+    a fixed set, a generated file's name, or a count. Never a claim key or
+    value, a source locator or provenance, an evidence ref, a full hash, or an
+    arbitrary SQLite value — a check that leaked the row it is complaining
+    about would be a worse problem than the row.
+    """
+    return [
+        _sensitivity_check(conn),
+        _source_checks(conn),
+        _source_link_checks(conn),
+        _edge_checks(conn),
+        _restricted_context_check(conn, aos_dir, aos_root),
     ]

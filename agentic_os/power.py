@@ -163,6 +163,13 @@ COMMAND_POLICY: dict[tuple[str, ...], CommandPolicy] = {
     ("memory", "pin"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("memory", "unpin"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("memory", "link-evidence"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    # U-M3 graph writes. Each writes a canonical row, its integrity hash and
+    # an event in one transaction — authoritative by the same mechanical rule
+    # as everything above it, and so blocked in recovery BEFORE it mutates.
+    ("memory", "classify"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("memory", "source", "add"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("memory", "source", "link"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("memory", "edge", "add"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("agent", "add"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("agent", "update"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("ingest", "dropfile"): _p(AUTHORITATIVE_WRITE, ledger=True),
@@ -193,6 +200,16 @@ COMMAND_POLICY: dict[tuple[str, ...], CommandPolicy] = {
     ("task", "show"): _p(READ_ONLY),
     ("memory", "list"): _p(READ_ONLY),
     ("memory", "show"): _p(READ_ONLY),
+    # U-M3 graph inspection. Each reads rows and prints ids, enum names and
+    # counts. None opens a source locator, resolves a URL, runs a command
+    # string or reads an evidence ref — the references are inert by
+    # construction (D-v0.3.47), which is what keeps these read_only rather
+    # than merely read-mostly.
+    ("memory", "source", "list"): _p(READ_ONLY),
+    ("memory", "source", "show"): _p(READ_ONLY),
+    ("memory", "edge", "list"): _p(READ_ONLY),
+    ("memory", "graph"): _p(READ_ONLY),
+    ("memory", "contradictions"): _p(READ_ONLY),
     ("agent", "list"): _p(READ_ONLY),
     ("agent", "show"): _p(READ_ONLY),
     ("hooks", "status"): _p(READ_ONLY),
@@ -243,13 +260,27 @@ def iter_command_paths(parser) -> list[tuple[str, ...]]:
     return sorted(walk(parser, ()))
 
 
+#: The argparse dests the classification key is assembled from, outermost
+#: first. U-M3 added the third level: `memory source add` and `memory edge add`
+#: are three deep, and a key that stopped at two would classify every
+#: `memory source *` leaf as one command — including collapsing the read-only
+#: ones into the writes.
+_PATH_DESTS = ("command", "subcommand", "subsubcommand")
+
+
 def command_path(args) -> tuple[str, ...]:
-    """The classification key for a parsed argparse namespace."""
-    command = getattr(args, "command", None)
-    if command is None:
-        return ()
-    sub = getattr(args, "subcommand", None)
-    return (command,) if sub is None else (command, sub)
+    """The classification key for a parsed argparse namespace.
+
+    Stops at the first absent level, so a two-deep command never picks up a
+    stale third element.
+    """
+    path: tuple[str, ...] = ()
+    for dest in _PATH_DESTS:
+        value = getattr(args, dest, None)
+        if value is None:
+            break
+        path += (value,)
+    return path
 
 
 def policy_for(path: tuple[str, ...]) -> CommandPolicy:

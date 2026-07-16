@@ -184,15 +184,17 @@ class V2WorkspaceTestCase(unittest.TestCase):
 # 1/2. Schema version 2 and the production registry
 
 class SchemaVersionTest(V2WorkspaceTestCase):
-    def test_fresh_init_creates_schema_version_two(self):
-        """(1)"""
-        self.assertEqual(db.SCHEMA_VERSION, "2")
+    def test_fresh_init_creates_the_current_schema_version(self):
+        """(1) U-M3 moved the current version to 3. What U-M2 pins here is
+        that a fresh workspace is born AT it, whatever it is — the literal
+        lives in db.py and is asserted against 3 in the U-M3 suite."""
+        self.assertEqual(db.SCHEMA_VERSION, "3")
         self.assertEqual(self.query(
             "SELECT value FROM meta WHERE key='schema_version'"
-        )[0][0], "2")
+        )[0][0], db.SCHEMA_VERSION)
 
     def test_fresh_init_never_migrates(self):
-        """(1) A new workspace is BORN at 2 — no migration event, nothing
+        """(1) A new workspace is BORN current — no migration event, nothing
         pending."""
         self.assertEqual(
             self.query(
@@ -204,8 +206,9 @@ class SchemaVersionTest(V2WorkspaceTestCase):
         report = migrations.status(self.db_path)
         self.assertFalse(report["pending"])
 
-    def test_fresh_v2_memory_table_shape(self):
-        """(1/16) Every v1 column survives; exactly three are added."""
+    def test_fresh_memory_table_shape(self):
+        """(1/16) Every v1 column survives; U-M2 added exactly three, and
+        U-M3 added exactly one more (`sensitivity`)."""
         columns = {
             row["name"]: row for row in self.query("PRAGMA table_info(memory)")
         }
@@ -221,7 +224,7 @@ class SchemaVersionTest(V2WorkspaceTestCase):
                 "source", "confidence", "valid_from", "valid_until",
                 "superseded_by", "updated_at",
             },
-            {"status", "pinned", "content_sha256"},
+            {"status", "pinned", "sensitivity", "content_sha256"},
         )
         self.assertEqual(columns["status"]["dflt_value"], "'live'")
         self.assertEqual(columns["pinned"]["dflt_value"], "0")
@@ -246,9 +249,10 @@ class SchemaVersionTest(V2WorkspaceTestCase):
 
 
 class ProductionRegistryTest(unittest.TestCase):
-    def test_registry_holds_exactly_the_one_to_two_migration(self):
-        """(2)"""
-        self.assertEqual(len(migrations.MIGRATIONS), 1)
+    def test_registry_still_holds_the_one_to_two_migration_first(self):
+        """(2) U-M3 appended a second step; U-M2's remains the FIRST, with
+        its identifier unchanged. A shipped migration id is a permanent
+        fact — renaming one would orphan every database that ran it."""
         step = migrations.MIGRATIONS[0]
         self.assertEqual(
             (step.from_version, step.to_version, step.migration_id),
@@ -259,12 +263,13 @@ class ProductionRegistryTest(unittest.TestCase):
     def test_latest_version_still_derives_from_the_schema(self):
         """(2) One declaration; a bump cannot land in only one place."""
         self.assertEqual(migrations.LATEST_VERSION, int(db.SCHEMA_VERSION))
-        self.assertEqual(migrations.LATEST_VERSION, 2)
 
-    def test_no_third_version_and_no_second_transition(self):
-        """(2) U-M2 adds ONE production step. Nothing targets 3."""
+    def test_the_one_to_two_step_is_the_only_thing_targeting_version_two(self):
+        """(2) U-M2 adds ONE production step. Whatever later units append,
+        exactly one migration may target version 2."""
         self.assertEqual(
-            [m.to_version for m in migrations.MIGRATIONS], [2]
+            [m.migration_id for m in migrations.MIGRATIONS if m.to_version == 2],
+            ["u-m2-memory-claims-v2"],
         )
 
 
@@ -272,15 +277,16 @@ class ProductionRegistryTest(unittest.TestCase):
 # 3/4/5. Status, plan, and snapshot-before-mutation
 
 class StatusAndPlanTest(V1FixtureTestCase):
-    def test_v1_fixture_reports_exactly_one_pending_migration(self):
-        """(3)"""
+    def test_v1_fixture_reports_the_one_to_two_step_first(self):
+        """(3) The v1 fixture is two steps behind since U-M3, and the U-M2
+        step is still the FIRST thing that runs on it."""
         report = migrations.status(self.db_path)
         self.assertEqual(report["current_version"], 1)
-        self.assertEqual(report["latest_version"], 2)
+        self.assertEqual(report["latest_version"], int(db.SCHEMA_VERSION))
         self.assertTrue(report["pending"])
         self.assertEqual(
-            report["plan"],
-            [{"from": 1, "to": 2, "migration_id": "u-m2-memory-claims-v2"}],
+            report["plan"][0],
+            {"from": 1, "to": 2, "migration_id": "u-m2-memory-claims-v2"},
         )
 
     def test_plan_is_read_only_and_shows_one_to_two(self):
@@ -292,7 +298,7 @@ class StatusAndPlanTest(V1FixtureTestCase):
         )
         code, out, _ = self.aos("migrate", "plan")
         self.assertEqual(code, 0)
-        self.assertIn("1 → 2", out)
+        self.assertIn("1 → 2  u-m2-memory-claims-v2", out)
         self.assertIn("u-m2-memory-claims-v2", out)
         self.assertEqual(self.db_path.read_bytes(), before)
         self.assertEqual(
@@ -309,8 +315,8 @@ class StatusAndPlanTest(V1FixtureTestCase):
         code, out, _ = self.aos("migrate", "status")
         self.assertEqual(code, 0)
         self.assertIn("schema version:  1", out)
-        self.assertIn("build supports:  2", out)
-        self.assertIn("pending:         yes (1 migration(s))", out)
+        self.assertIn(f"build supports:  {db.SCHEMA_VERSION}", out)
+        self.assertIn("pending:         yes", out)
 
 
 class SnapshotBeforeMutationTest(V1FixtureTestCase):
@@ -368,7 +374,13 @@ class LegacyMigrationTest(V1FixtureTestCase):
             row["id"]: dict(row)
             for row in self.query("SELECT * FROM memory ORDER BY id")
         }
-        self.result = migrations.apply_migrations(self.aos_dir)
+        # target=2, not "the latest": this class's SUBJECT is the 1 → 2 step,
+        # and U-M3 appended a 2 → 3 that would otherwise run straight over it
+        # and leave these assertions describing a v3 database. Stopping at the
+        # step under test is also a real proof in its own right — each step
+        # leaves a database that genuinely IS its own version. U-M3's suite
+        # proves the rest of the chain.
+        self.result = migrations.apply_migrations(self.aos_dir, target=2)
 
     def claims(self) -> dict[int, sqlite3.Row]:
         return {
@@ -426,22 +438,30 @@ class LegacyMigrationTest(V1FixtureTestCase):
         )
 
     def test_every_migrated_row_gets_the_correct_hash(self):
-        """(10)"""
-        conn = db.connect(self.db_path)
-        try:
-            for row in conn.execute("SELECT * FROM memory ORDER BY id"):
-                item = models.MemoryItem.from_row(row)
-                self.assertTrue(
-                    models.is_claim_hash(item.content_sha256),
-                    f"M-{item.id:04d} hash is malformed",
-                )
-                self.assertEqual(ops.claim_integrity(conn, item), "ok")
-        finally:
-            conn.close()
+        """(10) A v2 hash, on a database stopped at v2.
+
+        `ops.claim_integrity` computes the CURRENT payload, which is v3 since
+        U-M3 — so it is the wrong oracle for a v2 row, and using it here would
+        quietly prove nothing. The oracle is the frozen v2 payload the step
+        itself writes with.
+        """
+        for row in self.query("SELECT * FROM memory ORDER BY id"):
+            legacy = dict(row)
+            self.assertTrue(
+                models.is_claim_hash(legacy["content_sha256"]),
+                f"M-{legacy['id']:04d} hash is malformed",
+            )
+            self.assertEqual(
+                legacy["content_sha256"],
+                migrations._v2_claim_digest(
+                    legacy, legacy["status"], legacy["pinned"]
+                ),
+                f"M-{legacy['id']:04d} carries the wrong v2 hash",
+            )
 
     def test_schema_version_advances_exactly_once(self):
         """(11)"""
-        self.assertEqual(self.version(), "2")
+        self.assertEqual(self.version(), "2")  # target=2: see setUp
         self.assertEqual(
             self.result["applied"],
             ({"from": 1, "to": 2, "migration_id": "u-m2-memory-claims-v2"},),
@@ -467,25 +487,42 @@ class LegacyMigrationTest(V1FixtureTestCase):
         self.assertNotIn("INSERT", blob.upper())
         self.assertNotIn("SELECT", blob.upper())
 
-    def test_migrated_shape_matches_a_freshly_initialized_v2(self):
+    def test_migrated_shape_matches_a_born_v2_table(self):
         """(11) A migrated table and a born-v2 table must be the same table,
-        or the rebuild bought nothing."""
-        fresh_dir = self.root.parent / "fresh"
-        fresh_dir.mkdir()
-        conn, _ = db.init_db(fresh_dir / utils.AOS_DIR_NAME / utils.DB_FILENAME)
+        or the rebuild bought nothing.
+
+        "Born v2" is now a FROZEN definition rather than `db.init_db` — v2 is
+        history since U-M3, and a fresh init builds a v3 table. Comparing the
+        1 → 2 step's output against anything else would be comparing it to a
+        table it is not supposed to produce. (Fresh-vs-migrated identity for
+        the CURRENT version is proven in the U-M3 suite, against a real
+        `init_db`.)
+        """
+        scratch = sqlite3.connect(":memory:")
         try:
-            fresh = [tuple(r)[1:] for r in conn.execute("PRAGMA table_info(memory)")]
+            scratch.execute(
+                migrations._V2_MEMORY_CLAIM_DDL.format(table="born_v2")
+            )
+            scratch.execute(
+                db.MEMORY_EVIDENCE_DDL.format(table="born_v2_evidence")
+            )
+            fresh = [
+                tuple(r)[1:] for r in scratch.execute("PRAGMA table_info(born_v2)")
+            ]
             fresh_links = [
-                tuple(r)[1:] for r in conn.execute("PRAGMA table_info(memory_evidence)")
+                tuple(r)[1:]
+                for r in scratch.execute("PRAGMA table_info(born_v2_evidence)")
             ]
         finally:
-            conn.close()
+            scratch.close()
         migrated = [tuple(r)[1:] for r in self.query("PRAGMA table_info(memory)")]
         migrated_links = [
             tuple(r)[1:] for r in self.query("PRAGMA table_info(memory_evidence)")
         ]
         self.assertEqual(migrated, fresh)
         self.assertEqual(migrated_links, fresh_links)
+        # And it really is the v2 shape: no U-M3 column got in.
+        self.assertNotIn("sensitivity", [c[0] for c in migrated])
 
     def test_constraints_are_live_on_a_migrated_database(self):
         """(16) The CHECKs came across with the rebuild, not just the columns."""
@@ -502,7 +539,14 @@ class LegacyMigrationTest(V1FixtureTestCase):
                     conn.close()
 
     def test_migrated_claims_are_usable_immediately(self):
-        """(6) The point of the migration: the CLI works on the result."""
+        """(6) The point of the migration: the CLI works on the result.
+
+        The CLI runs against the CURRENT schema and nothing else, so this one
+        finishes the chain the rest of the class deliberately stops short of.
+        """
+        code, _, err = self.aos("migrate", "apply")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.version(), db.SCHEMA_VERSION)
         code, out, err = self.aos("memory", "show", "M-0001", "--json")
         self.assertEqual(code, 0, err)
         doc = json.loads(out)
@@ -565,14 +609,14 @@ class MigrationFailureTest(V1FixtureTestCase):
             migrations.apply_migrations(self.aos_dir, registry=failing, latest=2)
         self.assertEqual(self.version(), "1")
 
-        result = migrations.apply_migrations(self.aos_dir)
+        result = migrations.apply_migrations(self.aos_dir, target=2)
         self.assertTrue(result["migrated"])
-        self.assertEqual(self.version(), "2")
+        self.assertEqual(self.version(), "2")  # target=2: the step under test
         self.assertEqual(len(self.migrate_events()), 1)
         self.assertEqual(len(self.query("SELECT id FROM memory")), 5)
 
         # And a second apply is a no-op: exactly once, not once per attempt.
-        again = migrations.apply_migrations(self.aos_dir)
+        again = migrations.apply_migrations(self.aos_dir, target=2)
         self.assertFalse(again["migrated"])
         self.assertIsNone(again["snapshot"])
         self.assertEqual(len(self.migrate_events()), 1)
@@ -1106,9 +1150,12 @@ class ShowAndListTest(V2WorkspaceTestCase):
             for path in power.iter_command_paths(cli.build_parser())
             if path and path[0] == "memory"
         }
-        self.assertEqual(
-            leaves,
+        # U-M2's own leaves, still exactly these. U-M3 added more (classify,
+        # source, edge, graph, contradictions) and none of them sets a status
+        # either — the assertion below is what actually pins that.
+        self.assertLessEqual(
             {"add", "list", "show", "pin", "unpin", "link-evidence", "retire"},
+            leaves,
         )
         for argv in (
             ("memory", "add", "--status", "quarantined"),
@@ -1412,11 +1459,13 @@ class ClaimHashPayloadTest(V2WorkspaceTestCase):
                 "evidence_ids", "scope_sha256", "kind_sha256", "key_sha256",
                 "value_sha256", "source_sha256", "confidence_sha256",
                 "valid_from_sha256", "valid_until_sha256", "status_sha256",
+                # U-M3 added exactly one leaf and bumped the identity with it.
+                "sensitivity_sha256",
                 "updated_at_sha256",
             },
         )
         self.assertNotIn("content_sha256", payload)
-        self.assertEqual(payload["claim_schema"], "aos.memory-claim/v2")
+        self.assertEqual(payload["claim_schema"], "aos.memory-claim/v3")
         self.assertEqual(payload["evidence_ids"], [1])
         self.assertEqual(
             payload["value_sha256"], utils.sha256_text(item.value_md)
@@ -1467,7 +1516,7 @@ class DoctorTest(V2WorkspaceTestCase):
         code, out, _ = self.aos("doctor")
         return out
 
-    def test_doctor_passes_on_a_healthy_v2_workspace(self):
+    def test_doctor_passes_on_a_healthy_workspace(self):
         """(29)"""
         self.add_memory("--pin", "--evidence", "E-0001")
         out = self.doctor_lines()
@@ -1475,10 +1524,12 @@ class DoctorTest(V2WorkspaceTestCase):
         self.assertIn("memory claims are well-formed", out)
         self.assertIn("memory evidence links resolve", out)
 
-    def test_doctor_check_count_is_twenty_five(self):
-        """(29) 21 → 25: four mandated memory-claim checks joined the set."""
+    def test_doctor_check_count_is_thirty(self):
+        """(29) 21 → 25 → 30: U-M2's four mandated memory-claim checks joined
+        the set, then U-M3's five memory-graph checks (the D-W8.1 pattern —
+        the pin moves UP with a mandated new check)."""
         out = self.doctor_lines()
-        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 25)
+        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 30)
 
     def test_doctor_reports_damaged_claims_by_id_only(self):
         """(29/30) Bounded, ID-only diagnostics — and the planted secret in
@@ -1750,7 +1801,12 @@ class PackagingParityTest(V1FixtureTestCase):
 
     def test_every_entrypoint_migrates_and_inspects_identically(self):
         """(35) Each entrypoint gets its OWN copy of the v1 fixture, migrates
-        it, and must produce the same answers."""
+        it to the CURRENT version, and must produce the same answers.
+
+        The CLI has no `--target`, so this exercises the whole chain a real v1
+        user gets — 1 → 2 → 3 since U-M3. The U-M2 step being FIRST is what
+        this asserts; the rest of the chain is U-M3's suite's business.
+        """
         outputs = {}
         for name, entry in self.entries().items():
             with self.subTest(entry=name):
@@ -1760,8 +1816,8 @@ class PackagingParityTest(V1FixtureTestCase):
                 report = json.loads(status.stdout)
                 self.assertTrue(report["pending"])
                 self.assertEqual(
-                    report["plan"],
-                    [{"from": 1, "to": 2, "migration_id": "u-m2-memory-claims-v2"}],
+                    report["plan"][0],
+                    {"from": 1, "to": 2, "migration_id": "u-m2-memory-claims-v2"},
                 )
 
                 plan = self.run_entry(entry, "migrate", "plan")
@@ -1770,7 +1826,7 @@ class PackagingParityTest(V1FixtureTestCase):
 
                 applied = self.run_entry(entry, "migrate", "apply")
                 self.assertEqual(applied.returncode, 0, applied.stderr)
-                self.assertEqual(self.version(), "2")
+                self.assertEqual(self.version(), db.SCHEMA_VERSION)
 
                 shown = self.run_entry(entry, "memory", "show", "M-0001", "--json")
                 self.assertEqual(shown.returncode, 0, shown.stderr)

@@ -45,6 +45,42 @@ def validate_date(text: str, what: str) -> str:
     return text
 
 
+#: The full instant `utc_now_iso()` produces. Anchored with \Z, never $
+#: (D-v0.2.3): '$' admits a trailing newline, and a timestamp with a newline
+#: in it would compare and render as something no reader expects.
+_INSTANT_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z", re.ASCII)
+
+
+def validate_instant(text: str, what: str) -> str:
+    """Strict UTC timestamp: `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SSZ` (M3.7).
+
+    Both spellings already exist in this ledger — `utc_now_iso()` writes the
+    instant, `memory add --valid-until` has always accepted the date — so
+    U-M3's temporal fields accept exactly those two and nothing else. No third
+    format is invented, and neither spelling is normalized into the other:
+    what the operator wrote is what the hash binds.
+
+    Lexicographic comparison stays correct across both, which is what the
+    existing expiry predicate already relies on: a date sorts as that day's
+    start, so '2026-07-16' < '2026-07-16T00:00:01Z' and both order correctly
+    against every other day.
+    """
+    if _INSTANT_RE.match(text):
+        try:
+            datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            raise AosError(
+                f"Invalid {what} {text!r}: not a real UTC timestamp."
+            )
+        return text
+    if _DATE_RE.match(text):
+        return validate_date(text, what)
+    raise AosError(
+        f"Invalid {what} {text!r}. Expected format: YYYY-MM-DD or "
+        "YYYY-MM-DDTHH:MM:SSZ"
+    )
+
+
 def json_dumps(obj) -> str:
     """Canonical JSON for stdout: readable, UTF-8, stable key order as built."""
     return json.dumps(obj, indent=2, ensure_ascii=False)
