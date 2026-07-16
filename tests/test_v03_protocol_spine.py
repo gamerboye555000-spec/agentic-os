@@ -930,10 +930,20 @@ class TimestampTests(ReasonCase):
                     protocols.validate_document(work_spec(created_at=stamp))
 
     def test_the_aos_clock_emits_a_valid_protocol_timestamp(self):
-        """utils.utc_now_iso() is the one clock; its shape IS the protocol's."""
+        """utils.utc_now_iso() is the one clock; its shape IS the protocol's.
+
+        expires_at is pushed far past the fixture default: with the REAL
+        clock as created_at, the fixture's fixed 2026 expiry would otherwise
+        turn this into a time bomb that starts refusing the day it passes.
+        """
         from agentic_os import utils
 
-        protocols.validate_document(work_spec(created_at=utils.utc_now_iso()))
+        protocols.validate_document(
+            work_spec(
+                created_at=utils.utc_now_iso(),
+                expires_at="2099-01-01T00:00:00Z",
+            )
+        )
 
     def test_retry_deadline_must_be_a_real_instant(self):
         self.assertRefuses(
