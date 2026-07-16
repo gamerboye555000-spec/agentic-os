@@ -4,7 +4,7 @@ transaction helper that carries the domain-row + event-row invariant.
 Rules honored here:
 - WAL journal mode set at init.
 - PRAGMA foreign_keys=ON on EVERY connection; busy_timeout >= 3000ms.
-- meta.schema_version = "3" at init; a different version is a hard stop.
+- meta.schema_version = "4" at init; a different version is a hard stop.
   Normal commands NEVER auto-migrate: an older database is refused here and
   the human is pointed at `migrate status/plan/apply` (U-M2 M2.5; U-M3 M3.1).
 """
@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .utils import DB_FILENAME, AosError
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 #: The v3 memory claim (U-M2 M2.2; U-M3 M3.2). The table name is parameterized
 #: for exactly one reason: the 1→2 and 2→3 migrations build the new table
@@ -153,11 +153,88 @@ MEMORY_EDGES_DDL = """CREATE TABLE {table}(
   FOREIGN KEY(to_memory_id) REFERENCES memory(id)
 )"""
 
+#: The v4 governed agent identity table (U-A1). The table name is
+#: parameterized for the same one reason the memory DDLs are: the 3→4
+#: migration builds the new table under a temporary name and renames it, so a
+#: MIGRATED table is created from this same DDL as a freshly initialized one
+#: and the two cannot drift (the D-v0.3.43 rule, applied a third time).
+#:
+#: The five v3 columns (kind, invoke_hint, capabilities_json, trust_level,
+#: notes) survive as INERT legacy history: they lose their NOT NULL/DEFAULT
+#: because they are historical facts about legacy rows, not fields of a
+#: governed agent — new rows store NULL. They carry no CHECK on purpose:
+#: damaged history must remain storable and reportable, never unstorable.
+#:
+#: The composite FOREIGN KEY is the current-passport pointer's structural
+#: guarantee: it must name an existing (agent_id, version) of THIS agent, so
+#: a pointer can never name another agent's passport or a missing version.
+#: A NULL pointer disables the check (SQLite's composite-FK NULL rule),
+#: which is what makes a draft or legacy agent legal.
+#:
+#: `content_sha256` has NO default, like every hashed record in this schema:
+#: an identity row without its integrity hash must be impossible to insert.
+AGENTS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  agent_class TEXT NOT NULL DEFAULT 'custom'
+    CHECK (agent_class IN ('system','specialist','custom','temporary')),
+  scope TEXT NOT NULL DEFAULT 'global'
+    CHECK (scope IN ('global','project')),
+  project_id INTEGER,
+  lifecycle TEXT NOT NULL DEFAULT 'draft'
+    CHECK (lifecycle IN ('draft','active','suspended','archived','revoked')),
+  protected INTEGER NOT NULL DEFAULT 0 CHECK (protected IN (0,1)),
+  owner TEXT NOT NULL DEFAULT 'human'
+    CHECK (owner IN ('human','system')),
+  origin TEXT NOT NULL
+    CHECK (origin IN ('legacy','create','import')),
+  current_passport_version INTEGER,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  kind TEXT,
+  invoke_hint TEXT,
+  capabilities_json TEXT,
+  trust_level INTEGER,
+  notes TEXT,
+  content_sha256 TEXT NOT NULL,
+  CHECK ((scope = 'global' AND project_id IS NULL)
+      OR (scope = 'project' AND project_id IS NOT NULL)),
+  CHECK (current_passport_version IS NULL OR current_passport_version >= 1),
+  FOREIGN KEY(project_id) REFERENCES projects(id),
+  FOREIGN KEY(id, current_passport_version)
+    REFERENCES agent_passports(agent_id, version)
+)"""
+
+#: The immutable passport versions (U-A1). `document` holds the exact
+#: canonical bytes of a valid beast.agent-passport/v1 artifact (bounded by
+#: U-X1 before storage); `content_sha256` is the ROW record hash — the
+#: document's own content digest lives inside the document per U-X1.
+#: UNIQUE(agent_id, version) doubles as the composite-FK parent key for the
+#: agents pointer. Published rows are never UPDATEd or DELETEd; the only
+#: delete path anywhere is `agent discard`, which removes a (draft, v1) row
+#: together with its draft agent.
+AGENT_PASSPORTS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  agent_id INTEGER NOT NULL,
+  version INTEGER NOT NULL CHECK (version >= 1),
+  status TEXT NOT NULL CHECK (status IN ('draft','published')),
+  created_at TEXT NOT NULL,
+  published_at TEXT,
+  document TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  UNIQUE(agent_id, version),
+  CHECK ((status = 'draft' AND published_at IS NULL)
+      OR (status = 'published' AND published_at IS NOT NULL)),
+  FOREIGN KEY(agent_id) REFERENCES agents(id)
+)"""
+
 MEMORY_TABLE = "memory"
 MEMORY_EVIDENCE_TABLE = "memory_evidence"
 MEMORY_SOURCES_TABLE = "memory_sources"
 MEMORY_SOURCE_LINKS_TABLE = "memory_source_links"
 MEMORY_EDGES_TABLE = "memory_edges"
+AGENTS_TABLE = "agents"
+AGENT_PASSPORTS_TABLE = "agent_passports"
 
 #: The three tables U-M3 adds, paired with their DDL. The 2→3 migration
 #: iterates this rather than repeating the CREATEs, so a fresh v3 schema and a
@@ -280,21 +357,12 @@ CREATE TABLE IF NOT EXISTS packs(
   created_at TEXT NOT NULL,
   UNIQUE(task_id, inputs_hash)
 );
-
-CREATE TABLE IF NOT EXISTS agents(
-  id INTEGER PRIMARY KEY,
-  name TEXT UNIQUE NOT NULL,
-  kind TEXT NOT NULL,
-  invoke_hint TEXT,
-  capabilities_json TEXT,
-  trust_level INTEGER NOT NULL DEFAULT 0,
-  notes TEXT
-);
 """
 
-#: The canonical v3 schema. Composed rather than typed as one literal so the
+#: The canonical v4 schema. Composed rather than typed as one literal so the
 #: memory tables have exactly ONE definition in the codebase, shared with the
-#: 1→2 (M2.3) and 2→3 (M3.11) migrations.
+#: 1→2 (M2.3) and 2→3 (M3.11) migrations — and so the agent tables have
+#: exactly one, shared with the 3→4 migration (U-A1).
 SCHEMA_SQL = (
     _SCHEMA_HEAD
     + MEMORY_CLAIM_DDL.format(table=MEMORY_TABLE)
@@ -306,6 +374,11 @@ SCHEMA_SQL = (
     )
     + ";\n"
     + _SCHEMA_TAIL
+    + "\n"
+    + AGENTS_DDL.format(table=AGENTS_TABLE)
+    + ";\n\n"
+    + AGENT_PASSPORTS_DDL.format(table=AGENT_PASSPORTS_TABLE)
+    + ";\n"
 )
 
 

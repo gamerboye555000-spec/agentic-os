@@ -1,3 +1,136 @@
+# DECISIONS — Agentic OS v0.4 U-A1 agent passports
+
+This section begins the `D-v0.4.*` series for the U-A1 pass executed per
+`agentic-os-v0.4-u-a1-agent-passports-contract.md` on branch
+`v0.4-u-a1-agent-passports` (2026-07-16). Prepended per the established
+precedent (D-W0.4, reaffirmed in D-v0.2.7); everything below stays
+byte-identical.
+
+## D-v0.4 decisions (U-A1)
+
+- **D-v0.4.1 — One canonical identity table, rebuilt in place.** `agents`
+  keeps its name and becomes the governed identity table; a second table
+  would have left two authorities answering to `FROM agents`. The rebuild
+  follows the D-v0.3.43 recipe a third time: `{table}`-parameterized DDL
+  constants in `db.py`, shared by fresh init and the 3→4 step, so a migrated
+  schema and a fresh one are identical by construction. The current-passport
+  pointer is a composite FOREIGN KEY `(id, current_passport_version) →
+  agent_passports(agent_id, version)`: a pointer can never name another
+  agent's passport or a missing version, and NULL (draft/legacy) disables
+  the check by SQLite's rule rather than by convention.
+
+- **D-v0.4.2 — Create publishes nothing; publish freezes everything.**
+  `agent create`/`agent import` produce a DRAFT identity plus a draft v1
+  passport — the operator's own pending declaration, discardable, editable
+  only by discarding and recreating. `agent passport publish` is the single
+  moment a declaration becomes immutable history and the identity becomes
+  `active`. This is how "published passports are immutable" and "a draft
+  that was never used can be discarded" coexist without exceptions.
+
+- **D-v0.4.3 — Three hash bindings, one per substitution attack.** The
+  document's own U-X1 content digest breaks on content tamper; the passport
+  ROW hash (binding the recomputed document digest to agent_id + version +
+  status + timestamps) breaks on status/reparent tamper; the identity hash
+  (binding lifecycle, pointer, and the five inert legacy fields) breaks on
+  pointer/lifecycle tamper. Every authoritative agent write walks the
+  no-laundering gate first — identity hash, every row hash, every document,
+  contiguity 1..N, draft shape, pointer resolution — so a corrupted history
+  cannot receive a new version on top. The only exits are restore-from-backup
+  or deliberate repair, both outside normal commands (the U-M2 verify_claim
+  posture, applied to identities).
+
+- **D-v0.4.4 — The migration synthesizes no passports.** 3→4 carries every
+  v3 field verbatim — `kind` outside today's vocabulary, `capabilities_json`
+  that does not parse, secret-shaped `notes`, all of it — into permanently
+  inert legacy columns, and creates `agent_passports` EMPTY. Parsing
+  `capabilities_json` or mapping `trust_level` into declarations would put a
+  guess into the ledger wearing the same clothes as a fact (the D-v0.3.44
+  rule). A legacy agent has no current passport until a human publishes one;
+  doctor's WARN-only coverage line says so without calling history an error.
+  The new facts are constants plus ONE clock reading, and `origin='legacy'`
+  is what makes the stamped timestamps honest.
+
+- **D-v0.4.5 — Legacy agents migrate to `active`, not to a sixth state.**
+  They were live, referenceable identities the moment before the migration;
+  `origin='legacy'` plus a NULL pointer already distinguishes the ungoverned
+  population permanently. A dedicated `legacy` lifecycle state would force a
+  mass adoption ceremony on upgrade day and complicate every transition
+  table for nothing the origin column doesn't say.
+
+- **D-v0.4.6 — Reservation is a namespace rule, not a set of rows.**
+  `governor`, `planner`, `builder`, `verifier`, `security-sentinel` and the
+  `aos.`/`beast.` prefixes are refused at create/import from frozen tuples in
+  `models.py`. No row exists until U-A2's bootstrap mints the system agents —
+  a reserved row created today would be U-A1 guessing U-A2's shape. For the
+  same reason `protected` ships as a column with refusal semantics and
+  doctor coverage but NO setter: marking noise as protected is exactly what
+  an operator flag would invite, and minting protected system identities is
+  U-A2's job.
+
+- **D-v0.4.7 — `revoked` is terminal, and parked identities cannot gain
+  versions.** No command leaves `revoked`, ever — permanent distrust with
+  the full history retained. `publish` requires draft or active: letting a
+  suspended or archived agent quietly accumulate declarations would launder
+  a parked identity back into circulation without the deliberate `restore`.
+  Same-state transitions are refusals naming the current state, never
+  silent no-ops.
+
+- **D-v0.4.8 — Discard is the system's only DELETE, and it cannot delete
+  history.** Legal only for a draft with exactly one (draft, v1) passport,
+  origin create/import, unprotected, pointer NULL, and ZERO textual
+  references anywhere (`runs.agent`, `handoffs.from_agent/to_agent`,
+  `evidence.provenance`, `memory_sources.provenance`). Everything else is
+  pointed at archive/revoke. The discard event itself survives, so even a
+  discarded draft's existence stays journaled.
+
+- **D-v0.4.9 — A passport is not a task message.** The schema carries a
+  REDUCED envelope — no `aos_task_id`, no `trace`, no `idempotency_key`, no
+  `audience`, no `permitted_destinations` — because requiring them would
+  force fabricated data into every declaration. `_check_semantics` guards
+  its field-specific checks on PRESENCE rather than schema identity, so the
+  three task-message schemas (which require those fields structurally) keep
+  byte-identical behavior, proven by regression.
+
+- **D-v0.4.10 — Everything a passport declares is inert.** `autonomy` is a
+  stored enum no code path reads; skill/tool requirements and provider
+  compatibility are pattern-bounded strings with no resolver (U-K1/U-T1);
+  `approvals_required` declares what needs approval and cannot grant one;
+  credential-shaped property names are unrepresentable (the registry lint
+  refuses the schema; instances refuse as unknown_field). Import is bytes →
+  dict → refusal-or-rows: nothing an artifact names is opened, fetched,
+  resolved or executed. Signing is deferred to U-S5/U-Q1 — the digest and
+  provenance fields are the substrate a signature will later cover, and no
+  field pretends to be one today.
+
+- **D-v0.4.11 — `agent add`/`agent update` retired, not aliased.** A
+  deprecated alias would have kept a second, ungoverned write path into the
+  legacy columns alive — the exact thing this unit exists to end. In-place
+  mutation of capability text is incompatible with immutable versioned
+  declarations; the muscle-memory cost is bounded and the fixtures now seed
+  historical rows through frozen v1/v2/v3 replica writers, exactly as the
+  memory fixtures already did.
+
+- **D-v0.4.12 — Version 3 is history now, and history is pinned by bytes.**
+  The v3 `agents` DDL is frozen verbatim in `migrations._V3_AGENTS_DDL`
+  (fixtures build from it, so fixture and migration agree about v3 by
+  construction), and a regression test migrates the v2 fixture to target 3
+  and byte-compares both the memory DDL and the agents DDL in sqlite_master
+  against the expected text — so a future edit to the live constants that
+  would silently rewrite what 2→3 produces fails loudly. The 3→4 step uses
+  the LIVE v4 constants (correct while 4 is current; the frozen copy becomes
+  v5's obligation — the established trade).
+
+- **D-v0.4.13 — Doctor gained exactly three checks, and the sweep followed
+  the text.** Check 13 validates the governed v4 shape (still reporting the
+  legacy hazards it always reported); 32/33 verify identity hashes and
+  passport histories with the same closed verdict vocabulary the gate
+  refuses on — both FAIL, both feed the recovery gate, so a tampered
+  registry blocks leaving recovery; 34 is WARN-only coverage. The U-C3
+  sweep now scans stored passport documents leaf-by-leaf under
+  `agent #id passport vN` labels, because role and mission are exactly the
+  prose an operator pastes a credential into. Diagnostics stay
+  name-or-`agent #id`, verdicts and counts — never a value.
+
 # DECISIONS — Agentic OS v0.3 U-M5 retrieval evaluations
 
 This section continues the `D-v0.3.*` series for the U-M5 pass executed per

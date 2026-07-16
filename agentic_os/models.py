@@ -79,7 +79,48 @@ MEMORY_EDGE_SYMMETRIC = ("contradicts", "related")
 #: table and no verdict column (D-v0.3.38).
 MEMORY_EDGE_CONTRADICTS = "contradicts"
 
+#: The LEGACY v3 agent vocabulary. No v4 writer produces a `kind`; doctor
+#: still uses this tuple to describe history (a legacy row whose kind falls
+#: outside it is reported, never rewritten).
 AGENT_KINDS = ("local", "cloud", "human", "generic")
+
+# ---------------------------------------------------------------------------
+# U-A1 governed agent registry vocabulary. Closed here AND by CHECK
+# constraints in the schema (the U-M2 rule): neither a careless caller nor a
+# direct SQL writer can invent a class, scope, lifecycle, owner or origin.
+
+AGENT_CLASSES = ("system", "specialist", "custom", "temporary")
+AGENT_SCOPES = ("global", "project")
+AGENT_LIFECYCLES = ("draft", "active", "suspended", "archived", "revoked")
+AGENT_OWNERS = ("human", "system")
+AGENT_ORIGINS = ("legacy", "create", "import")
+
+AGENT_LIFECYCLE_DRAFT = "draft"
+AGENT_LIFECYCLE_ACTIVE = "active"
+#: Terminal: no command leaves `revoked`, ever.
+AGENT_LIFECYCLE_REVOKED = "revoked"
+
+AGENT_PASSPORT_STATUSES = ("draft", "published")
+AGENT_PASSPORT_DRAFT = "draft"
+AGENT_PASSPORT_PUBLISHED = "published"
+
+#: Reserved agent namespace (U-A1 rule 9/36): a NAMESPACE refusal at
+#: create/import, never a set of rows — no row exists until U-A2's bootstrap
+#: mints the system agents. Frozen tuples: reservation is vocabulary, not
+#: configuration.
+RESERVED_AGENT_PREFIXES = ("aos.", "beast.")
+RESERVED_AGENT_NAMES = (
+    "governor",
+    "planner",
+    "builder",
+    "verifier",
+    "security-sentinel",
+)
+
+#: Bound for NEW agent names only (create/import). Historical rows are
+#: carried verbatim by the 3→4 migration whatever their length; doctor
+#: reports out-of-vocabulary names without renaming history.
+MAX_AGENT_NAME_CHARS = 64
 
 #: All user-input validators anchor with \Z, never $ (D-v0.2.3) — '$' admits
 #: a trailing newline, letting e.g. $'proj\n' become a slug (and a mirror
@@ -135,6 +176,30 @@ def validate_agent_name(name: str) -> str:
         raise AosError(
             f"Invalid agent name {name!r}. Use letters, digits, '.', '_' "
             "or '-' (must start with a letter or digit)."
+        )
+    return name
+
+
+def validate_new_agent_name(name: str) -> str:
+    """The NEW-name rules (U-A1): charset, 64-char bound, reserved namespace.
+
+    Applied only where a name enters the registry (`agent create`/`agent
+    import`) — historical rows keep whatever they carry, and are reported by
+    doctor rather than judged here.
+    """
+    validate_agent_name(name)
+    if len(name) > MAX_AGENT_NAME_CHARS:
+        raise AosError(
+            f"Invalid agent name: longer than {MAX_AGENT_NAME_CHARS} "
+            "characters."
+        )
+    if name in RESERVED_AGENT_NAMES or any(
+        name.startswith(prefix) for prefix in RESERVED_AGENT_PREFIXES
+    ):
+        raise AosError(
+            f"Agent name {name!r} is reserved for system agents "
+            "(reserved names: " + ", ".join(RESERVED_AGENT_NAMES) + "; "
+            "reserved prefixes: " + ", ".join(RESERVED_AGENT_PREFIXES) + ")."
         )
     return name
 
@@ -326,16 +391,36 @@ class Pack(_Row):
 
 @dataclass
 class Agent(_Row):
+    """A v4 governed agent identity (U-A1).
+
+    The five legacy fields (kind, invoke_hint, capabilities_json,
+    trust_level, notes) are v3 history carried verbatim by the 3→4
+    migration — permanently inert, NULL on every new row, and read by
+    nothing that grants behavior.
+    """
+
     id: int
     name: str
-    kind: str
+    agent_class: str
+    scope: str
+    project_id: int | None
+    lifecycle: str
+    protected: int
+    owner: str
+    origin: str
+    current_passport_version: int | None
+    created_at: str
+    updated_at: str
+    kind: str | None
     invoke_hint: str | None
     capabilities_json: str | None
-    trust_level: int
+    trust_level: int | None
     notes: str | None
+    content_sha256: str
 
     def capabilities(self) -> list[str]:
-        """capabilities_json as a list of strings; malformed/absent → []."""
+        """Legacy capabilities_json as a list of strings; malformed/absent
+        → []. Display-only, like every other legacy field."""
         import json
 
         if not self.capabilities_json:
@@ -347,6 +432,26 @@ class Agent(_Row):
         if not isinstance(value, list):
             return []
         return [str(item) for item in value]
+
+
+@dataclass
+class AgentPassport(_Row):
+    """One immutable passport version (U-A1).
+
+    `document` is the exact canonical text of a valid
+    beast.agent-passport/v1 artifact; `content_sha256` is the ROW record
+    hash (the document's own digest lives inside the document). A published
+    row is never updated or deleted.
+    """
+
+    id: int
+    agent_id: int
+    version: int
+    status: str
+    created_at: str
+    published_at: str | None
+    document: str
+    content_sha256: str
 
 
 @dataclass

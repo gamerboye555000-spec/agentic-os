@@ -1520,3 +1520,61 @@ than preferring the newer thing.
 It is advisory in the strongest sense: **no command acts on it**. Nothing in
 U-M5 changes packs, `aos search`, or any configuration file. Adoption is a
 human decision.
+
+## Governed agent registry (U-A1)
+
+### "Refusing to change agent '…': v1: mismatch / identity mismatch / draft_shape / history_gap / pointer_invalid"
+
+The no-laundering gate. An agent's identity hash, a passport row hash, or a
+stored passport document no longer verifies, and every authoritative agent
+write refuses rather than recompute a hash over tampered state — writing now
+would quietly bless the edit. Nothing was changed.
+
+```bash
+python aos.py doctor            # checks 32/33 name the row and the verdict
+python aos.py agent show NAME   # reads still work; verdicts are displayed
+```
+
+The exits are deliberate: restore a verified backup (see RECOVERY.md), or —
+if you know exactly what was edited and why — repair the row by hand and
+accept that the repair is on you. No aos command will do it for you.
+
+### "agent add: invalid choice" after upgrading
+
+U-A1 retired the ungoverned v3 verbs. `agent create NAME` makes a draft
+identity, `agent passport publish NAME` freezes its first passport, and
+capability/requirement text now lives in the passport document (see
+`--from-file`, or publish a new version with `--file`). `agent update` has no
+replacement on purpose: published declarations are immutable versions, not
+mutable rows.
+
+### A migrated agent shows "(none published)" and doctor warns about coverage
+
+Expected. The 3→4 migration fabricates no declarations from legacy
+`capabilities_json`/`trust_level` — a legacy agent is ungoverned history
+until a human publishes a passport for it:
+
+```bash
+python aos.py agent export NAME --version 1   # (only if one already exists)
+python aos.py agent passport publish NAME --file passport.json
+```
+
+The WARN-only doctor line ("active agents without a published passport") is
+a fact, never a failure, and never affects the exit code.
+
+### "Agent 'X' is referenced by N runs row(s) and cannot be discarded"
+
+`agent discard` removes never-used drafts only. An identity that any run,
+handoff, evidence provenance or memory source ever named textually is
+history, and history is archived or revoked, never deleted:
+
+```bash
+python aos.py agent archive X    # keeps everything; hidden from default list
+python aos.py agent revoke X     # permanent distrust; terminal
+```
+
+### "Agent 'X' is revoked; revocation is permanent"
+
+By design. No command leaves `revoked` — not restore, not publish. The
+identity, its passports and its events remain on record; create a new
+identity under a new name if the work must continue.

@@ -246,8 +246,10 @@ def _index_note_contents(conn: sqlite3.Connection, aos_root: Path) -> dict[str, 
             bullet += f" · valid until {row['valid_until']}"
         memory.append(bullet)
     agents = [
-        f"- [[{row['name']}]] {row['kind']}"
-        for row in conn.execute("SELECT name, kind FROM agents ORDER BY name")
+        f"- [[{row['name']}]] {row['agent_class']} · {row['lifecycle']}"
+        for row in conn.execute(
+            "SELECT name, agent_class, lifecycle FROM agents ORDER BY name"
+        )
     ]
     reviews_dir = aos_root / "Reviews"
     reviews = [

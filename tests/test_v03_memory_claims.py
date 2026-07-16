@@ -188,7 +188,7 @@ class SchemaVersionTest(V2WorkspaceTestCase):
         """(1) U-M3 moved the current version to 3. What U-M2 pins here is
         that a fresh workspace is born AT it, whatever it is — the literal
         lives in db.py and is asserted against 3 in the U-M3 suite."""
-        self.assertEqual(db.SCHEMA_VERSION, "3")
+        self.assertEqual(db.SCHEMA_VERSION, "4")
         self.assertEqual(self.query(
             "SELECT value FROM meta WHERE key='schema_version'"
         )[0][0], db.SCHEMA_VERSION)
@@ -1524,13 +1524,13 @@ class DoctorTest(V2WorkspaceTestCase):
         self.assertIn("memory claims are well-formed", out)
         self.assertIn("memory evidence links resolve", out)
 
-    def test_doctor_check_count_is_thirty_one(self):
+    def test_doctor_check_count_is_thirty_four(self):
         """(29) 21 → 25 → 30 → 31: U-M2's four mandated memory-claim checks
         joined the set, then U-M3's five memory-graph checks, then U-M5's one
         retrieval-benchmark registry check (the D-W8.1 pattern — the pin moves
         UP with a mandated new check)."""
         out = self.doctor_lines()
-        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 31)
+        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 34)
 
     def test_doctor_reports_damaged_claims_by_id_only(self):
         """(29/30) Bounded, ID-only diagnostics — and the planted secret in

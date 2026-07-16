@@ -811,119 +811,81 @@ class TestGitEvidence(Night1BackCompatCase):
 
 
 class TestAgentRegistry(Night1BackCompatCase):
+    """The registry surface after U-A1: the ungoverned `agent add`/`agent
+    update` are retired, and the governed verbs (create → publish) carry
+    the same back-compat essentials — name validation, show/list roundtrip,
+    mirror sync, atomicity, and no trust-level surface."""
+
     def add_codex(self) -> str:
         return self.aos(
-            "agent", "add", "codex", "--kind", "cloud",
-            "--notes", "cloud codex agent",
-            "--capability", "code", "--capability", "review",
+            "agent", "create", "codex", "--role", "cloud codex agent",
+            "--mission", "review and write code",
         )
 
-    def test_add_show_list_roundtrip(self):
+    def test_create_show_list_roundtrip(self):
         out = self.add_codex()
-        self.assertIn("Added agent codex (cloud)", out)
-        self.aos("agent", "add", "aider", "--kind", "local")
+        self.assertIn("Added agent codex (custom, draft)", out)
+        self.aos("agent", "passport", "publish", "codex")
+        self.aos("agent", "create", "aider")
         doc = json.loads(self.aos("agent", "show", "codex", "--json"))
-        self.assertEqual(
-            doc,
-            {
-                "agent": {
-                    "name": "codex",
-                    "kind": "cloud",
-                    "capabilities": ["code", "review"],
-                    "notes": "cloud codex agent",
-                    "invoke_hint": None,
-                    "trust_level": 0,
-                }
-            },
-        )
+        agent = doc["agent"]
+        self.assertEqual(agent["name"], "codex")
+        self.assertEqual(agent["agent_class"], "custom")
+        self.assertEqual(agent["lifecycle"], "active")
+        self.assertEqual(agent["origin"], "create")
+        self.assertEqual(agent["current_passport_version"], 1)
+        self.assertEqual(agent["integrity"], "ok")
         listing = json.loads(self.aos("agent", "list", "--json"))
         self.assertEqual(set(listing.keys()), {"agents"})
         self.assertEqual(
             [a["name"] for a in listing["agents"]], ["aider", "codex"]
         )
-        self.assertEqual(listing["agents"][0]["kind"], "local")
-        self.assertEqual(listing["agents"][0]["capabilities"], [])
+        self.assertEqual(listing["agents"][0]["lifecycle"], "draft")
         text = self.aos("agent", "list")
         self.assertIn("codex", text)
-        self.assertIn("code,review", text)
+        self.assertIn("active", text)
         self.assert_no_schema_drift()
 
-    def test_add_default_kind_is_generic(self):
-        self.aos("agent", "add", "plain")
-        doc = json.loads(self.aos("agent", "show", "plain", "--json"))
-        self.assertEqual(doc["agent"]["kind"], "generic")
+    def test_retired_verbs_are_gone(self):
+        for argv in (
+            ("agent", "add", "codex"),
+            ("agent", "update", "codex", "--notes", "n"),
+        ):
+            with self.subTest(argv=argv):
+                code, out, err = self.aos_fails(*argv)
+                self.assertIn("invalid choice", err)
 
-    def test_duplicate_add_names_update(self):
+    def test_duplicate_create_names_the_existing_agent(self):
         self.add_codex()
-        code, out, err = self.aos_fails("agent", "add", "codex")
+        code, out, err = self.aos_fails("agent", "create", "codex")
         self.assertIn("already exists", err)
-        self.assertIn("agent update codex", err)
+        self.assertIn("agent show codex", err)
 
-    def test_add_validates_kind_and_name(self):
-        code, out, err = self.aos_fails(
-            "agent", "add", "codex", "--kind", "robot"
-        )
-        self.assertIn("local|cloud|human|generic", err)
+    def test_create_validates_name(self):
         for bad in ("evil name", ".hidden", "a/b", "codex\n"):
             # "codex\n" is the adversarial-review regression: '$' matches
             # before a trailing newline, \Z must not.
             with self.subTest(name=bad):
-                code, out, err = self.aos_fails("agent", "add", bad)
+                code, out, err = self.aos_fails("agent", "create", bad)
                 self.assertIn("Invalid agent name", err)
-        # A '-'-leading name never reaches ops via argparse; prove the guard
-        # holds below the parser too.
+        # A '-'-leading name never reaches the domain layer via argparse;
+        # prove the guard holds below the parser too.
+        from agentic_os import passports
         from agentic_os.utils import AosError
 
         conn = db.connect(self.db_path)
         try:
             with self.assertRaises(AosError):
-                ops.add_agent(conn, name="-lead")
+                passports.create_agent(conn, name="-lead")
         finally:
             conn.close()
 
     def test_no_trust_level_surface_exists(self):
         code, out, err = self.run_cli(
             "--root", str(self.root),
-            "agent", "add", "codex", "--trust-level", "3",
+            "agent", "create", "codex", "--trust-level", "3",
         )
         self.assertEqual(code, 1)  # rejected: autonomy is earned, never set
-
-    def test_update_replaces_capabilities_and_notes(self):
-        self.add_codex()
-        out = self.aos(
-            "agent", "update", "codex",
-            "--notes", "updated notes", "--capability", "docs",
-        )
-        self.assertIn("codex updated: notes, capabilities", out)
-        doc = json.loads(self.aos("agent", "show", "codex", "--json"))
-        self.assertEqual(doc["agent"]["capabilities"], ["docs"])
-        self.assertEqual(doc["agent"]["notes"], "updated notes")
-        entries = json.loads(self.aos("log", "--json"))["events"]
-        agent_events = [
-            (e["action"], e["payload"]) for e in entries
-            if e["entity"] == "agent"
-        ]
-        self.assertEqual(len(agent_events), 2)
-        self.assertEqual(agent_events[0][0], "add")
-        self.assertEqual(agent_events[0][1]["agent"], "codex")
-        self.assertEqual(agent_events[0][1]["kind"], "cloud")
-        self.assertEqual(agent_events[1][0], "update")
-        self.assertEqual(
-            agent_events[1][1]["changed"], ["notes", "capabilities"]
-        )
-        self.assert_no_schema_drift()
-
-    def test_update_unknown_agent_refuses(self):
-        code, out, err = self.aos_fails(
-            "agent", "update", "ghost", "--notes", "x"
-        )
-        self.assertIn("No agent 'ghost'", err)
-        self.assertIn("agent add ghost", err)
-
-    def test_update_requires_a_flag(self):
-        self.add_codex()
-        code, out, err = self.aos_fails("agent", "update", "codex")
-        self.assertIn("Nothing to update", err)
 
     def test_show_unknown_agent_refuses(self):
         code, out, err = self.aos_fails("agent", "show", "ghost")
@@ -931,17 +893,19 @@ class TestAgentRegistry(Night1BackCompatCase):
 
     def test_agent_notes_sync_into_the_mirror(self):
         self.add_codex()
+        self.aos("agent", "passport", "publish", "codex")
         self.aos("sync")
         vault = self.aos_dir / "obsidian-vault" / "AOS"
         self.assertTrue((vault / "Agents").is_dir())
         note = (vault / "Agents" / "codex.md").read_text("utf-8")
         self.assertIn("type: agent", note)
         self.assertIn("name: codex", note)
-        self.assertIn("kind: cloud", note)
-        self.assertIn("- code", note)
-        self.assertIn("- review", note)
-        self.assertIn("cloud codex agent", note)
+        self.assertIn("agent_class: custom", note)
+        self.assertIn("lifecycle: active", note)
+        self.assertIn("passport_version: v1", note)
         self.assertIn("  - aos/agent", note)
+        # The passport document (role, mission) stays in the ledger.
+        self.assertNotIn("review and write code", note)
         self.aos("doctor")
 
     def test_sync_idempotent_with_agent_notes(self):
@@ -955,32 +919,21 @@ class TestAgentRegistry(Night1BackCompatCase):
         self.assertIn("(0 written", out)
         self.assertEqual(agentic_utils.tree_hash(vault_aos), hash1)
 
-    def test_add_and_update_are_atomic(self):
+    def test_create_is_atomic(self):
+        from agentic_os import passports
+
         conn = db.connect(self.db_path)
         try:
             with mock.patch.object(
                 events, "emit", side_effect=RuntimeError("forced failure")
             ):
                 with self.assertRaises(RuntimeError):
-                    ops.add_agent(conn, name="codex")
-            count = conn.execute(
-                "SELECT COUNT(*) AS n FROM agents"
-            ).fetchone()["n"]
-            self.assertEqual(count, 0)
-        finally:
-            conn.close()
-        self.add_codex()
-        conn = db.connect(self.db_path)
-        try:
-            with mock.patch.object(
-                events, "emit", side_effect=RuntimeError("forced failure")
-            ):
-                with self.assertRaises(RuntimeError):
-                    ops.update_agent(conn, name="codex", notes="mutated")
-            notes = conn.execute(
-                "SELECT notes FROM agents WHERE name = 'codex'"
-            ).fetchone()["notes"]
-            self.assertEqual(notes, "cloud codex agent")
+                    passports.create_agent(conn, name="codex")
+            for table in ("agents", "agent_passports"):
+                count = conn.execute(
+                    f"SELECT COUNT(*) AS n FROM {table}"
+                ).fetchone()["n"]
+                self.assertEqual(count, 0, table)
         finally:
             conn.close()
 
@@ -1290,7 +1243,8 @@ class TestObsidianUsability(Night1BackCompatCase):
             "--value", "SQLite only", "--source", "human",
             "--confidence", "confirmed",
         )
-        self.aos("agent", "add", "codex", "--kind", "cloud")
+        self.aos("agent", "create", "codex", "--class", "specialist")
+        self.aos("agent", "passport", "publish", "codex")
         review_path = Path(self.aos("review", "build").strip())
         weekly_path = Path(self.aos("review", "weekly").strip())
         self.aos("review", "project", "demo")
@@ -1302,7 +1256,7 @@ class TestObsidianUsability(Night1BackCompatCase):
         memory = (self.vault_aos / "Memory.md").read_text("utf-8")
         self.assertIn("[[M-0001]] storage · project · [confirmed]", memory)
         agents = (self.vault_aos / "Agents.md").read_text("utf-8")
-        self.assertIn("[[codex]] cloud", agents)
+        self.assertIn("[[codex]] specialist", agents)
         evidence = (self.vault_aos / "Evidence.md").read_text("utf-8")
         self.assertIn("[[E-0001]] note · night-1 proof · [[T-0001]]", evidence)
         reviews = (self.vault_aos / "Reviews.md").read_text("utf-8")
@@ -1330,9 +1284,8 @@ class TestObsidianUsability(Night1BackCompatCase):
             "--key", "style", "--value", "tabs", "--source", "human",
             "--confidence", "confirmed",
         )
-        self.aos(
-            "agent", "add", "codex", "--kind", "cloud", "--capability", "code"
-        )
+        self.aos("agent", "create", "codex")
+        self.aos("agent", "passport", "publish", "codex")
         self.aos("review", "build")
         self.aos("review", "weekly")
         self.aos("review", "project", "demo")
@@ -1396,16 +1349,29 @@ class TestDoctorCompleteTodayHardening(Night1BackCompatCase):
             self.assertIn(f"[PASS] {name}", out)
 
     def test_fails_on_malformed_agent_row(self):
+        # The v4 row shape, carrying the two legacy hazards this check has
+        # always reported: an out-of-vocabulary kind and unparseable
+        # capabilities_json. Doctor's detail names the row and the reasons —
+        # never the stored kind value (stored data stays out of diagnostics).
         self.corrupt(
-            "INSERT INTO agents (name, kind, capabilities_json) "
-            "VALUES ('rogue', 'robot', 'not json')"
+            "INSERT INTO agents (name, origin, lifecycle, created_at, "
+            "updated_at, kind, capabilities_json, content_sha256) "
+            "VALUES ('rogue', 'legacy', 'active', '2026-01-01T00:00:00Z', "
+            "'2026-01-01T00:00:00Z', 'robot', 'not json', '')"
         )
-        self.assert_single_failure(
-            "agent registry rows are well-formed",
-            "rogue",
-            "unknown kind 'robot'",
-            "capabilities_json does not parse",
-        )
+        code, out = self.doctor()
+        self.assertEqual(code, 1, out)
+        failed = [l for l in out.splitlines() if l.startswith("[FAIL]")]
+        # The planted row also (correctly) fails the U-A1 identity-hash
+        # check; this test owns check 13's verdicts.
+        thirteen = [
+            l for l in failed if "agent registry rows are well-formed" in l
+        ]
+        self.assertEqual(len(thirteen), 1, out)
+        for detail in ("rogue", "unknown kind",
+                       "capabilities_json does not parse"):
+            self.assertIn(detail, thirteen[0])
+        self.assertNotIn("robot", thirteen[0])
 
     def test_fails_on_ingest_event_missing_its_hash(self):
         self.corrupt(

@@ -16,6 +16,7 @@ from pathlib import Path
 
 from . import db, ids, obsidian, ops, power, utils
 from .models import (
+    AGENT_CLASSES,
     MEMORY_EDGE_RELATIONS,
     MEMORY_SENSITIVITIES,
     MEMORY_SENSITIVITY_DEFAULT,
@@ -370,34 +371,53 @@ def cmd_evidence_add(args) -> int:
     return 0
 
 
-def cmd_agent_add(args) -> int:
+def cmd_agent_create(args) -> int:
+    from . import passports
+
     with _ledger(args) as (aos_dir, conn):
-        agent = ops.add_agent(
+        agent, _passport = passports.create_agent(
             conn,
             name=args.name,
-            kind=args.kind,
-            notes=args.notes,
-            capabilities=args.capability,
+            agent_class=args.agent_class,
+            project_slug=args.project,
+            role=args.role,
+            mission=args.mission,
+            fragment_path=args.from_file,
         )
-        print(f"Added agent {agent.name} ({agent.kind})")
+        if args.json:
+            _print_json({"agent": passports.agent_public(conn, agent)})
+            return 0
+        print(
+            f"Added agent {agent.name} ({agent.agent_class}, "
+            f"{agent.lifecycle}) — publish: python aos.py agent passport "
+            f"publish {agent.name}"
+        )
     return 0
 
 
-def cmd_agent_update(args) -> int:
+def cmd_agent_import(args) -> int:
+    from . import passports
+
     with _ledger(args) as (aos_dir, conn):
-        agent, changed = ops.update_agent(
-            conn,
-            name=args.name,
-            notes=args.notes,
-            capabilities=args.capability,
+        agent, _passport = passports.import_agent(conn, args.file)
+        if args.json:
+            _print_json({"agent": passports.agent_public(conn, agent)})
+            return 0
+        print(
+            f"Imported agent {agent.name} ({agent.agent_class}, "
+            f"{agent.lifecycle}) — publish: python aos.py agent passport "
+            f"publish {agent.name}"
         )
-        print(f"{agent.name} updated: {', '.join(changed)}")
     return 0
 
 
 def cmd_agent_list(args) -> int:
+    from . import passports
+
     with _ledger(args) as (aos_dir, conn):
-        agents = ops.list_agents(conn)
+        agents = passports.list_agents(
+            conn, include_all=args.all, project_slug=args.project
+        )
         if args.json:
             _print_json({"agents": agents})
             return 0
@@ -405,34 +425,168 @@ def cmd_agent_list(args) -> int:
             print("(no agents)")
             return 0
         for agent in agents:
-            capabilities = ",".join(agent["capabilities"]) or "-"
-            notes = " ".join(agent["notes"].split()) if agent["notes"] else "-"
+            version = (
+                f"v{agent['current_passport_version']}"
+                if agent["current_passport_version"]
+                else "-"
+            )
+            scope = (
+                f"project:{agent['project']}"
+                if agent["project"]
+                else agent["scope"]
+            )
             print(
-                f"{agent['name']:<16} {agent['kind']:<8} "
-                f"{capabilities:<24} {notes}"
+                f"{agent['name']:<16} {agent['agent_class']:<10} "
+                f"{scope:<16} {agent['lifecycle']:<10} {version:<6} "
+                f"{agent['origin']}"
             )
     return 0
 
 
 def cmd_agent_show(args) -> int:
+    from . import passports
+    from .models import hash_prefix
+
     with _ledger(args) as (aos_dir, conn):
-        agent = ops.get_agent(conn, args.name)
+        agent = passports.get_agent(conn, args.name)
         if agent is None:
             raise AosError(
                 f"No agent '{args.name}'. Run: python aos.py agent list"
             )
-        public = ops.agent_public(agent)
+        public = passports.agent_public(conn, agent)
         if args.json:
             _print_json({"agent": public})
             return 0
-        print(f"{public['name']}  ({public['kind']})")
-        print(
-            "capabilities: "
-            + (", ".join(public["capabilities"]) or "-")
+        print(f"{public['name']}  ({public['agent_class']}, {public['lifecycle']})")
+        scope = public["scope"] + (
+            f" ({public['project']})" if public["project"] else ""
         )
-        print(f"notes:        {_dash(public['notes'])}")
-        print(f"invoke hint:  {_dash(public['invoke_hint'])}")
-        print(f"trust level:  {public['trust_level']}")
+        print(f"scope:        {scope}")
+        print(f"origin:       {public['origin']}")
+        print(f"owner:        {public['owner']}")
+        print(f"protected:    {'yes' if public['protected'] else 'no'}")
+        version = public["current_passport_version"]
+        print(f"passport:     {f'v{version}' if version else '(none published)'}")
+        for passport in public["passports"]:
+            marker = " *" if passport["version"] == version else ""
+            print(
+                f"  v{passport['version']}  {passport['status']:<10} "
+                f"{passport['created_at']}  "
+                f"{hash_prefix(passport['content_sha256'])}…{marker}"
+            )
+        print(f"created:      {public['created_at']}")
+        print(f"updated:      {public['updated_at']}")
+        print(f"integrity:    {public['integrity']}")
+        print(f"hash:         {hash_prefix(public['content_sha256'])}…")
+        legacy = public.get("legacy")
+        if legacy:
+            print("legacy (inert v3 history):")
+            print(f"  kind:         {_dash(legacy['kind'])}")
+            print(
+                "  capabilities: "
+                + (", ".join(legacy["capabilities"]) or "-")
+            )
+            print(f"  notes:        {_dash(legacy['notes'])}")
+            print(f"  invoke hint:  {_dash(legacy['invoke_hint'])}")
+            print(f"  trust level:  {_dash(legacy['trust_level'])}")
+    return 0
+
+
+def cmd_agent_export(args) -> int:
+    from . import passports
+
+    with _ledger(args) as (aos_dir, conn):
+        document = passports.export_document(conn, args.name, args.version)
+        # The stored canonical bytes plus one trailing newline — the
+        # `protocol show` precedent: deterministic, byte-stable forever.
+        sys.stdout.write(document + "\n")
+    return 0
+
+
+def cmd_agent_passport_publish(args) -> int:
+    from . import passports
+
+    with _ledger(args) as (aos_dir, conn):
+        agent, passport = passports.publish_passport(
+            conn, name=args.name, path=args.file
+        )
+        if args.json:
+            _print_json({"agent": passports.agent_public(conn, agent)})
+            return 0
+        print(
+            f"Published passport v{passport.version} for {agent.name} "
+            f"({agent.lifecycle})"
+        )
+    return 0
+
+
+def cmd_agent_passport_history(args) -> int:
+    from . import passports
+    from .models import hash_prefix
+
+    with _ledger(args) as (aos_dir, conn):
+        agent = passports.get_agent(conn, args.name)
+        if agent is None:
+            raise AosError(
+                f"No agent '{args.name}'. Run: python aos.py agent list"
+            )
+        history = passports.list_passports(conn, agent.id)
+        if args.json:
+            _print_json(
+                {
+                    "agent": agent.name,
+                    "current_passport_version": agent.current_passport_version,
+                    "passports": [
+                        {
+                            "version": passport.version,
+                            "status": passport.status,
+                            "created_at": passport.created_at,
+                            "published_at": passport.published_at,
+                            "content_sha256": passport.content_sha256,
+                            "integrity": passports.passport_integrity(passport),
+                        }
+                        for passport in history
+                    ],
+                }
+            )
+            return 0
+        if not history:
+            print("(no passports)")
+            return 0
+        for passport in history:
+            marker = (
+                " *"
+                if passport.version == agent.current_passport_version
+                else ""
+            )
+            print(
+                f"v{passport.version}  {passport.status:<10} "
+                f"created {passport.created_at}  published "
+                f"{passport.published_at or '-':<20}  "
+                f"{hash_prefix(passport.content_sha256)}…{marker}"
+            )
+    return 0
+
+
+def cmd_agent_lifecycle(args) -> int:
+    from . import passports
+
+    with _ledger(args) as (aos_dir, conn):
+        before = passports.get_agent(conn, args.name)
+        from_state = before.lifecycle if before else "?"
+        agent = passports.transition_lifecycle(
+            conn, name=args.name, verb=args.subcommand
+        )
+        print(f"{agent.name}: {from_state} → {agent.lifecycle}")
+    return 0
+
+
+def cmd_agent_discard(args) -> int:
+    from . import passports
+
+    with _ledger(args) as (aos_dir, conn):
+        passports.discard_agent(conn, name=args.name)
+        print(f"Discarded draft agent {args.name}")
     return 0
 
 
@@ -2146,36 +2300,112 @@ def build_parser() -> _Parser:
     p_memory_contra.add_argument("--json", action="store_true")
     p_memory_contra.set_defaults(func=cmd_memory_contradictions)
 
+    # U-A1 governed agent registry. Records and declarations only: nothing
+    # here executes, routes, schedules or authorizes an agent.
     p_agent = sub.add_parser(
-        "agent", help="agent registry (records only; never executes agents)"
+        "agent", help="governed agent registry (records only; never "
+        "executes agents)"
     )
     agent_sub = p_agent.add_subparsers(
         dest="subcommand", metavar="SUBCOMMAND", required=True
     )
-    p_agent_add = agent_sub.add_parser("add", help="register an agent")
-    p_agent_add.add_argument("name")
-    p_agent_add.add_argument("--kind", default="generic")
-    p_agent_add.add_argument("--notes", default=None)
-    p_agent_add.add_argument(
-        "--capability", action="append", default=None, metavar="TEXT"
+    p_agent_create = agent_sub.add_parser(
+        "create", help="register a DRAFT agent identity with a draft v1 "
+        "passport (immutable only at publish)"
     )
-    p_agent_add.set_defaults(func=cmd_agent_add)
-    p_agent_update = agent_sub.add_parser(
-        "update", help="update a registered agent"
+    p_agent_create.add_argument("name")
+    p_agent_create.add_argument(
+        "--class", dest="agent_class", default="custom",
+        choices=list(AGENT_CLASSES),
     )
-    p_agent_update.add_argument("name")
-    p_agent_update.add_argument("--notes", default=None)
-    p_agent_update.add_argument(
-        "--capability", action="append", default=None, metavar="TEXT"
+    p_agent_create.add_argument(
+        "-p", "--project", default=None, metavar="SLUG",
+        help="file the agent under a project (scope=project)",
     )
-    p_agent_update.set_defaults(func=cmd_agent_update)
+    p_agent_create.add_argument("--role", default=None, metavar="TEXT")
+    p_agent_create.add_argument("--mission", default=None, metavar="TEXT")
+    p_agent_create.add_argument(
+        "--from-file", dest="from_file", default=None, metavar="FILE",
+        help="inert JSON fragment of passport body declarations "
+        "(capabilities, task_families, limits, …)",
+    )
+    p_agent_create.add_argument("--json", action="store_true")
+    p_agent_create.set_defaults(func=cmd_agent_create)
+
+    p_agent_import = agent_sub.add_parser(
+        "import", help="import a beast.agent-passport/v1 artifact as a "
+        "DRAFT identity (the file is inert: nothing it names is opened, "
+        "fetched or executed)"
+    )
+    p_agent_import.add_argument("file", metavar="FILE")
+    p_agent_import.add_argument("--json", action="store_true")
+    p_agent_import.set_defaults(func=cmd_agent_import)
+
     p_agent_list = agent_sub.add_parser("list", help="list registered agents")
+    p_agent_list.add_argument(
+        "--all", action="store_true",
+        help="include archived and revoked agents",
+    )
+    p_agent_list.add_argument("-p", "--project", default=None, metavar="SLUG")
     p_agent_list.add_argument("--json", action="store_true")
     p_agent_list.set_defaults(func=cmd_agent_list)
+
     p_agent_show = agent_sub.add_parser("show", help="show one agent")
     p_agent_show.add_argument("name")
     p_agent_show.add_argument("--json", action="store_true")
     p_agent_show.set_defaults(func=cmd_agent_show)
+
+    p_agent_export = agent_sub.add_parser(
+        "export", help="print a passport's stored canonical document "
+        "(default: the current published version)"
+    )
+    p_agent_export.add_argument("name")
+    p_agent_export.add_argument(
+        "--version", type=int, default=None, metavar="N",
+        help="a specific version; the only way to export a draft",
+    )
+    p_agent_export.set_defaults(func=cmd_agent_export)
+
+    p_agent_passport = agent_sub.add_parser(
+        "passport", help="passport versions (immutable once published)"
+    )
+    passport_sub = p_agent_passport.add_subparsers(
+        dest="subsubcommand", metavar="SUBCOMMAND", required=True
+    )
+    p_passport_publish = passport_sub.add_parser(
+        "publish", help="publish the pending draft (or, with --file, a new "
+        "version N+1)"
+    )
+    p_passport_publish.add_argument("name")
+    p_passport_publish.add_argument(
+        "--file", default=None, metavar="FILE",
+        help="a beast.agent-passport/v1 artifact declaring the next version",
+    )
+    p_passport_publish.add_argument("--json", action="store_true")
+    p_passport_publish.set_defaults(func=cmd_agent_passport_publish)
+    p_passport_history = passport_sub.add_parser(
+        "history", help="list an agent's passport versions"
+    )
+    p_passport_history.add_argument("name")
+    p_passport_history.add_argument("--json", action="store_true")
+    p_passport_history.set_defaults(func=cmd_agent_passport_history)
+
+    for verb, help_text in (
+        ("suspend", "declare an active agent parked (reversible)"),
+        ("archive", "move an agent to history (restorable)"),
+        ("restore", "return a suspended/archived agent to active"),
+        ("revoke", "permanently distrust an agent (terminal, journaled)"),
+    ):
+        p_verb = agent_sub.add_parser(verb, help=help_text)
+        p_verb.add_argument("name")
+        p_verb.set_defaults(func=cmd_agent_lifecycle)
+
+    p_agent_discard = agent_sub.add_parser(
+        "discard", help="remove a never-published, never-referenced DRAFT "
+        "(the discard event preserves the audit trail)"
+    )
+    p_agent_discard.add_argument("name")
+    p_agent_discard.set_defaults(func=cmd_agent_discard)
 
     p_ingest = sub.add_parser("ingest", help="ingest agent write-back artifacts")
     ingest_sub = p_ingest.add_subparsers(

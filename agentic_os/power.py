@@ -170,8 +170,19 @@ COMMAND_POLICY: dict[tuple[str, ...], CommandPolicy] = {
     ("memory", "source", "add"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("memory", "source", "link"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("memory", "edge", "add"): _p(AUTHORITATIVE_WRITE, ledger=True),
-    ("agent", "add"): _p(AUTHORITATIVE_WRITE, ledger=True),
-    ("agent", "update"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    # U-A1 governed agent registry. Every write below changes identity
+    # and/or passport rows plus its audit event in one transaction —
+    # authoritative by the same mechanical rule, and blocked in recovery
+    # BEFORE it mutates. `discard` is the system's only DELETE path and is
+    # still just a ledger write for classification purposes.
+    ("agent", "create"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("agent", "import"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("agent", "passport", "publish"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("agent", "suspend"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("agent", "archive"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("agent", "restore"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("agent", "revoke"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("agent", "discard"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("ingest", "dropfile"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("done",): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("migrate", "apply"): _p(AUTHORITATIVE_WRITE, ledger=True),
@@ -212,6 +223,11 @@ COMMAND_POLICY: dict[tuple[str, ...], CommandPolicy] = {
     ("memory", "contradictions"): _p(READ_ONLY),
     ("agent", "list"): _p(READ_ONLY),
     ("agent", "show"): _p(READ_ONLY),
+    # `export` prints stored canonical bytes; `history` prints versions,
+    # statuses and hash prefixes. Both usable in recovery — inspecting a
+    # damaged registry is exactly when they earn their keep.
+    ("agent", "export"): _p(READ_ONLY),
+    ("agent", "passport", "history"): _p(READ_ONLY),
     ("hooks", "status"): _p(READ_ONLY),
     ("migrate", "status"): _p(READ_ONLY),
     ("migrate", "plan"): _p(READ_ONLY),

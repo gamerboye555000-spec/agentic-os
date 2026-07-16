@@ -528,25 +528,56 @@ def memory_note(item, project_slug: str | None, evidence_ids=(), counts=None) ->
 
 
 def agent_note(agent, capabilities: list[str]) -> str:
-    """Registry note. Pure function of the agents row — the table carries no
-    timestamps, so the note is trivially deterministic."""
+    """Governed registry note (U-A1). Pure function of the agents row.
+
+    Shows identity, lifecycle and the current passport version + hash
+    prefix; the passport DOCUMENT stays in the ledger (`agent export` is the
+    reader). Legacy v3 history renders in its own clearly-labeled block —
+    inert facts, never governance.
+    """
+    version = (
+        f"v{agent.current_passport_version}"
+        if agent.current_passport_version
+        else "-"
+    )
     head = frontmatter(
         [
             ("type", "agent"),
             ("name", agent.name),
-            ("kind", agent.kind),
-            ("trust_level", agent.trust_level),
-            ("capabilities", ", ".join(capabilities)),
+            ("agent_class", agent.agent_class),
+            ("scope", agent.scope),
+            ("lifecycle", agent.lifecycle),
+            ("origin", agent.origin),
+            ("passport_version", version),
+            ("hash_prefix", models.hash_prefix(agent.content_sha256)),
         ],
         ["aos/agent"],
     )
-    capability_lines = [f"- {_one_line(c)}" for c in capabilities]
     lines = [head, "", f"# Agent {agent.name}", ""]
-    lines += [f"- kind: {agent.kind}"]
-    lines += [f"- trust level: {agent.trust_level}"]
-    lines += [f"- invoke hint: {_one_line(agent.invoke_hint) if agent.invoke_hint else '-'}"]
-    lines += ["", "## Capabilities", "", _bullets(capability_lines)]
-    lines += _section("Notes", agent.notes)
+    lines += [f"- class: {agent.agent_class}"]
+    lines += [f"- scope: {agent.scope}"]
+    lines += [f"- lifecycle: {agent.lifecycle}"]
+    lines += [f"- origin: {agent.origin}"]
+    lines += [f"- owner: {agent.owner}"]
+    lines += [f"- protected: {'yes' if agent.protected else 'no'}"]
+    lines += [f"- passport: {version}"]
+    lines += [f"- created: {agent.created_at}"]
+    lines += [f"- updated: {agent.updated_at}"]
+    lines += [f"- hash: {models.hash_prefix(agent.content_sha256)}…"]
+    if agent.origin == "legacy":
+        capability_lines = [f"- {_one_line(c)}" for c in capabilities]
+        lines += ["", "## Legacy (inert v3 history)", ""]
+        lines += [f"- kind: {agent.kind if agent.kind is not None else '-'}"]
+        lines += [
+            "- trust level: "
+            + (str(agent.trust_level) if agent.trust_level is not None else "-")
+        ]
+        lines += [
+            "- invoke hint: "
+            + (_one_line(agent.invoke_hint) if agent.invoke_hint else "-")
+        ]
+        lines += ["", "### Capabilities", "", _bullets(capability_lines)]
+        lines += _section("Notes", agent.notes)
     return "\n".join(lines) + "\n"
 
 

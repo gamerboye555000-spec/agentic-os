@@ -664,7 +664,7 @@ class TestDoctorHardening(Night1BackCompatCase):
         # new check). The power line reports [PASS] "standard (default)"
         # here: this workspace has no power.json, and doctor must never
         # create one — which U-M5's read-only commands also honor.
-        self.assertEqual(len(lines), 31)
+        self.assertEqual(len(lines), 34)
         warn_lines = [l for l in lines if l.startswith("[WARN]")]
         self.assertEqual(len(warn_lines), 1)
         self.assertIn("T-0001", warn_lines[0])

@@ -7,8 +7,9 @@ and the schema can never drift apart.
 
 U-M2 (agentic-os-v0.3-u-m2-memory-claims-contract.md) added the first
 production migration: 1 → 2, `u-m2-memory-claims-v2`. U-M3
-(agentic-os-v0.3-u-m3-memory-graph-contract.md) adds the second: 2 → 3,
-`u-m3-memory-graph-v3`. Each supplies a step body and nothing else; every
+(agentic-os-v0.3-u-m3-memory-graph-contract.md) added the second: 2 → 3,
+`u-m3-memory-graph-v3`. U-A1 adds the third: 3 → 4,
+`u-a1-agent-passports-v4`. Each supplies a step body and nothing else; every
 guarantee around them (validate, lock, re-read, snapshot, verify at the
 starting version, then mutate) is U-M1's, unchanged.
 
@@ -57,6 +58,7 @@ from .models import (
     MEMORY_SENSITIVITY_DEFAULT,
     MEMORY_STATUS_LIVE,
     MEMORY_STATUS_RETIRED,
+    Agent,
     MemoryItem,
 )
 from .utils import AosError
@@ -363,11 +365,158 @@ MEMORY_GRAPH_V3 = Migration(
     apply=_memory_graph_v3,
 )
 
-#: The canonical production registry: exactly two steps, 1 → 2 → 3, in order.
-#: Never populated by importing arbitrary files or by evaluating names read
-#: from the database — a literal tuple in source is the whole discovery
+
+# ---------------------------------------------------------------------------
+# Production migration 3 → 4: governed agent identities (U-A1)
+
+#: The temporary name the v4 agents table is built under. Never survives the
+#: step: it is renamed inside the transaction.
+_MIGRATING_TABLE_V4 = "agents_v4_migrating"
+
+#: The HISTORICAL v3 agents table, frozen here verbatim as of 2d242ab (the
+#: U-A1 baseline), exactly as sqlite_master stores it (the IF NOT EXISTS in
+#: db._SCHEMA_TAIL was never part of the stored text). Version 3 is history
+#: now, and history gets a frozen copy — the same trade _V2_MEMORY_CLAIM_DDL
+#: documents. The fixtures build their v3 agents table from THIS text, so
+#: the fixture and this step agree about v3 by construction, and a
+#: regression test byte-compares a migrated database's agents DDL against it
+#: so a future edit to the live constant cannot silently rewrite history.
+_V3_AGENTS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  name TEXT UNIQUE NOT NULL,
+  kind TEXT NOT NULL,
+  invoke_hint TEXT,
+  capabilities_json TEXT,
+  trust_level INTEGER NOT NULL DEFAULT 0,
+  notes TEXT
+)"""
+
+#: The v3 agents columns, in their v3 order. Pinned so the step reads the
+#: historical row shape explicitly rather than trusting `SELECT *` to mean
+#: what it meant at U-A1.
+_V3_AGENTS_COLUMNS = (
+    "id",
+    "name",
+    "kind",
+    "invoke_hint",
+    "capabilities_json",
+    "trust_level",
+    "notes",
+)
+
+
+def _agent_passports_v4(conn: sqlite3.Connection) -> None:
+    """Rebuild `agents` as the v4 governed identity table and add an EMPTY
+    `agent_passports`.
+
+    A rebuild rather than ALTER TABLE ADD COLUMN, for the same measured
+    reason as 1→2 and 2→3 (D-v0.3.43): the new NOT NULL columns
+    (`content_sha256` above all) must have no default a careless writer can
+    fall into, and a migrated table must be byte-identical to a freshly
+    initialized one. Builds from the LIVE db.AGENTS_DDL — correct while 4 is
+    current; a frozen copy becomes v5's obligation (the established trade).
+
+    Every v3 field is carried across VERBATIM: same id, same name (no
+    case-folding, no trimming, no length judgment), same kind — even one
+    outside AGENT_KINDS — same capabilities_json even when it does not
+    parse, same trust_level, same notes. The new facts are constants plus
+    one clock reading (the migration instant, stamped on every row;
+    `origin='legacy'` is what makes that honest). NO PASSPORT IS SYNTHESIZED
+    (the D-v0.3.44 rule): `capabilities_json` and `trust_level` are never
+    parsed, mapped or interpreted — a legacy agent has no current passport
+    until a human publishes one.
+
+    A row that cannot be identity-hashed (a BLOB where text belongs) fails
+    the step with a refusal naming `agent #id` and the field — never the
+    value — and U-M1 rolls the whole step back.
+
+    Runs inside U-M1's already-open transaction: no COMMIT, no ROLLBACK, no
+    touching meta.schema_version — all three belong to apply_migrations.
+    The framework's foreign_keys=OFF + whole-database foreign_key_check is
+    what makes the DROP/RENAME and the mutual agents↔agent_passports
+    foreign keys legal inside one step.
+    """
+    from . import passports  # local: keeps module import order flat
+
+    now = utils.utc_now_iso()  # read ONCE: one migration, one clock reading
+    conn.execute(db.AGENTS_DDL.format(table=_MIGRATING_TABLE_V4))
+
+    columns = ", ".join(_V3_AGENTS_COLUMNS)
+    for row in conn.execute(
+        f"SELECT {columns} FROM {db.AGENTS_TABLE} ORDER BY id"
+    ).fetchall():
+        legacy = {name: row[name] for name in _V3_AGENTS_COLUMNS}
+        agent = Agent(
+            id=legacy["id"],
+            name=legacy["name"],
+            agent_class="custom",
+            scope="global",
+            project_id=None,
+            lifecycle="active",
+            protected=0,
+            owner="human",
+            origin="legacy",
+            current_passport_version=None,
+            created_at=now,
+            updated_at=now,
+            kind=legacy["kind"],
+            invoke_hint=legacy["invoke_hint"],
+            capabilities_json=legacy["capabilities_json"],
+            trust_level=legacy["trust_level"],
+            notes=legacy["notes"],
+            content_sha256="",
+        )
+        digest = passports.agent_identity_digest(agent)
+        conn.execute(
+            f"INSERT INTO {_MIGRATING_TABLE_V4} "
+            "(id, name, agent_class, scope, project_id, lifecycle, "
+            "protected, owner, origin, current_passport_version, "
+            "created_at, updated_at, kind, invoke_hint, capabilities_json, "
+            "trust_level, notes, content_sha256) "
+            "VALUES (?, ?, 'custom', 'global', NULL, 'active', 0, 'human', "
+            "'legacy', NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                legacy["id"],
+                legacy["name"],
+                now,
+                now,
+                legacy["kind"],
+                legacy["invoke_hint"],
+                legacy["capabilities_json"],
+                legacy["trust_level"],
+                legacy["notes"],
+                digest,
+            ),
+        )
+
+    conn.execute(f"DROP TABLE {db.AGENTS_TABLE}")
+    conn.execute(
+        f"ALTER TABLE {_MIGRATING_TABLE_V4} RENAME TO {db.AGENTS_TABLE}"
+    )
+    # AFTER the rename, so the composite-FK parent the agents table names is
+    # created once the real table carries its real name. EMPTY, like the
+    # graph tables at 2→3: nothing here invents a declaration.
+    conn.execute(
+        db.AGENT_PASSPORTS_DDL.format(table=db.AGENT_PASSPORTS_TABLE)
+    )
+
+
+AGENT_PASSPORTS_V4 = Migration(
+    from_version=3,
+    to_version=4,
+    migration_id="u-a1-agent-passports-v4",
+    apply=_agent_passports_v4,
+)
+
+#: The canonical production registry: exactly three steps, 1 → 2 → 3 → 4, in
+#: order. Never populated by importing arbitrary files or by evaluating names
+#: read from the database — a literal tuple in source is the whole discovery
 #: mechanism.
-MIGRATIONS: tuple[Migration, ...] = (MEMORY_CLAIMS_V2, MEMORY_GRAPH_V3)
+MIGRATIONS: tuple[Migration, ...] = (
+    MEMORY_CLAIMS_V2,
+    MEMORY_GRAPH_V3,
+    AGENT_PASSPORTS_V4,
+)
 
 
 # ---------------------------------------------------------------------------

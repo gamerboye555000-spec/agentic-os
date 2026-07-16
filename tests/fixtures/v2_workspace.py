@@ -165,6 +165,12 @@ def _install_v2_memory_schema(db_path: Path) -> None:
                     "v2 fixture: memory must be empty when the v2 schema is "
                     f"installed (found {rows} rows)"
                 )
+            agent_rows = conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
+            if agent_rows:
+                raise AssertionError(
+                    "v2 fixture: agents must be empty when the v2 schema is "
+                    f"installed (found {agent_rows} rows)"
+                )
             # Reverse order: memory_source_links references memory_sources.
             for table, _ddl in reversed(db.MEMORY_GRAPH_TABLES):
                 conn.execute(f"DROP TABLE {table}")
@@ -172,9 +178,55 @@ def _install_v2_memory_schema(db_path: Path) -> None:
             conn.execute("DROP TABLE memory")
             conn.execute(V2_MEMORY_SQL)
             conn.execute(V2_MEMORY_EVIDENCE_SQL)
+            # U-A1: a "v2" workspace with a v4 agents table (or any
+            # agent_passports) would not be one. The v3 agents DDL — which
+            # IS the v2 agents DDL; the table was unchanged from Night-1
+            # through v3 — comes from migrations._V3_AGENTS_DDL, the same
+            # frozen text the 3→4 step documents as its input shape.
+            conn.execute("DROP TABLE agent_passports")
+            conn.execute("DROP TABLE agents")
+            conn.execute(migrations._V3_AGENTS_DDL.format(table="agents"))
             conn.execute(
                 "UPDATE meta SET value = ? WHERE key = 'schema_version'",
                 (V2_SCHEMA_VERSION,),
+            )
+    finally:
+        conn.close()
+
+
+def _v2_agent_add(
+    db_path: Path,
+    *,
+    name: str,
+    kind: str = "generic",
+    notes: str | None = None,
+    capabilities: tuple[str, ...] = (),
+) -> None:
+    """v2's `agent add`, frozen — a verbatim replica of ops.add_agent as of
+    2d242ab (the agents table and its writer were unchanged from Night-1
+    through v3). It exists only because U-A1 retired the ungoverned writer
+    and a v4 build cannot address a v2 table."""
+    import json
+
+    conn = db.connect(db_path)
+    try:
+        with conn:
+            cursor = conn.execute(
+                "INSERT INTO agents (name, kind, capabilities_json, notes) "
+                "VALUES (?, ?, ?, ?)",
+                (name, kind, json.dumps(list(capabilities)), notes),
+            )
+            events.emit(
+                conn,
+                actor=ops.ACTOR_HUMAN,
+                entity="agent",
+                entity_id=cursor.lastrowid,
+                action="add",
+                payload={
+                    "agent": name,
+                    "kind": kind,
+                    "capabilities": list(capabilities),
+                },
             )
     finally:
         conn.close()
@@ -303,11 +355,6 @@ def build_v2_workspace(root: Path) -> Path:
             "--repo", str(legacy_repo),
         )
 
-        _run("agent", "add", "claude-code", "--kind", "local",
-             "--notes", "primary coding agent", "--capability", "code")
-        _run("agent", "add", "reviewer", "--kind", "cloud",
-             "--notes", "review only")
-
         _run("task", "add", "Historical v2 task", "-p", "demo",
              "--accept", "pack + evidence flow works")
         _run("pack", "build", "T-0001", "--for", "claude-code")
@@ -336,10 +383,19 @@ def build_v2_workspace(root: Path) -> Path:
         # The last v3-code step, with memory still empty.
         _run("sync")
 
-        # Step 3: the memory tables become v2, and so does the version.
+        # Step 3: the memory and agent tables become v2, and so does the
+        # version.
         db_path = root / utils.AOS_DIR_NAME / utils.DB_FILENAME
         demo_id = _project_id(db_path, "demo")
         _install_v2_memory_schema(db_path)
+
+        # Step 4a: the two registered agents, through v2's frozen writer.
+        _v2_agent_add(
+            db_path, name="claude-code", kind="local",
+            notes="primary coding agent", capabilities=("code",),
+        )
+        _v2_agent_add(db_path, name="reviewer", kind="cloud",
+                      notes="review only")
 
         # Step 4: the memory rows, through v2's frozen writer.
 
