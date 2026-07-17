@@ -204,6 +204,34 @@ def validate_new_agent_name(name: str) -> str:
     return name
 
 
+#: U-A2 built-in specialist catalog vocabulary. The catalog lives entirely
+#: inside the "aos." prefix RESERVED_AGENT_PREFIXES already reserves — zero
+#: new reservations, zero edits to RESERVED_AGENT_PREFIXES/RESERVED_AGENT_NAMES
+#: or validate_new_agent_name. CATALOG_ISSUER is the passport `issuer` every
+#: catalog artifact carries, hash-bound into the document body.
+CATALOG_AGENT_PREFIX = "aos."
+CATALOG_ISSUER = "aos.catalog"
+
+
+def validate_catalog_agent_name(name: str) -> str:
+    """The catalog-name gate (U-A2): charset-valid AND inside the reserved
+    `aos.` namespace — exact bytes only, no case folding, no Unicode
+    normalization, no aliases.
+
+    The exact complement of validate_new_agent_name over the same reserved
+    prefix: that function refuses any name starting with CATALOG_AGENT_PREFIX,
+    this one requires it. Together they are disjoint and total over every
+    string — a property of the code, not a separate check.
+    """
+    validate_agent_name(name)
+    if not name.startswith(CATALOG_AGENT_PREFIX):
+        raise AosError(
+            f"Catalog agent name {name!r} must start with "
+            f"{CATALOG_AGENT_PREFIX!r}."
+        )
+    return name
+
+
 class _Row:
     @classmethod
     def from_row(cls, row: sqlite3.Row):

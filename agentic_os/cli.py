@@ -590,6 +590,171 @@ def cmd_agent_discard(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# U-A2 built-in specialist catalog — five read-only leaves this wave.
+#
+# Every one of these is inert: `list`/`show`/`verify` parse bytes and compare
+# them to the checked-in manifest (no SQLite, no workspace, no event —
+# usable in recovery); `status`/`plan` additionally open the ledger
+# READ-ONLY to report installed state. None of the five writes a row.
+# `agent catalog install` does not exist in this build.
+
+def cmd_agent_catalog_list(args) -> int:
+    from . import catalog
+
+    cat = catalog.catalog()
+    if args.json:
+        _print_json(
+            {
+                "catalog": {
+                    "catalog_version": cat.catalog_version,
+                    "manifest_sha256": cat.manifest_sha256,
+                    "entries": [catalog.entry_public(e) for e in cat.entries],
+                }
+            }
+        )
+        return 0
+    name_width = max(len(e.agent) for e in cat.entries)
+    category_width = max(len(e.category) for e in cat.entries)
+    for e in cat.entries:
+        print(
+            f"{e.agent:<{name_width}}  {e.category:<{category_width}}  "
+            f"{e.maturity:<11}  v{e.latest.passport_version}"
+        )
+    print(f"{len(cat.entries)} entry(ies), catalog v{cat.catalog_version}")
+    return 0
+
+
+def cmd_agent_catalog_show(args) -> int:
+    from . import catalog, passports, protocols
+
+    modes = [
+        name
+        for name, flag in (
+            ("--document", args.document),
+            ("--fragment", args.fragment),
+            ("--json", args.json),
+        )
+        if flag
+    ]
+    if len(modes) > 1:
+        raise AosError(
+            "Pass at most one of --document, --fragment, --json; got "
+            + ", ".join(modes) + "."
+        )
+
+    entry = catalog.catalog().get(args.name)
+    if entry is None:
+        raise AosError(
+            f"No catalog entry {args.name!r}. Run: python aos.py agent catalog list"
+        )
+    document, text = catalog.load_document(entry, entry.latest)
+
+    if args.document:
+        sys.stdout.write(text)
+        return 0
+
+    if args.fragment:
+        fragment = {
+            key: value
+            for key, value in document.items()
+            if key not in passports._FRAGMENT_FORBIDDEN
+        }
+        sys.stdout.write(protocols.serialize_canonical_file_bytes(fragment).decode("utf-8"))
+        return 0
+
+    if args.json:
+        _print_json({"entry": catalog.entry_public(entry), "document": document})
+        return 0
+
+    evidence = document["evidence_expectations"]
+    print(f"{entry.agent}  ({entry.category}, {entry.maturity})")
+    print(f"role:                {document['role']}")
+    print(f"escalation:          {document['escalation']}")
+    print(
+        "evidence:            "
+        + ", ".join(evidence["evidence_kinds"])
+        + f" (min {evidence['min_evidence_count']})"
+    )
+    print("task families:       " + (", ".join(document.get("task_families", ())) or "-"))
+    print(
+        "skill requirements:  "
+        + (", ".join(document.get("skill_requirements", ())) or "-")
+    )
+    print(
+        "tool requirements:   "
+        + (", ".join(document.get("tool_requirements", ())) or "-")
+    )
+    for limitation in document.get("limitations", ()):
+        print(f"limitation:          {limitation}")
+    print(f"passport:            v{entry.latest.passport_version}")
+    print(f"digest:              {entry.latest.document_sha256}")
+    return 0
+
+
+def cmd_agent_catalog_verify(args) -> int:
+    from . import catalog
+
+    problems = catalog.verify()
+    if args.json:
+        _print_json({"problems": problems})
+        return 1 if problems else 0
+    if not problems:
+        cat = catalog.catalog()
+        total_versions = sum(len(e.versions) for e in cat.entries)
+        print(f"{len(cat.entries)} entry(ies), {total_versions} passport(s): OK")
+        return 0
+    for problem in problems:
+        print(problem, file=sys.stderr)
+    return 1
+
+
+def cmd_agent_catalog_status(args) -> int:
+    from . import catalog
+
+    with _ledger(args) as (aos_dir, conn):
+        rows = catalog.status(conn)
+        if args.json:
+            _print_json({"status": rows})
+            return 0
+        width = max(len(r["agent"]) for r in rows)
+        for r in rows:
+            installed = f"v{r['installed_version']}" if r["installed_version"] else "-"
+            available = f"v{r['available_version']}"
+            detail = f"  ({r['detail']})" if r["detail"] else ""
+            print(
+                f"{r['agent']:<{width}}  {r['state']:<13}  {installed:<6} "
+                f"{available:<6}{detail}"
+            )
+        counts: dict[str, int] = {}
+        for r in rows:
+            counts[r["state"]] = counts.get(r["state"], 0) + 1
+        summary = ", ".join(f"{n} {s}" for s, n in sorted(counts.items()))
+        print(f"{len(rows)} entry(ies): {summary}")
+    return 0
+
+
+def cmd_agent_catalog_plan(args) -> int:
+    from . import catalog
+
+    if args.all and args.names:
+        raise AosError("Pass either NAME(s) or --all, not both.")
+    if not args.all and not args.names:
+        raise AosError("Pass at least one NAME, or --all.")
+    names = None if args.all else list(args.names)
+
+    with _ledger(args) as (aos_dir, conn):
+        actions = catalog.plan(conn, names)
+        if args.json:
+            _print_json({"plan": actions})
+            return 0
+        width = max(len(a["agent"]) for a in actions)
+        for a in actions:
+            detail = f"  ({a['detail']})" if a["detail"] else ""
+            print(f"{a['agent']:<{width}}  {a['action']:<8}{detail}")
+    return 0
+
+
 def cmd_evidence_git(args) -> int:
     task_id = ids.parse_id(args.id, "task")
     with _ledger(args) as (aos_dir, conn):
@@ -2406,6 +2571,59 @@ def build_parser() -> _Parser:
     )
     p_agent_discard.add_argument("name")
     p_agent_discard.set_defaults(func=cmd_agent_discard)
+
+    # U-A2 built-in specialist catalog. Five read-only leaves this wave;
+    # `install` does not exist yet.
+    p_agent_catalog = agent_sub.add_parser(
+        "catalog", help="the built-in specialist catalog (inert "
+        "declarations; read-only in this build)"
+    )
+    catalog_sub = p_agent_catalog.add_subparsers(
+        dest="subsubcommand", metavar="SUBCOMMAND", required=True
+    )
+    p_catalog_list = catalog_sub.add_parser(
+        "list", help="list the built-in catalog's entries"
+    )
+    p_catalog_list.add_argument("--json", action="store_true")
+    p_catalog_list.set_defaults(func=cmd_agent_catalog_list)
+
+    p_catalog_show = catalog_sub.add_parser(
+        "show", help="show one catalog entry's declaration"
+    )
+    p_catalog_show.add_argument("name")
+    p_catalog_show.add_argument(
+        "--document", action="store_true",
+        help="print the exact stored canonical artifact",
+    )
+    p_catalog_show.add_argument(
+        "--fragment", action="store_true",
+        help="print the document minus CLI-owned envelope fields, ready "
+        "for `agent create --from-file`",
+    )
+    p_catalog_show.add_argument("--json", action="store_true")
+    p_catalog_show.set_defaults(func=cmd_agent_catalog_show)
+
+    p_catalog_verify = catalog_sub.add_parser(
+        "verify", help="verify the built-in catalog's manifest and artifacts"
+    )
+    p_catalog_verify.add_argument("--json", action="store_true")
+    p_catalog_verify.set_defaults(func=cmd_agent_catalog_verify)
+
+    p_catalog_status = catalog_sub.add_parser(
+        "status", help="this workspace's installed-state for every catalog "
+        "entry"
+    )
+    p_catalog_status.add_argument("--json", action="store_true")
+    p_catalog_status.set_defaults(func=cmd_agent_catalog_status)
+
+    p_catalog_plan = catalog_sub.add_parser(
+        "plan", help="install/upgrade/noop/refuse actions, without writing "
+        "anything"
+    )
+    p_catalog_plan.add_argument("names", nargs="*", metavar="NAME")
+    p_catalog_plan.add_argument("--all", action="store_true")
+    p_catalog_plan.add_argument("--json", action="store_true")
+    p_catalog_plan.set_defaults(func=cmd_agent_catalog_plan)
 
     p_ingest = sub.add_parser("ingest", help="ingest agent write-back artifacts")
     ingest_sub = p_ingest.add_subparsers(

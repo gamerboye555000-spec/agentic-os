@@ -228,6 +228,16 @@ COMMAND_POLICY: dict[tuple[str, ...], CommandPolicy] = {
     # damaged registry is exactly when they earn their keep.
     ("agent", "export"): _p(READ_ONLY),
     ("agent", "passport", "history"): _p(READ_ONLY),
+    # U-A2 built-in specialist catalog. All five leaves parse bytes and/or
+    # read existing rows — none writes, so all five are read_only and
+    # therefore usable in recovery, which is the point: inspecting the
+    # catalog while the ledger is damaged is exactly when `verify` and
+    # `status` earn their keep. `agent catalog install` does not exist yet.
+    ("agent", "catalog", "list"): _p(READ_ONLY),
+    ("agent", "catalog", "show"): _p(READ_ONLY),
+    ("agent", "catalog", "verify"): _p(READ_ONLY),
+    ("agent", "catalog", "status"): _p(READ_ONLY),
+    ("agent", "catalog", "plan"): _p(READ_ONLY),
     ("hooks", "status"): _p(READ_ONLY),
     ("migrate", "status"): _p(READ_ONLY),
     ("migrate", "plan"): _p(READ_ONLY),
