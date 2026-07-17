@@ -1578,3 +1578,138 @@ python aos.py agent revoke X     # permanent distrust; terminal
 By design. No command leaves `revoked` — not restore, not publish. The
 identity, its passports and its events remain on record; create a new
 identity under a new name if the work must continue.
+
+## Specialist agent catalog (U-A2)
+
+### The model in one paragraph
+
+Twelve built-in `beast.agent-passport/v1` declarations ship inside the
+package under `agentic_os/catalog/`, indexed by a checked-in
+`manifest.json`. `list`/`show`/`verify`/`status`/`plan` are read-only and
+touch no ledger row; `install` is the ONLY command that ever writes one, and
+it is explicit — no power mode, `init`, `migrate apply`, `doctor`, or `sync`
+ever installs or upgrades an entry. Reinstalling an already-installed set at
+matching digests is a true no-op: no transaction, no row, no event.
+
+### "The built-in catalog does not verify, so nothing was installed: …"
+
+Doctor check 35 ("built-in catalog verified") failed for the same reason:
+the shipped catalog itself — the manifest or one of the twelve artifacts —
+does not verify (malformed, missing, extra, non-canonical, digest-
+mismatching, or secret-shaped). This is a corrupted or tampered
+*installation of the software*, not a ledger problem.
+
+```bash
+python aos.py agent catalog verify   # names a bounded problem count + reason codes
+python aos.py doctor                 # check 35 reports the same verdict
+```
+
+Re-obtain `agentic_os/catalog/` from a trusted source (a clean checkout,
+wheel, or `aos.pyz`). Never hand-edit a passport or the manifest to make the
+check pass — see RECOVERY.md's "Catalog tamper or divergence" section.
+
+### "Catalog entry 'X' is blocked (name owned by a … identity); refusing the whole request"
+
+A non-catalog identity — human-created, imported, or a legacy v3 row —
+already owns that `aos.*` name. This is only reachable through legacy
+migration or out-of-band writes; `agent create`/`agent import` have refused
+`aos.*` names since U-A1. The install refuses the **whole** selected set,
+never partially installs, and the pre-existing row is never adopted,
+renamed, or overwritten:
+
+```bash
+python aos.py agent catalog status          # names which entries are blocked and why
+python aos.py agent show aos.NAME           # inspect the row that owns the name
+```
+
+There is no route to "take over" the name. If the pre-existing identity is
+truly obsolete, retire it through the normal `archive`/`revoke` verbs — the
+catalog entry then still cannot install onto that name; that limitation is
+tracked as deferred work (§19 of the U-A2 contract), not a bug.
+
+### "Catalog entry 'X' is diverged (installed history does not match the catalog); refusing the whole request"
+
+An installed catalog identity's history does not match the checked-in
+catalog at a version both share, or the installed maximum version exceeds
+what the catalog ships. `agent passport publish --file` has refused
+`owner=system` identities since U-A1, so this is reachable only by
+out-of-band tampering. Doctor check 36 ("installed catalog identities
+verified") reports the same identity and verdict.
+
+```bash
+python aos.py agent catalog status   # state: diverged
+python aos.py doctor                 # check 36: FAIL, names the identity
+```
+
+There is no automatic repair. Restore the ledger from a verified backup —
+see RECOVERY.md's "Catalog tamper or divergence" section. `agent catalog
+install` will not overwrite a diverged row.
+
+### "Catalog entry 'X' is tampered (…); refusing the whole request"
+
+The installed identity's own hashes are internally inconsistent — an
+identity hash mismatch, a broken passport-row hash, an incoherent
+`owner`/`protected`/`agent_class`/`lifecycle` combination, or no published
+passport at all. Doctor checks 32/33 (identity/history) and 36 (catalog
+coherence) all name it. Same posture as any other tampered governed row:
+restore from backup, never hand-repair the hash.
+
+### doctor: "[WARN] catalog entries available to install — N actionable: aos.NAME (upgradable), …"
+
+Not a failure — an actionable fact. One or more entries are either
+upgradable (the catalog ships a newer version than what is installed) or
+blocked by a name collision. An uninstalled entry never produces this
+warning by itself; only an *actionable* condition does:
+
+```bash
+python aos.py agent catalog plan --all    # shows the exact action per entry
+python aos.py agent catalog install --all # upgrades the upgradable entries;
+                                           # still refuses on any blocked one
+```
+
+### "Agent 'X' is catalog-managed (owner: system); its passport history is the built-in catalog's …"
+
+`agent passport publish --file` refuses any `owner=system` row: a catalog
+identity's history is exclusively the catalog's, and grafting a
+user-published version onto it would produce a permanently un-upgradable
+half-ours/half-yours history. Derive a customized variant instead — a new,
+human-owned identity that shares no row with the catalog entry:
+
+```bash
+python aos.py agent catalog show aos.architect --fragment > body.json
+python aos.py agent create my-architect --class specialist --from-file body.json
+```
+
+The derived identity is `owner=human`, `origin=create`, unprotected, and is
+never touched by a later `agent catalog install` — it does not share a name,
+a row, or a code path with `aos.architect`.
+
+### `suspend`/`archive`/`revoke`/`discard` refuses a catalog identity
+
+Expected — every catalog identity is created `protected=1`, exactly like any
+other protected identity (see the Governed agent registry section above). A
+built-in cannot be archived or revoked in U-A2; uninstall/park is
+deliberately deferred work (§19 of the contract). Upgrades remain possible
+through `agent catalog install` — protection does not block the catalog's
+own append path.
+
+### A built zipapp's `doctor` fails check 35, but the checkout's `doctor` passes
+
+The archive is missing or has a stale copy of a referenced catalog resource.
+`tools/build_zipapp.py` re-verifies the manifest and every referenced
+passport (canonical bytes, self-digest, per-artifact digest, agent/version
+binding) before archiving anything — a missing referenced file, an unsafe
+path, a duplicate-key or non-canonical artifact, or a digest mismatch all
+**fail the build itself**, not silently produce a partial archive:
+
+```bash
+python3 tools/build_zipapp.py    # rebuild; a real problem fails loudly here
+python3 tools/gen_catalog.py --check   # confirms the checked-in source is sound
+```
+
+If the build succeeds but an older `.pyz` is the one you are running, that
+`.pyz` predates the current catalog — rebuild it. The archive never
+`*.json`-sweeps `agentic_os/catalog/`; it includes exactly the manifest plus
+the passport paths the manifest's entries reference, so an unreferenced or
+stray file (including a stray `credentials.json`) is excluded by
+construction, never by name.

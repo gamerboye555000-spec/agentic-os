@@ -131,6 +131,104 @@ byte-identical.
   prose an operator pastes a credential into. Diagnostics stay
   name-or-`agent #id`, verdicts and counts — never a value.
 
+- **D-v0.4.14 — Packaging: the zipapp allowlist becomes manifest-driven, not
+  broadened by pattern.** D-v0.3.61 declined a `*.json` branch precisely
+  because a denylist-shaped widening can be defeated by an unanticipated new
+  file; U-A2 needs JSON passports in the archive anyway, so the allowlist is
+  strengthened instead of loosened: the builder reads
+  `agentic_os/catalog/manifest.json` and archives exactly that file plus the
+  passport paths its entries reference, verifying each referenced artifact's
+  digest before archiving it. A schema (D-v0.3.2) is hashed externally and
+  is code; a passport is hashed internally (`content_sha256` is a required,
+  checked field) and is authored content, so embedding it as a Python
+  literal would make verification circular — the rejected fallback. An
+  unreferenced `agentic_os/catalog/*.json` stays excluded by construction, a
+  tampered referenced artifact fails the build outright, and
+  `test_v02_packaging.py`'s `.py`-only pin moves to reflect the new rule.
+  Signing (U-S5/U-Q1) will cover these same referenced artifacts later; this
+  decision only establishes what ships.
+
+- **D-v0.4.15 — Catalog provenance is `owner='system'` + `issuer` +
+  digest match, with no schema change.** `agents.owner` already permits
+  `'system'` and no U-A1 writer has ever emitted it — D-v0.4.6 reserved the
+  pairing for this unit. Bound together with the hash-bound passport
+  `issuer='aos.catalog'` and a recomputed-digest match against the
+  checked-in manifest, the three independent bindings make forged catalog
+  authenticity structurally impossible without inventing a fourth. Adding an
+  `origin='catalog'` value to `origin`'s CHECK was rejected: it would force
+  a table rebuild and a schema v5 bump for a fact the existing fields
+  already carry more strongly, and an import of a checked-in artifact is a
+  truthful `import` regardless of who authored the artifact. Name is used
+  only for lookup and collision refusal, never as the ownership test.
+
+- **D-v0.4.16 — The catalog reuses the existing `aos.` reservation; zero
+  new names are reserved.** `RESERVED_AGENT_PREFIXES` has refused `aos.*` at
+  create/import since U-A1 shipped (D-v0.4.6), so the catalog's namespace
+  and the user's namespace are structurally disjoint — no catalog write can
+  land on a user name, and no user write can land on a catalog name, by
+  construction rather than by a new check. The bare reserved names
+  (`governor`, `planner`, `builder`, `verifier`, `security-sentinel`) stay
+  row-less on purpose: the catalog lives entirely at `aos.*`, and `governor`
+  specifically is never minted, because no policy engine, router, or
+  scheduler exists for it to have authority over. Name comparison is exact
+  bytes — no case folding, no Unicode normalization, no aliases — so a
+  lookalike name is simply a different, non-colliding, non-catalog name.
+
+- **D-v0.4.17 — The catalog ships every passport version, never only the
+  latest.** A passport's `passport_version` is hash-bound and must equal its
+  row's version, so a catalog that shipped only "the newest" per role could
+  never reconstruct a gap-free history on a fresh install. Synthesizing a
+  plausible intermediate version to close that gap was rejected on the same
+  ground D-v0.4.4 already established for the 3→4 migration: a guess does
+  not get to wear history's clothes. Shipping versions 1..N for all twelve
+  entries (N=1 at this unit's ship date) means a fresh install and an
+  upgrade-chain converge on byte-identical documents and identical version
+  numbers, and the manifest's version-list shape needs no change at the
+  first future upgrade.
+
+- **D-v0.4.18 — `agent catalog install --all` is one transaction, not
+  one per entry.** Empirical verification showed `db.transaction()` commits
+  early when nested, so the two new row-writing primitives
+  (`create_catalog_identity`, `append_catalog_version`) are written as
+  transaction participants that never open their own, and `catalog.py` owns
+  the single rollback boundary around the whole `--all` operation.
+  Per-entry transactions were rejected: a partially installed catalog is a
+  state nobody requested and no command can describe, every realistic
+  refusal (collision, divergence, tamper) is already detected during
+  verify-then-plan before the transaction opens, and twelve entries at
+  roughly two rows each is too small to need splitting. Consequently every
+  foreseeable refusal costs zero writes, every fact is re-read inside the
+  transaction against TOCTOU, and one failing entry rolls back the entire
+  operation with the refusal naming the entry that blocked it.
+
+- **D-v0.4.19 — Shipped catalog artifacts are fail-closed on secret shape,
+  not warn-on-write.** D-v0.2.15's warn-on-write posture governs the
+  trusted human CLI boundary: a human typed it, so the ledger stays honest
+  and the human is warned rather than blocked. A checked-in catalog artifact
+  is not user input — it is reviewed content the project ships — so a
+  secret-shaped string appearing in one is a defect, not a user's choice.
+  Reusing warn-on-write for catalog content was rejected because it would
+  let a defect in reviewed, shipped content reach the ledger and only be
+  flagged afterward, exactly the laundering U-C3 exists to prevent for less
+  trusted input. `catalog.verify()` therefore FAILs and `install` refuses
+  before any write. No catalog-specific reader is invented: every byte still
+  passes through the same `parse_canonical` + `validate_document` path
+  `agent import` uses, so catalog install events stay unconditionally clean.
+
+- **D-v0.4.20 — No handoff graph or dependency block in U-A2.** A
+  preferred-inbound/outbound-handoff field on a passport, or a `dependencies`
+  block in the manifest, would encode a routing structure — exactly the
+  router this unit's non-goals forbid building. A manifest `dependencies`
+  list expressing install ordering was rejected on its own terms too:
+  passports are inert with no inter-entry dependency, installation order is
+  already manifest order, and a separate ordering field would be duplicate
+  state carrying no meaning. Where a boundary is genuinely part of a role's
+  own limit, it is prose in that role's `mission`/`limitations` field, never
+  a structured, machine-followed one. Routing and handoff graphs remain
+  explicitly assigned to a future unit (U-A3), which starts from a clean
+  slate rather than an informally-encoded graph it would have to honor or
+  break.
+
 # DECISIONS — Agentic OS v0.3 U-M5 retrieval evaluations
 
 This section continues the `D-v0.3.*` series for the U-M5 pass executed per

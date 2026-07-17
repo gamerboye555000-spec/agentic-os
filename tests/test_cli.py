@@ -827,10 +827,12 @@ class TestDoctor(CliTestCase):
         # (R-0001's evidence is attributable and no ref is blank). The
         # power line is [PASS] "standard (default)": this fixture never
         # writes power.json, and reading it must not create it.
-        # 21 → 25 → 30 → 34: U-M2's four mandated memory-claim checks joined
-        # the set, then U-M3's five memory-graph checks, then U-M5's
-        # retrieval benchmark registry check.
-        self.assertEqual(len(lines), 34)
+        # 21 → 25 → 30 → 34 → 37: U-M2's four mandated memory-claim checks
+        # joined the set, then U-M3's five memory-graph checks, then U-M5's
+        # retrieval benchmark registry check, then U-A2's three built-in
+        # catalog checks (fresh workspace: catalog uninstalled, so all
+        # three stay [PASS] and the warn count is unaffected).
+        self.assertEqual(len(lines), 37)
         warn_lines = [l for l in lines if l.startswith("[WARN]")]
         self.assertEqual(len(warn_lines), 1)
         self.assertIn("code tasks done without commit evidence", warn_lines[0])

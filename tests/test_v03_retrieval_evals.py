@@ -1974,8 +1974,14 @@ class ParityTests(unittest.TestCase):
         self.assertIn("Unknown benchmark", script.stderr)
 
     def test_the_zipapp_carries_retrieval_but_no_benchmark_json(self):
-        """(39) The datasets travel as Python (D-v0.3.61); the archive gains
-        agentic_os/retrieval.py and nothing else."""
+        """(39) The retrieval datasets travel as Python (D-v0.3.61); the
+        archive gains agentic_os/retrieval.py and no retrieval_benchmarks/
+        JSON. U-A2 (D-v0.4.14) is the one deliberate exception to
+        "otherwise nothing but .py": the built-in catalog's manifest plus
+        twelve passports are checked-in JSON that DOES belong in the
+        archive, manifest-driven and independently re-verified by the
+        builder — never a broad *.json sweep, and never anything under
+        retrieval_benchmarks/."""
         import zipfile
 
         with zipfile.ZipFile(self.archive) as archive:
@@ -1984,11 +1990,16 @@ class ParityTests(unittest.TestCase):
         for name in names:
             if name.endswith("/"):
                 continue  # a directory entry, not a member
+            if name.startswith("agentic_os/catalog/"):
+                continue  # U-A2's deliberate, manifest-driven exception
             self.assertTrue(
                 name.endswith(".py"), f"{name} is not a Python source file"
             )
         self.assertFalse(any("retrieval_benchmarks" in n for n in names))
-        self.assertFalse(any(n.endswith(".json") for n in names))
+        json_members = [n for n in names if n.endswith(".json")]
+        self.assertTrue(
+            all(n.startswith("agentic_os/catalog/") for n in json_members), json_members
+        )
         self.assertFalse(any(n.endswith(".db") for n in names))
 
     def test_the_zipapp_reports_its_benchmarks_from_the_embedded_definitions(self):

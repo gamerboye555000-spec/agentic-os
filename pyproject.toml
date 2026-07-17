@@ -21,5 +21,14 @@ aos = "agentic_os.cli:main"
 # exports, caches, and repository-only files are never swept in.
 packages = ["agentic_os"]
 
+[tool.setuptools.package-data]
+# The built-in specialist catalog (U-A2): the manifest and twelve checked-in
+# passport artifacts under agentic_os/catalog/ only. setuptools ships no
+# non-.py file by default, so without this a wheel or console-script install
+# would carry the loader code but none of its data. Restricted to this one
+# subtree — not a repository-wide *.json rule — so no ledger, credential,
+# backup, export, or other repository JSON is ever swept in this way.
+agentic_os = ["catalog/*.json"]
+
 [tool.setuptools.dynamic]
 version = { attr = "agentic_os.__version__" }

@@ -38,10 +38,12 @@ from .models import (
     AGENT_LIFECYCLE_REVOKED,
     AGENT_PASSPORT_DRAFT,
     AGENT_PASSPORT_PUBLISHED,
+    CATALOG_ISSUER,
     Agent,
     AgentPassport,
     hash_prefix,
     is_claim_hash,
+    validate_catalog_agent_name,
     validate_new_agent_name,
 )
 from .utils import AosError
@@ -899,6 +901,24 @@ def publish_passport(
             f"restore {name}"
         )
     verify_before_write(conn, agent)
+    # A catalog identity's history is exclusively the catalog's (U-A2 §11).
+    # Grafting a user-published version onto it would produce an ambiguous,
+    # permanently un-upgradable half-ours/half-yours history, so this refuses
+    # BEFORE the user's file is read, validated or stored — nothing about the
+    # input can influence the outcome. The test is owner == 'system', NOT
+    # `protected`: protection refuses lifecycle verbs for audit-critical
+    # identities and says nothing about who authors a declaration, and a
+    # human-owned protected agent must keep publishing exactly as it always
+    # has.
+    if agent.owner == "system":
+        raise AosError(
+            f"Agent '{name}' is catalog-managed (owner: system); its passport "
+            "history is the built-in catalog's and cannot receive a published "
+            "version from a file. Nothing was changed. To derive your own "
+            "customized variant instead:\n"
+            f"  python aos.py agent catalog show {name} --fragment > fragment.json\n"
+            "  python aos.py agent create NEWNAME --from-file fragment.json"
+        )
     now = utils.utc_now_iso()
 
     if path is None:
@@ -1171,3 +1191,251 @@ def discard_agent(conn: sqlite3.Connection, *, name: str) -> None:
             payload=payload,
         )
     ops._warn_secret(secret_warning)
+
+
+# ---------------------------------------------------------------------------
+# U-A2 catalog write primitives — TRANSACTION PARTICIPANTS
+#
+# The only passport writers in this module that do NOT own a transaction and
+# do NOT emit an event. `catalog.install` owns exactly one boundary around
+# the whole operation and emits one event per changed entry inside it.
+#
+# Why participants rather than self-contained writes (D-v0.4.18): db's
+# transaction helper is `with conn:`, which COMMITS when it exits — so a
+# nested one commits early. A primitive that opened its own would silently
+# split `install --all`'s single rollback boundary into per-entry commits and
+# produce exactly the partially-installed catalog §9 forbids. They therefore
+# open nothing, commit nothing and roll back nothing; the caller's boundary is
+# the only one, and `_require_caller_transaction` proves it is already open.
+#
+# These are NOT a general alternate passport API. They exist for one caller,
+# so `install` can reuse U-A1's validation, hashing and no-laundering gate
+# without nesting. Every ordinary human write above still owns its own
+# transaction, unchanged.
+
+#: The class every catalog identity carries. A catalog entry declares a
+#: specialist role; nothing else is installable through this path.
+CATALOG_AGENT_CLASS = "specialist"
+
+#: The field values a catalog document is REQUIRED to bind, beyond its
+#: agent/passport_version identity pair. Each is hash-bound inside the
+#: document, so a document that disagrees with the catalog's provenance
+#: cannot be stored under catalog ownership.
+_CATALOG_BINDINGS: tuple[tuple[str, object], ...] = (
+    ("issuer", CATALOG_ISSUER),
+    ("agent_class", CATALOG_AGENT_CLASS),
+    ("agent_scope", {"level": "global"}),
+    ("autonomy", DEFAULT_AUTONOMY),
+)
+
+
+def _require_caller_transaction(conn: sqlite3.Connection, primitive: str) -> None:
+    """Prove the caller's transaction is already OPEN.
+
+    A programming error, not a user condition: it means a caller wrote rows
+    outside the one boundary that would roll them back. Raised as RuntimeError
+    (not AosError) so it surfaces as an internal failure (exit 2), never as a
+    refusal a human could act on.
+
+    `in_transaction` is only True once a statement has actually opened the
+    transaction, so this REQUIRES the caller to have materially begun it (the
+    `BEGIN IMMEDIATE` in catalog.install) rather than merely entered a `with`
+    block — which is the stronger property, and the one that makes an
+    in-transaction re-read atomic against another writer.
+    """
+    if not conn.in_transaction:
+        raise RuntimeError(
+            f"{primitive}() is a transaction participant and must be called "
+            "inside the caller's already-open transaction: it opens, commits "
+            "and rolls back nothing (D-v0.4.18)."
+        )
+
+
+def _accept_catalog_document(name: str, version: int, document_text: str) -> dict:
+    """One catalog document → its validated dict, or a refusal.
+
+    Walks the same `_accept_document` path `agent import` uses (D-v0.4.19: no
+    catalog-specific reader is invented), then proves the document binds to
+    the identity and provenance it is about to be stored under. Pure: no row
+    is read or written here, so every caller can run it before its first
+    INSERT.
+    """
+    if not isinstance(document_text, str):
+        raise AosError(
+            f"Catalog passport for '{name}' v{version} is not text; nothing "
+            "was changed."
+        )
+    try:
+        document = protocols.parse_canonical(document_text.encode("utf-8"))
+    except protocols.ProtocolError:
+        raise AosError(
+            f"Catalog passport for '{name}' v{version} is not canonical JSON; "
+            "nothing was changed."
+        ) from None
+    _accept_document(document)
+    if _canonical_text(document) != document_text:
+        raise AosError(
+            f"Catalog passport for '{name}' v{version} is not in canonical "
+            "storage form; nothing was changed."
+        )
+    if len(document_text.encode("utf-8")) > protocols.MAX_ARTIFACT_BYTES:
+        raise AosError(
+            f"Catalog passport for '{name}' v{version} exceeds the protocol "
+            "size bound; nothing was changed."
+        )
+    for field, expected in (
+        ("agent", name),
+        ("passport_version", version),
+    ) + _CATALOG_BINDINGS:
+        if document.get(field) != expected:
+            raise AosError(
+                f"Catalog passport for '{name}' v{version} does not carry the "
+                f"catalog's bound {field}; nothing was changed."
+            )
+    return document
+
+
+def create_catalog_identity(
+    conn: sqlite3.Connection,
+    *,
+    name: str,
+    agent_class: str,
+    documents,
+) -> Agent:
+    """Materialize one catalog identity and its COMPLETE published history.
+
+    `documents` is an ordered sequence of (version, canonical document text)
+    starting at 1 and contiguous — a fresh install replays the whole shipped
+    history (D-v0.4.17), so it converges byte-for-byte with an upgrade chain
+    to the same catalog version.
+
+    Every validation completes before the first INSERT: a refusal here costs
+    zero writes even though the caller's transaction would have rolled them
+    back anyway.
+    """
+    _require_caller_transaction(conn, "create_catalog_identity")
+    validate_catalog_agent_name(name)
+    if agent_class != CATALOG_AGENT_CLASS:
+        raise AosError(
+            f"A catalog identity is always '{CATALOG_AGENT_CLASS}', not "
+            f"{agent_class!r}. Nothing was changed."
+        )
+    if get_agent(conn, name) is not None:
+        raise AosError(
+            f"Agent '{name}' already exists and is not created again. "
+            f"Run: python aos.py agent show {name}"
+        )
+    ordered = list(documents)
+    if not ordered:
+        raise AosError(
+            f"Catalog entry '{name}' ships no passport version; nothing was "
+            "changed."
+        )
+
+    accepted: list[tuple[int, str]] = []
+    for expected_version, (version, document_text) in enumerate(ordered, start=1):
+        if version != expected_version:
+            raise AosError(
+                f"Catalog history for '{name}' must be contiguous from v1; "
+                "nothing was changed."
+            )
+        _accept_catalog_document(name, version, document_text)
+        accepted.append((version, document_text))
+
+    # Ownership, provenance and protection are set HERE and only here — the
+    # three-way binding (owner + hash-bound issuer + digest match) that
+    # `catalog.installed_state` re-derives is what proves catalog ownership
+    # later; the name never does (D-v0.4.15).
+    now = utils.utc_now_iso()
+    cursor = conn.execute(
+        "INSERT INTO agents (name, agent_class, scope, project_id, lifecycle, "
+        "protected, owner, origin, current_passport_version, created_at, "
+        "updated_at, content_sha256) "
+        "VALUES (?, ?, 'global', NULL, 'active', 1, 'system', 'import', NULL, "
+        "?, ?, '')",
+        (name, CATALOG_AGENT_CLASS, now, now),
+    )
+    agent_id = cursor.lastrowid
+    # The pointer starts NULL and is set after the rows it names exist: the
+    # agents→agent_passports composite FK would refuse it in the other order.
+    for version, document_text in accepted:
+        passport_cursor = conn.execute(
+            "INSERT INTO agent_passports (agent_id, version, status, "
+            "created_at, published_at, document, content_sha256) "
+            "VALUES (?, ?, 'published', ?, ?, ?, '')",
+            (agent_id, version, now, now, document_text),
+        )
+        _rehash_passport(conn, passport_cursor.lastrowid)
+    conn.execute(
+        "UPDATE agents SET current_passport_version = ?, updated_at = ? "
+        "WHERE id = ?",
+        (accepted[-1][0], now, agent_id),
+    )
+    _rehash_agent(conn, agent_id)
+    return get_agent(conn, name)
+
+
+def append_catalog_version(
+    conn: sqlite3.Connection,
+    *,
+    agent: Agent,
+    version: int,
+    document_text: str,
+) -> Agent:
+    """Append ONE immutable published version to a catalog identity.
+
+    Strictly additive: no existing published row is updated or deleted, ever
+    (U-A2 §9). Only the identity's pointer and hash move.
+    """
+    _require_caller_transaction(conn, "append_catalog_version")
+    # The no-laundering gate first: a corrupted identity or history cannot
+    # receive a new version on top, catalog-owned or not.
+    verify_before_write(conn, agent)
+    if (
+        agent.owner != "system"
+        or agent.protected != 1
+        or agent.lifecycle != AGENT_LIFECYCLE_ACTIVE
+        or agent.agent_class != CATALOG_AGENT_CLASS
+        or agent.scope != "global"
+        or agent.project_id is not None
+    ):
+        raise AosError(
+            f"Agent '{agent.name}' is not a catalog-managed identity and "
+            "cannot receive a catalog version. Nothing was changed."
+        )
+
+    history = list_passports(conn, agent.id)
+    published = [p for p in history if p.status == AGENT_PASSPORT_PUBLISHED]
+    if not published or len(published) != len(history):
+        raise AosError(
+            f"Agent '{agent.name}' does not carry a complete published "
+            "catalog history. Nothing was changed."
+        )
+    max_installed = max(p.version for p in published)
+    if agent.current_passport_version != max_installed:
+        raise AosError(
+            f"Agent '{agent.name}' has an incoherent current-passport "
+            "pointer. Nothing was changed. Run: python aos.py doctor"
+        )
+    if version != max_installed + 1:
+        raise AosError(
+            f"Catalog version v{version} does not append to '{agent.name}': "
+            f"the next version is v{max_installed + 1}. Nothing was changed."
+        )
+    _accept_catalog_document(agent.name, version, document_text)
+
+    now = utils.utc_now_iso()
+    cursor = conn.execute(
+        "INSERT INTO agent_passports (agent_id, version, status, created_at, "
+        "published_at, document, content_sha256) "
+        "VALUES (?, ?, 'published', ?, ?, ?, '')",
+        (agent.id, version, now, now, document_text),
+    )
+    _rehash_passport(conn, cursor.lastrowid)
+    conn.execute(
+        "UPDATE agents SET current_passport_version = ?, updated_at = ? "
+        "WHERE id = ?",
+        (version, now, agent.id),
+    )
+    _rehash_agent(conn, agent.id)
+    return get_agent(conn, agent.name)
