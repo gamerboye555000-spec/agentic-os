@@ -1,5 +1,5 @@
-"""U-A2 built-in specialist catalog: loader, verifier, and read-only
-installed-state/status/plan logic.
+"""U-A2 built-in specialist catalog: loader, verifier, read-only
+installed-state/status/plan logic, and the explicit installer.
 
 Contract: agentic-os-v0.4-u-a2-specialist-catalog-contract.md
 
@@ -7,12 +7,20 @@ Twelve inert `beast.agent-passport/v1` artifacts ship under
 `agentic_os/catalog/`, indexed by a deterministic `manifest.json`. Every
 declaration in them is INERT — nothing here reads `autonomy`,
 `skill_requirements`, `tool_requirements` or `model_requirements` to grant
-capability, spend, or execution; this module only loads, verifies, and
-reports ledger-relative state.
+capability, spend, or execution; this module loads, verifies, reports
+ledger-relative state, and installs when a human explicitly asks.
 
-This module executes NO SQL mutation against `agents` or `agent_passports`:
-`installed_state`/`status`/`plan` only ever read existing rows. Wave 1 ships
-no writer at all (no `install`); that lands in a later unit.
+`install` is the ONLY writer in this unit and runs only from the explicit
+`agent catalog install` leaf: no mode, no `init`, no `migrate apply`, no
+`doctor` and no `sync` ever installs or upgrades an entry (U-A2 §2). It still
+issues no INSERT/UPDATE/DELETE against `agents` or `agent_passports` itself —
+every row is written through the two transaction-participating primitives in
+`passports`, while this module owns the one transaction and the events, because
+the rollback boundary must span the whole selected set (D-v0.4.18).
+`installed_state`/`status`/`plan` only ever read existing rows.
+
+Protection grants no execution or runtime authority: an installed identity is
+a stored declaration and nothing reads `protected` for authorization.
 
 Two read paths, two threat models, deliberately not merged: artifacts here
 are read as PACKAGE RESOURCES (`importlib.resources`), never from the
@@ -38,7 +46,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import models, passports, protocols, secretscan
+from . import db, events, models, ops, passports, protocols, secretscan
 from .utils import AosError
 
 # ---------------------------------------------------------------------------
@@ -640,3 +648,234 @@ def plan(conn: sqlite3.Connection, names: list[str] | None) -> list[dict]:
             }
         )
     return actions
+
+
+# ---------------------------------------------------------------------------
+# Installation — the ONE writer in this unit (U-A2 §9)
+#
+# This module still issues no INSERT/UPDATE/DELETE against `agents` or
+# `agent_passports`: every row is written by the two transaction-participating
+# primitives in `passports`, and every read below is a SELECT. What this
+# module owns is the TRANSACTION and the EVENT, because the rollback boundary
+# has to span the whole selected set (D-v0.4.18) and only the caller can know
+# what "the whole set" is.
+
+#: The exact event payload key set (U-A2 §14). Frozen here so the payload is
+#: built from a closed vocabulary rather than accumulated: no diagnostic,
+#: count, path, reason or full digest can drift in later.
+EVENT_PAYLOAD_KEYS = (
+    "agent",
+    "catalog_version",
+    "manifest_sha256_prefix",
+    "passport_sha256_prefix",
+    "version",
+    "from_version",
+    "from_lifecycle",
+    "to_lifecycle",
+    "result",
+)
+
+ACTION_INSTALL = "catalog_install"
+ACTION_UPGRADE = "catalog_upgrade"
+
+
+def _select(cat: Catalog, names: list[str] | None) -> list[CatalogEntry]:
+    """The selected entries, deduplicated and in MANIFEST order.
+
+    Manifest order is installation order (U-A2 §7): CLI argument order is a
+    human's typing, not a fact about the catalog, so two invocations naming
+    the same entries in different orders must write identical rows in an
+    identical sequence. Duplicates collapse to one entry — asking twice is
+    not asking for two identities. An unknown name refuses here, before the
+    caller reaches any mutation.
+    """
+    if names is None:
+        return list(cat.entries)
+    requested: set[str] = set()
+    for name in names:
+        if cat.get(name) is None:
+            raise AosError(
+                f"No catalog entry {name!r}. Nothing was changed. "
+                "Run: python aos.py agent catalog list"
+            )
+        requested.add(name)
+    return [entry for entry in cat.entries if entry.agent in requested]
+
+
+def _document_text(entry: CatalogEntry, version: CatalogVersion) -> str:
+    """One verified artifact → its exact canonical STORAGE form.
+
+    `load_document` re-verifies the digest, the protocol and the catalog's
+    bound fields on every read, so a tampered artifact cannot reach a row
+    through here. The stored form is the canonical bytes WITHOUT the
+    artifact file's trailing newline — identical to what every other passport
+    row in the ledger carries.
+    """
+    document, _text = load_document(entry, version)
+    return protocols.serialize_canonical(document).decode("utf-8")
+
+
+def _versions(entry: CatalogEntry) -> list[CatalogVersion]:
+    return sorted(entry.versions, key=lambda v: v.passport_version)
+
+
+def _refuse_plan(actions: list[dict]) -> None:
+    """One blocked entry refuses the WHOLE request (U-A2 §9).
+
+    Never a best-effort partial install: 'I installed nine of the twelve you
+    asked for' is a state nobody requested and no later command can describe.
+    Reasons come from the closed state/detail vocabulary — never a stored
+    value, a path, or exception text.
+    """
+    refusals = [a for a in actions if a["action"] == "refuse"]
+    if not refusals:
+        return
+    first = refusals[0]
+    detail = f" ({first['detail']})" if first["detail"] else ""
+    scope = (
+        f" {len(refusals)} of {len(actions)} selected entries are blocked."
+        if len(refusals) > 1
+        else ""
+    )
+    raise AosError(
+        f"Catalog entry '{first['agent']}' is {first['state']}{detail}; "
+        f"refusing the whole request.{scope} Nothing was changed. "
+        "Run: python aos.py agent catalog status"
+    )
+
+
+def install(conn: sqlite3.Connection, names: list[str] | None) -> dict:
+    """Install and/or upgrade the selected catalog entries. One transaction.
+
+    The shape, in order:
+
+    1. verify the complete built-in catalog (D-v0.4.19: a defect in shipped
+       content refuses before any write, it does not warn afterward);
+    2. select, in manifest order;
+    3. plan, read-only;
+    4. refuse every blocked/diverged/tampered/unknown selection;
+    5. return WITHOUT opening a transaction when everything is a no-op;
+    6. otherwise open exactly one transaction, re-read every fact inside it,
+       write, and emit one event per changed entry.
+
+    Every foreseeable refusal therefore costs zero writes, and any failure
+    inside the transaction rolls back every identity, passport, pointer, hash
+    and event this operation would have written.
+    """
+    problems = verify()
+    if problems:
+        raise AosError(
+            "The built-in catalog does not verify, so nothing was installed: "
+            f"{problems[0]} Run: python aos.py agent catalog verify"
+        )
+
+    cat = catalog()
+    selected = _select(cat, names)
+    actions = plan(conn, [entry.agent for entry in selected])
+    _refuse_plan(actions)
+
+    #: The exact preflight facts each write is predicated on. Re-derived
+    #: inside the transaction and compared whole: a discrepancy in ANY field
+    #: (history, pointer, lifecycle, owner, protection, class, scope, digest
+    #: verdict) aborts the complete operation rather than writing against a
+    #: fact that has since stopped being true.
+    planned_state = {entry.agent: installed_state(conn, entry) for entry in selected}
+    by_name = {entry.agent: entry for entry in selected}
+    todo = [
+        (by_name[a["agent"]], a)
+        for a in actions
+        if a["action"] in ("install", "upgrade")
+    ]
+    unchanged = len(actions) - len(todo)
+
+    result = {
+        "changed": False,
+        "installed": 0,
+        "upgraded": 0,
+        "unchanged": unchanged,
+        "catalog_version": cat.catalog_version,
+    }
+    if not todo:
+        # A true no-op (U-A2 §9): no transaction, no row, no rehash, no
+        # updated_at, no event. Reinstalling what is already installed is a
+        # question, and a question does not get to touch the ledger.
+        return result
+
+    with db.transaction(conn):
+        # Take the write lock BEFORE the re-reads below, so the
+        # re-read-then-write pair is atomic against any other writer: with a
+        # deferred transaction the reads would run against a snapshot the
+        # first INSERT could only then discover was stale. This also makes
+        # the transaction materially open, which is what lets the passport
+        # primitives PROVE (not assume) they are participating in it.
+        conn.execute("BEGIN IMMEDIATE")
+        for entry, action in todo:
+            current = installed_state(conn, entry)
+            if current != planned_state[entry.agent]:
+                raise AosError(
+                    f"Catalog entry '{entry.agent}' changed while the install "
+                    f"was preparing to write it (planned {action['state']}, "
+                    f"found {current['state']}); the whole operation was "
+                    "rolled back and nothing was changed. "
+                    "Run: python aos.py agent catalog status"
+                )
+
+            versions = _versions(entry)
+            if action["action"] == "install":
+                # A fresh install replays the COMPLETE shipped history, so it
+                # converges byte-for-byte with an upgrade chain (D-v0.4.17).
+                agent = passports.create_catalog_identity(
+                    conn,
+                    name=entry.agent,
+                    agent_class=passports.CATALOG_AGENT_CLASS,
+                    documents=[
+                        (v.passport_version, _document_text(entry, v)) for v in versions
+                    ],
+                )
+                from_version = None
+                from_lifecycle = None
+                new_version = versions[-1]
+                result["installed"] += 1
+                outcome = "installed"
+            else:
+                agent = passports.get_agent(conn, entry.agent)
+                from_version = current["installed_version"]
+                from_lifecycle = agent.lifecycle
+                # The state model proved the installed history is an exact
+                # contiguous prefix of the catalog's, so the missing suffix is
+                # simply everything above it. Each append re-proves it anyway.
+                missing = [v for v in versions if v.passport_version > from_version]
+                for version in missing:
+                    agent = passports.append_catalog_version(
+                        conn,
+                        agent=agent,
+                        version=version.passport_version,
+                        document_text=_document_text(entry, version),
+                    )
+                new_version = missing[-1]
+                result["upgraded"] += 1
+                outcome = "upgraded"
+
+            events.emit(
+                conn,
+                actor=ops.ACTOR_HUMAN,
+                entity="agent",
+                entity_id=agent.id,
+                action=ACTION_INSTALL if outcome == "installed" else ACTION_UPGRADE,
+                payload={
+                    "agent": entry.agent,
+                    "catalog_version": cat.catalog_version,
+                    "manifest_sha256_prefix": models.hash_prefix(cat.manifest_sha256),
+                    "passport_sha256_prefix": models.hash_prefix(
+                        new_version.document_sha256
+                    ),
+                    "version": new_version.passport_version,
+                    "from_version": from_version,
+                    "from_lifecycle": from_lifecycle,
+                    "to_lifecycle": agent.lifecycle,
+                    "result": outcome,
+                },
+            )
+
+    result["changed"] = True
+    return result

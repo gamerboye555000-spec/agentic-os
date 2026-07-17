@@ -183,6 +183,15 @@ COMMAND_POLICY: dict[tuple[str, ...], CommandPolicy] = {
     ("agent", "restore"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("agent", "revoke"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("agent", "discard"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    # U-A2's ONE catalog writer, and the only command in the system that can
+    # create or change a catalog-managed row. Authoritative by the same
+    # mechanical rule as everything above it: identity rows, passport rows,
+    # pointers, hashes and audit events in one transaction. So recovery blocks
+    # it before dispatch, deep preflights and post-verifies it, and eco runs
+    # it immediately — an operator-requested installation is not a background
+    # operation eco is entitled to defer (U-A2 §13). No mode auto-installs:
+    # every other catalog leaf is read_only and writes nothing.
+    ("agent", "catalog", "install"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("ingest", "dropfile"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("done",): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("migrate", "apply"): _p(AUTHORITATIVE_WRITE, ledger=True),
@@ -228,11 +237,12 @@ COMMAND_POLICY: dict[tuple[str, ...], CommandPolicy] = {
     # damaged registry is exactly when they earn their keep.
     ("agent", "export"): _p(READ_ONLY),
     ("agent", "passport", "history"): _p(READ_ONLY),
-    # U-A2 built-in specialist catalog. All five leaves parse bytes and/or
+    # U-A2 built-in specialist catalog. These five leaves parse bytes and/or
     # read existing rows — none writes, so all five are read_only and
     # therefore usable in recovery, which is the point: inspecting the
     # catalog while the ledger is damaged is exactly when `verify` and
-    # `status` earn their keep. `agent catalog install` does not exist yet.
+    # `status` earn their keep. The sixth leaf, `install`, is the unit's only
+    # writer and is classified with the authoritative writes above.
     ("agent", "catalog", "list"): _p(READ_ONLY),
     ("agent", "catalog", "show"): _p(READ_ONLY),
     ("agent", "catalog", "verify"): _p(READ_ONLY),

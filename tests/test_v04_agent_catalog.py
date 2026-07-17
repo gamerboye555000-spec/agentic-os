@@ -25,7 +25,7 @@ from pathlib import Path
 from unittest import mock
 
 from test_v04_agent_passports import V4WorkspaceTestCase
-from weekend_harness import run_cli
+from weekend_harness import core_schema, run_cli
 
 from agentic_os import catalog, cli, db, models, passports, power, protocols, secretscan
 from agentic_os.utils import AosError
@@ -1125,6 +1125,7 @@ class PowerCoverageTests(unittest.TestCase):
         ("agent", "catalog", "status"),
         ("agent", "catalog", "plan"),
     )
+    INSTALL_LEAF = ("agent", "catalog", "install")
 
     def test_all_five_leaves_classified_read_only(self):
         for path in self.CATALOG_LEAVES:
@@ -1143,10 +1144,29 @@ class PowerCoverageTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIn(path, leaves)
 
-    def test_no_install_leaf_exists_in_this_wave(self):
+    def test_install_is_the_authoritative_write_leaf(self):
+        policy = power.COMMAND_POLICY[self.INSTALL_LEAF]
+        self.assertEqual(policy.kind, power.AUTHORITATIVE_WRITE)
+        self.assertTrue(policy.ledger)
+
+    def test_install_is_the_only_catalog_leaf_that_is_not_recovery_allowed(self):
+        self.assertNotIn(
+            power.COMMAND_POLICY[self.INSTALL_LEAF].kind, power.RECOVERY_ALLOWED_KINDS
+        )
+
+    def test_install_leaf_appears_in_the_live_parser(self):
         leaves = set(power.iter_command_paths(cli.build_parser()))
-        self.assertNotIn(("agent", "catalog", "install"), leaves)
-        self.assertNotIn(("agent", "catalog", "install"), power.COMMAND_POLICY)
+        self.assertIn(self.INSTALL_LEAF, leaves)
+
+    def test_the_catalog_ships_exactly_six_leaves(self):
+        leaves = [
+            path
+            for path in power.iter_command_paths(cli.build_parser())
+            if path[:2] == ("agent", "catalog")
+        ]
+        self.assertEqual(
+            set(leaves), set(self.CATALOG_LEAVES) | {self.INSTALL_LEAF}
+        )
 
 
 class RecoveryAccessTests(V4WorkspaceTestCase):
@@ -1172,6 +1192,1004 @@ class RecoveryAccessTests(V4WorkspaceTestCase):
             self.aos(*argv)
         after = _table_snapshot(self.query)
         self.assertEqual(before, after)
+
+
+# ---------------------------------------------------------------------------
+# (10) Wave 2: installation, upgrade, refusal, rollback, events, modes.
+#
+# Every test below runs against a disposable temp workspace. The shipped
+# catalog under agentic_os/catalog/ is never edited: "future v2" is a
+# synthetic catalog served from a throwaway temp root (synthetic_catalog).
+
+def _stub_v2(agent: str = "aos.stub") -> dict:
+    """A v2 that differs from _stub_document(agent, 1) in body as well as
+    version, so the two carry genuinely different digests."""
+    return _stub_document(
+        agent,
+        2,
+        mission="Second mission, revised for v2, long enough to be plausible prose.",
+    )
+
+
+class InstallTests(V4WorkspaceTestCase):
+    def _agents(self) -> list[str]:
+        return [r["name"] for r in self.query("SELECT name FROM agents ORDER BY name")]
+
+    def _catalog_events(self) -> list[dict]:
+        return [
+            dict(r)
+            for r in self.query(
+                "SELECT * FROM events WHERE action IN "
+                "('catalog_install','catalog_upgrade') ORDER BY id"
+            )
+        ]
+
+    def test_install_one_entry(self):
+        out = self.ok("agent", "catalog", "install", "aos.architect")
+        self.assertIn("Installed 1 agent(s), upgraded 0, unchanged 0 (catalog v1).", out)
+        self.assertEqual(self._agents(), ["aos.architect"])
+
+    def test_install_multiple_explicit_entries(self):
+        self.ok("agent", "catalog", "install", "aos.architect", "aos.builder")
+        self.assertEqual(self._agents(), ["aos.architect", "aos.builder"])
+
+    def test_install_all(self):
+        out = self.ok("agent", "catalog", "install", "--all")
+        self.assertIn("Installed 12 agent(s)", out)
+        self.assertEqual(self._agents(), sorted(CATALOG_NAMES))
+
+    def test_execution_follows_manifest_order_not_cli_argument_order(self):
+        # Reversed on the command line; the rows, the ids and the events must
+        # still land in manifest order (U-A2 §7: manifest order IS install
+        # order, and a human's typing is not a fact about the catalog).
+        manifest_order = [
+            e.agent
+            for e in catalog.catalog().entries
+            if e.agent in {"aos.architect", "aos.builder", "aos.verifier"}
+        ]
+        self.ok(
+            "agent", "catalog", "install",
+            *reversed(manifest_order),
+        )
+        by_id = [
+            r["name"] for r in self.query("SELECT name FROM agents ORDER BY id")
+        ]
+        self.assertEqual(by_id, manifest_order)
+        self.assertEqual(
+            [json.loads(e["payload_json"])["agent"] for e in self._catalog_events()],
+            manifest_order,
+        )
+
+    def test_duplicate_explicit_names_produce_one_identity(self):
+        out = self.ok(
+            "agent", "catalog", "install",
+            "aos.architect", "aos.architect", "aos.architect",
+        )
+        self.assertIn("Installed 1 agent(s)", out)
+        self.assertEqual(self._agents(), ["aos.architect"])
+        self.assertEqual(len(self._catalog_events()), 1)
+
+    def test_same_version_reinstall_is_a_true_no_op(self):
+        self.ok("agent", "catalog", "install", "--all")
+        out = self.ok("agent", "catalog", "install", "--all")
+        self.assertEqual(
+            out.strip(),
+            "Nothing to do: 12 entry(ies) already installed at catalog v1.",
+        )
+
+    def test_no_op_changes_no_row_no_event_and_no_updated_at(self):
+        self.ok("agent", "catalog", "install", "--all")
+        before = _table_snapshot(self.query)
+        self.ok("agent", "catalog", "install", "--all")
+        self.ok("agent", "catalog", "install", "aos.architect")
+        self.assertEqual(_table_snapshot(self.query), before)
+
+    def test_no_op_opens_no_transaction(self):
+        # The §9 promise is stronger than "no net change": a no-op must not
+        # open a transaction at all. Proven by making db.transaction explode.
+        self.ok("agent", "catalog", "install", "--all")
+        conn = db.connect(self.db_path)
+        try:
+            def _boom(_conn):
+                raise AssertionError("a true no-op must not open a transaction")
+
+            with mock.patch.object(catalog.db, "transaction", _boom):
+                result = catalog.install(conn, None)
+        finally:
+            conn.close()
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["unchanged"], 12)
+
+    def test_fresh_install_row_shape(self):
+        self.ok("agent", "catalog", "install", "aos.architect")
+        row = self.query("SELECT * FROM agents WHERE name='aos.architect'")[0]
+        self.assertEqual(row["owner"], "system")
+        self.assertEqual(row["origin"], "import")
+        self.assertEqual(row["protected"], 1)
+        self.assertEqual(row["lifecycle"], "active")
+        self.assertEqual(row["agent_class"], "specialist")
+        self.assertEqual(row["scope"], "global")
+        self.assertIsNone(row["project_id"])
+        self.assertEqual(row["current_passport_version"], 1)
+
+    def test_fresh_install_publishes_v1_with_valid_hashes(self):
+        self.ok("agent", "catalog", "install", "aos.architect")
+        conn = db.connect(self.db_path)
+        try:
+            agent = passports.get_agent(conn, "aos.architect")
+            self.assertEqual(passports.agent_integrity(agent), "ok")
+            self.assertEqual(passports.history_problems(conn, agent), [])
+            history = passports.list_passports(conn, agent.id)
+            self.assertEqual([p.version for p in history], [1])
+            self.assertEqual(history[0].status, "published")
+            self.assertIsNotNone(history[0].published_at)
+            self.assertEqual(passports.passport_integrity(history[0]), "ok")
+        finally:
+            conn.close()
+
+    def test_installed_document_is_byte_identical_to_the_shipped_artifact(self):
+        self.ok("agent", "catalog", "install", "aos.architect")
+        entry = catalog.catalog().get("aos.architect")
+        document, text = catalog.load_document(entry, entry.latest)
+        stored = self.query(
+            "SELECT document FROM agent_passports ORDER BY id"
+        )[0]["document"]
+        self.assertEqual(stored, text[:-1])
+        self.assertEqual(
+            protocols.content_digest(protocols.parse_canonical(stored.encode("utf-8"))),
+            entry.latest.document_sha256,
+        )
+
+    def test_install_reaches_the_installed_state(self):
+        self.ok("agent", "catalog", "install", "--all")
+        out = self.ok("agent", "catalog", "status")
+        self.assertIn("12 entry(ies): 12 installed", out)
+
+    def test_json_success_shape(self):
+        out = self.ok("agent", "catalog", "install", "aos.architect", "--json")
+        self.assertEqual(
+            json.loads(out),
+            {
+                "result": {
+                    "changed": True,
+                    "installed": 1,
+                    "upgraded": 0,
+                    "unchanged": 0,
+                    "catalog_version": 1,
+                }
+            },
+        )
+
+    def test_unknown_catalog_name_refuses(self):
+        err = self.fails("agent", "catalog", "install", "aos.not-a-real-entry")
+        self.assertIn("No catalog entry", err)
+        self.assertEqual(self._agents(), [])
+
+    def test_explicit_names_plus_all_refuses(self):
+        err = self.fails("agent", "catalog", "install", "aos.architect", "--all")
+        self.assertIn("not both", err)
+        self.assertEqual(self._agents(), [])
+
+    def test_no_selection_refuses(self):
+        err = self.fails("agent", "catalog", "install")
+        self.assertIn("at least one NAME", err)
+
+    def test_schema_stays_4_and_migration_state_is_untouched(self):
+        before_meta = [tuple(r) for r in self.query("SELECT * FROM meta ORDER BY key")]
+        before_schema = core_schema(self.db_path)
+        self.ok("agent", "catalog", "install", "--all")
+        self.assertEqual(
+            [tuple(r) for r in self.query("SELECT * FROM meta ORDER BY key")],
+            before_meta,
+        )
+        self.assertEqual(core_schema(self.db_path), before_schema)
+        conn = db.connect(self.db_path)
+        try:
+            self.assertEqual(db.get_meta(conn, "schema_version"), "4")
+        finally:
+            conn.close()
+
+    def test_install_leaves_unrelated_agents_byte_identical(self):
+        self.ok("agent", "create", "mybot", "--role", "A human's own agent.")
+        self.ok("agent", "passport", "publish", "mybot")
+        before = [
+            tuple(r) for r in self.query("SELECT * FROM agents WHERE name='mybot'")
+        ]
+        before_p = [
+            tuple(r)
+            for r in self.query(
+                "SELECT p.* FROM agent_passports p JOIN agents a ON a.id=p.agent_id "
+                "WHERE a.name='mybot'"
+            )
+        ]
+        self.ok("agent", "catalog", "install", "--all")
+        self.assertEqual(
+            [tuple(r) for r in self.query("SELECT * FROM agents WHERE name='mybot'")],
+            before,
+        )
+        self.assertEqual(
+            [
+                tuple(r)
+                for r in self.query(
+                    "SELECT p.* FROM agent_passports p JOIN agents a ON a.id=p.agent_id "
+                    "WHERE a.name='mybot'"
+                )
+            ],
+            before_p,
+        )
+
+
+class UpgradeTests(V4WorkspaceTestCase):
+    """Append-only upgrades, proven against a SYNTHETIC v2 catalog — the
+    shipped catalog ships one version per entry at this unit's ship date, and
+    no test here edits it."""
+
+    AGENT = "aos.stub"
+
+    def setUp(self):
+        super().setUp()
+        self.v1 = _stub_document(self.AGENT, 1)
+        self.v2 = _stub_v2(self.AGENT)
+        _m1, self.files_v1 = _stub_catalog(
+            [(self.AGENT, "design", "stable", [self.v1])]
+        )
+        _m2, self.files_v2 = _stub_catalog(
+            [(self.AGENT, "design", "stable", [self.v1, self.v2])]
+        )
+
+    def _install(self, files, *argv):
+        with synthetic_catalog(files):
+            return self.ok("agent", "catalog", "install", *argv)
+
+    def _passport_rows(self):
+        return [
+            tuple(r)
+            for r in self.query("SELECT * FROM agent_passports ORDER BY version")
+        ]
+
+    def test_synthetic_v2_catalog_appends_v2(self):
+        self._install(self.files_v1, self.AGENT)
+        out = self._install(self.files_v2, self.AGENT)
+        self.assertIn("Installed 0 agent(s), upgraded 1", out)
+        self.assertEqual(
+            [r["version"] for r in self.query(
+                "SELECT version FROM agent_passports ORDER BY version"
+            )],
+            [1, 2],
+        )
+
+    def test_existing_v1_row_is_byte_identical_after_upgrade(self):
+        self._install(self.files_v1, self.AGENT)
+        before_v1 = self._passport_rows()[0]
+        self._install(self.files_v2, self.AGENT)
+        self.assertEqual(self._passport_rows()[0], before_v1)
+
+    def test_pointer_advances_to_v2_and_v2_is_published(self):
+        self._install(self.files_v1, self.AGENT)
+        self._install(self.files_v2, self.AGENT)
+        agent_row = self.query("SELECT * FROM agents")[0]
+        self.assertEqual(agent_row["current_passport_version"], 2)
+        v2_row = self.query("SELECT * FROM agent_passports WHERE version=2")[0]
+        self.assertEqual(v2_row["status"], "published")
+        self.assertIsNotNone(v2_row["published_at"])
+
+    def test_upgrade_preserves_protection_and_ownership(self):
+        # A protected, active catalog identity upgrades THROUGH the catalog
+        # path — protection refuses lifecycle verbs, never the catalog's own
+        # append.
+        self._install(self.files_v1, self.AGENT)
+        self._install(self.files_v2, self.AGENT)
+        row = self.query("SELECT * FROM agents")[0]
+        self.assertEqual(row["protected"], 1)
+        self.assertEqual(row["owner"], "system")
+        self.assertEqual(row["lifecycle"], "active")
+        self.assertEqual(row["agent_class"], "specialist")
+
+    def test_upgrade_rehashes_identity_and_new_row_only(self):
+        self._install(self.files_v1, self.AGENT)
+        self._install(self.files_v2, self.AGENT)
+        conn = db.connect(self.db_path)
+        try:
+            agent = passports.get_agent(conn, self.AGENT)
+            self.assertEqual(passports.agent_integrity(agent), "ok")
+            self.assertEqual(passports.history_problems(conn, agent), [])
+        finally:
+            conn.close()
+
+    def test_catalog_upgrade_event_records_from_version_1_and_version_2(self):
+        self._install(self.files_v1, self.AGENT)
+        self._install(self.files_v2, self.AGENT)
+        events = self.query(
+            "SELECT * FROM events WHERE action='catalog_upgrade' ORDER BY id"
+        )
+        self.assertEqual(len(events), 1)
+        payload = json.loads(events[0]["payload_json"])
+        self.assertEqual(payload["from_version"], 1)
+        self.assertEqual(payload["version"], 2)
+        self.assertEqual(payload["from_lifecycle"], "active")
+        self.assertEqual(payload["to_lifecycle"], "active")
+        self.assertEqual(payload["result"], "upgraded")
+
+    def test_fresh_install_of_a_v2_catalog_materializes_the_whole_history(self):
+        # D-v0.4.17: a fresh install and an upgrade chain converge on
+        # byte-identical documents and identical version numbers.
+        self._install(self.files_v2, self.AGENT)
+        self.assertEqual(
+            [
+                (r["version"], r["status"], r["document"])
+                for r in self.query("SELECT * FROM agent_passports ORDER BY version")
+            ],
+            [
+                (1, "published", protocols.serialize_canonical(self.v1).decode("utf-8")),
+                (2, "published", protocols.serialize_canonical(self.v2).decode("utf-8")),
+            ],
+        )
+        self.assertEqual(
+            self.query("SELECT * FROM agents")[0]["current_passport_version"], 2
+        )
+        self.assertEqual(
+            len(self.query("SELECT * FROM events WHERE action='catalog_install'")), 1
+        )
+
+    def test_installed_maximum_greater_than_catalog_maximum_refuses(self):
+        self._install(self.files_v2, self.AGENT)
+        with synthetic_catalog(self.files_v1):
+            err = self.fails("agent", "catalog", "install", self.AGENT)
+        self.assertIn("diverged", err)
+        self.assertIn("Nothing was changed", err)
+        self.assertEqual(
+            [r["version"] for r in self.query(
+                "SELECT version FROM agent_passports ORDER BY version"
+            )],
+            [1, 2],
+        )
+
+
+class RefusalTests(V4WorkspaceTestCase):
+    """Every predictable refusal costs ZERO writes (D-v0.4.18): each test
+    asserts the refusal AND a byte-identical database."""
+
+    def _insert_row(self, name, **kwargs):
+        return StateModelTests._insert_row(self, name, **kwargs)
+
+    @staticmethod
+    def _document_text(name: str) -> str:
+        entry = catalog.catalog().get(name)
+        _document, text = catalog.load_document(entry, entry.latest)
+        return text.rstrip("\n")
+
+    def _install_system_row(self, name, **overrides):
+        kwargs = dict(
+            owner="system",
+            agent_class="specialist",
+            protected=1,
+            lifecycle="active",
+            origin="import",
+            document_text=self._document_text(name),
+        )
+        kwargs.update(overrides)
+        return self._insert_row(name, **kwargs)
+
+    def _refuses_without_mutation(self, *argv):
+        before = _table_snapshot(self.query)
+        err = self.fails(*argv)
+        self.assertEqual(_table_snapshot(self.query), before)
+        self.assertIn("Nothing was changed", err)
+        return err
+
+    def test_human_collision_refuses(self):
+        self.ok("agent", "create", "mybot", "--role", "x")
+        self._insert_row(
+            "aos.planner",
+            owner="human",
+            agent_class="custom",
+            protected=0,
+            lifecycle="active",
+            origin="create",
+            document_text="{}",
+        )
+        err = self._refuses_without_mutation("agent", "catalog", "install", "aos.planner")
+        self.assertIn("aos.planner", err)
+        self.assertIn("blocked", err)
+
+    def test_imported_human_collision_refuses(self):
+        self._insert_row(
+            "aos.planner",
+            owner="human",
+            agent_class="specialist",
+            protected=0,
+            lifecycle="active",
+            origin="import",
+            document_text="{}",
+        )
+        err = self._refuses_without_mutation("agent", "catalog", "install", "aos.planner")
+        self.assertIn("blocked", err)
+
+    def test_legacy_collision_is_blocked_never_adopted(self):
+        self._insert_row(
+            "aos.planner",
+            owner="human",
+            agent_class="custom",
+            protected=0,
+            lifecycle="draft",
+            origin="legacy",
+            document_text="{}",
+            current_version=None,
+            status="draft",
+        )
+        err = self._refuses_without_mutation("agent", "catalog", "install", "aos.planner")
+        self.assertIn("blocked", err)
+        # Never adopted: still human-owned, still legacy, still unprotected.
+        row = self.query("SELECT * FROM agents WHERE name='aos.planner'")[0]
+        self.assertEqual(row["owner"], "human")
+        self.assertEqual(row["origin"], "legacy")
+        self.assertEqual(row["protected"], 0)
+
+    def test_divergent_shared_digest_refuses(self):
+        text = self._document_text("aos.builder")
+        document = protocols.parse_canonical(text.encode("utf-8"))
+        document["mission"] = document["mission"] + " (hand-edited, diverging)"
+        self._install_system_row(
+            "aos.builder",
+            document_text=protocols.serialize_canonical(_seal(document)).decode("utf-8"),
+        )
+        err = self._refuses_without_mutation("agent", "catalog", "install", "aos.builder")
+        self.assertIn("diverged", err)
+
+    def test_tampered_identity_hash_refuses(self):
+        self._install_system_row("aos.debugger")
+        self.execute(
+            "UPDATE agents SET content_sha256='deadbeef' || content_sha256 "
+            "WHERE name='aos.debugger'"
+        )
+        err = self._refuses_without_mutation("agent", "catalog", "install", "aos.debugger")
+        self.assertIn("tampered", err)
+
+    def test_tampered_passport_hash_refuses(self):
+        self._install_system_row("aos.debugger")
+        self.execute(
+            "UPDATE agent_passports SET content_sha256='deadbeef' || content_sha256"
+        )
+        err = self._refuses_without_mutation("agent", "catalog", "install", "aos.debugger")
+        self.assertIn("tampered", err)
+
+    def test_incoherent_pointer_refuses(self):
+        # The composite FK already makes a pointer at a MISSING version
+        # unstorable, so the reachable incoherence is a pointer at a row that
+        # exists but is not a published one. Rehashed afterward, so the
+        # pointer check — not the hash check — is what catches it.
+        self._install_system_row("aos.curator")
+        conn = db.connect(self.db_path)
+        try:
+            with conn:
+                agent_id = conn.execute(
+                    "SELECT id FROM agents WHERE name='aos.curator'"
+                ).fetchone()[0]
+                conn.execute(
+                    "INSERT INTO agent_passports (agent_id, version, status, "
+                    "created_at, published_at, document, content_sha256) "
+                    "VALUES (?, 2, 'draft', '2026-07-17T00:00:00Z', NULL, '{}', '')",
+                    (agent_id,),
+                )
+                conn.execute(
+                    "UPDATE agents SET current_passport_version=2 WHERE id=?",
+                    (agent_id,),
+                )
+                passports._rehash_agent(conn, agent_id)
+        finally:
+            conn.close()
+        err = self._refuses_without_mutation("agent", "catalog", "install", "aos.curator")
+        self.assertIn("tampered", err)
+
+    def test_malformed_hash_value_refuses_without_crashing(self):
+        self._install_system_row("aos.reviewer")
+        self.execute("UPDATE agents SET content_sha256='not-a-hash' WHERE name='aos.reviewer'")
+        err = self._refuses_without_mutation("agent", "catalog", "install", "aos.reviewer")
+        self.assertIn("tampered", err)
+
+    def test_blob_stored_value_refuses_without_crashing(self):
+        self._install_system_row("aos.reviewer")
+        self.execute("UPDATE agent_passports SET document = X'00FF'")
+        err = self._refuses_without_mutation("agent", "catalog", "install", "aos.reviewer")
+        self.assertIn("tampered", err)
+
+    def test_blob_identity_hash_refuses_without_crashing(self):
+        self._install_system_row("aos.reviewer")
+        self.execute("UPDATE agents SET content_sha256 = X'00FF' WHERE name='aos.reviewer'")
+        err = self._refuses_without_mutation("agent", "catalog", "install", "aos.reviewer")
+        self.assertIn("tampered", err)
+
+    def test_suspended_system_identity_refuses_as_tampered(self):
+        self._install_system_row("aos.verifier", lifecycle="suspended")
+        err = self._refuses_without_mutation("agent", "catalog", "install", "aos.verifier")
+        self.assertIn("tampered", err)
+
+    def test_archived_system_identity_refuses_as_tampered(self):
+        self._install_system_row("aos.verifier", lifecycle="archived")
+        err = self._refuses_without_mutation("agent", "catalog", "install", "aos.verifier")
+        self.assertIn("tampered", err)
+
+    def test_revoked_system_identity_refuses_as_tampered(self):
+        self._install_system_row("aos.verifier", lifecycle="revoked")
+        err = self._refuses_without_mutation("agent", "catalog", "install", "aos.verifier")
+        self.assertIn("tampered", err)
+
+    def test_unprotected_system_identity_refuses_as_tampered(self):
+        self._install_system_row("aos.verifier", protected=0)
+        err = self._refuses_without_mutation("agent", "catalog", "install", "aos.verifier")
+        self.assertIn("tampered", err)
+
+    def test_one_refusal_blocks_the_entire_selected_set(self):
+        # The whole point of D-v0.4.18: `--all` with ONE bad entry installs
+        # NOTHING, rather than eleven-of-twelve.
+        self._insert_row(
+            "aos.planner",
+            owner="human",
+            agent_class="custom",
+            protected=0,
+            lifecycle="active",
+            origin="create",
+            document_text="{}",
+        )
+        before = _table_snapshot(self.query)
+        err = self.fails("agent", "catalog", "install", "--all")
+        self.assertIn("aos.planner", err)
+        self.assertIn("refusing the whole request", err)
+        self.assertEqual(_table_snapshot(self.query), before)
+        self.assertEqual(
+            self.query("SELECT COUNT(*) c FROM agents")[0]["c"], 1
+        )
+
+    def test_refusal_names_the_entry_and_points_at_status(self):
+        self._install_system_row("aos.verifier", lifecycle="suspended")
+        err = self.fails("agent", "catalog", "install", "--all")
+        self.assertIn("aos.verifier", err)
+        self.assertIn("agent catalog status", err)
+
+    def test_a_refusal_carries_no_document_prose_or_full_digest(self):
+        self._install_system_row("aos.verifier", lifecycle="suspended")
+        err = self.fails("agent", "catalog", "install", "--all")
+        entry = catalog.catalog().get("aos.verifier")
+        self.assertNotIn(entry.latest.document_sha256, err)
+        document, _text = catalog.load_document(entry, entry.latest)
+        self.assertNotIn(document["mission"], err)
+
+
+class RollbackTests(V4WorkspaceTestCase):
+    """A failure mid-transaction rolls back EVERY row this operation would
+    have written — identities, passports, pointers, hashes and events."""
+
+    class Boom(RuntimeError):
+        pass
+
+    def _install_all_failing_after(self, successes: int):
+        """Fail deterministically after `successes` entries have already been
+        written INSIDE the transaction. A narrow test-only patch at the write
+        primitive: production carries no failure-injection hook."""
+        real = passports.create_catalog_identity
+        calls = {"n": 0}
+
+        def flaky(conn, **kwargs):
+            if calls["n"] >= successes:
+                raise RollbackTests.Boom("injected mid-transaction failure")
+            calls["n"] += 1
+            return real(conn, **kwargs)
+
+        conn = db.connect(self.db_path)
+        try:
+            with mock.patch.object(passports, "create_catalog_identity", flaky):
+                with self.assertRaises(RollbackTests.Boom):
+                    catalog.install(conn, None)
+        finally:
+            conn.close()
+        return calls["n"]
+
+    def test_failure_after_several_writes_rolls_back_everything(self):
+        before = _table_snapshot(self.query)
+        written = self._install_all_failing_after(3)
+        self.assertEqual(written, 3)  # three entries really were written first
+        after = _table_snapshot(self.query)
+        self.assertEqual(after, before)
+        self.assertEqual(self.query("SELECT COUNT(*) c FROM agents")[0]["c"], 0)
+        self.assertEqual(
+            self.query("SELECT COUNT(*) c FROM agent_passports")[0]["c"], 0
+        )
+        self.assertEqual(
+            self.query(
+                "SELECT COUNT(*) c FROM events WHERE action LIKE 'catalog_%'"
+            )[0]["c"],
+            0,
+        )
+
+    def test_rollback_preserves_a_pre_existing_human_agent(self):
+        self.ok("agent", "create", "mybot", "--role", "x")
+        self.ok("agent", "passport", "publish", "mybot")
+        before = _table_snapshot(self.query)
+        self._install_all_failing_after(2)
+        self.assertEqual(_table_snapshot(self.query), before)
+
+    def test_corrected_retry_succeeds(self):
+        self._install_all_failing_after(3)
+        out = self.ok("agent", "catalog", "install", "--all")
+        self.assertIn("Installed 12 agent(s)", out)
+        self.assertEqual(
+            self.query("SELECT COUNT(*) c FROM agents")[0]["c"], 12
+        )
+        conn = db.connect(self.db_path)
+        try:
+            for name in CATALOG_NAMES:
+                agent = passports.get_agent(conn, name)
+                self.assertEqual(passports.agent_integrity(agent), "ok")
+                self.assertEqual(passports.history_problems(conn, agent), [])
+        finally:
+            conn.close()
+
+    def test_in_transaction_state_change_aborts_the_whole_operation(self):
+        # The TOCTOU guard (U-A2 §9): a fact established during planning is
+        # re-read inside the transaction, and a discrepancy aborts everything.
+        real = passports.create_catalog_identity
+        state = {"n": 0}
+
+        # Manifest order is code-point order, so the LAST entry is the one
+        # still unwritten after the first: planting a collision there makes a
+        # planned `install` stop being true before its turn arrives.
+        victim = catalog.catalog().entries[-1].agent
+
+        def racing(conn, **kwargs):
+            agent = real(conn, **kwargs)
+            if state["n"] == 0:
+                state["n"] = 1
+                conn.execute(
+                    "INSERT INTO agents (name, agent_class, scope, project_id, "
+                    "lifecycle, protected, owner, origin, "
+                    "current_passport_version, created_at, updated_at, "
+                    "content_sha256) VALUES (?, 'custom', 'global', NULL, "
+                    "'active', 0, 'human', 'create', NULL, ?, ?, 'x')",
+                    (victim, "2026-07-17T00:00:00Z", "2026-07-17T00:00:00Z"),
+                )
+            return agent
+
+        before = _table_snapshot(self.query)
+        conn = db.connect(self.db_path)
+        try:
+            with mock.patch.object(passports, "create_catalog_identity", racing):
+                with self.assertRaises(AosError) as caught:
+                    catalog.install(conn, None)
+        finally:
+            conn.close()
+        self.assertIn("changed while the install was preparing", str(caught.exception))
+        self.assertEqual(_table_snapshot(self.query), before)
+
+
+class EventPrivacyTests(V4WorkspaceTestCase):
+    """U-A2 §14: bounded metadata and 12-char hash prefixes only."""
+
+    #: The EXACT allowed key set. `schema_version` is the envelope every
+    #: event in this system carries (events.emit adds it), not a payload
+    #: field this unit chose.
+    ALLOWED = set(catalog.EVENT_PAYLOAD_KEYS)
+
+    def _payloads(self) -> list[dict]:
+        return [
+            json.loads(r["payload_json"])
+            for r in self.query(
+                "SELECT * FROM events WHERE action IN "
+                "('catalog_install','catalog_upgrade') ORDER BY id"
+            )
+        ]
+
+    def test_payload_key_set_matches_the_allowlist_exactly(self):
+        self.ok("agent", "catalog", "install", "--all")
+        payloads = self._payloads()
+        self.assertEqual(len(payloads), 12)
+        for payload in payloads:
+            with self.subTest(agent=payload["agent"]):
+                self.assertEqual(set(payload) - {"schema_version"}, self.ALLOWED)
+
+    def test_event_action_entity_and_actor(self):
+        self.ok("agent", "catalog", "install", "aos.architect")
+        row = self.query(
+            "SELECT * FROM events WHERE action='catalog_install'"
+        )[0]
+        self.assertEqual(row["entity"], "agent")
+        self.assertEqual(row["actor"], "human")
+        agent_id = self.query("SELECT id FROM agents WHERE name='aos.architect'")[0]["id"]
+        self.assertEqual(row["entity_id"], agent_id)
+
+    def test_hash_prefixes_are_12_lowercase_hex_characters(self):
+        self.ok("agent", "catalog", "install", "--all")
+        for payload in self._payloads():
+            for key in ("manifest_sha256_prefix", "passport_sha256_prefix"):
+                with self.subTest(agent=payload["agent"], key=key):
+                    self.assertRegex(payload[key], r"^[0-9a-f]{12}\Z")
+
+    def test_no_full_digest_reaches_an_event(self):
+        self.ok("agent", "catalog", "install", "--all")
+        blob = json.dumps(self._payloads())
+        cat = catalog.catalog()
+        self.assertNotIn(cat.manifest_sha256, blob)
+        for entry in cat.entries:
+            for version in entry.versions:
+                with self.subTest(agent=entry.agent):
+                    self.assertNotIn(version.document_sha256, blob)
+
+    def test_no_passport_prose_or_declaration_fields_reach_an_event(self):
+        self.ok("agent", "catalog", "install", "--all")
+        blob = json.dumps(self._payloads())
+        for entry in catalog.catalog().entries:
+            document, _text = catalog.load_document(entry, entry.latest)
+            with self.subTest(agent=entry.agent):
+                for field in ("role", "mission"):
+                    self.assertNotIn(document[field], blob)
+                for field in (
+                    "task_families",
+                    "limitations",
+                    "skill_requirements",
+                    "tool_requirements",
+                    "model_requirements",
+                ):
+                    for item in document.get(field, ()):
+                        self.assertNotIn(item, blob)
+
+    def test_no_path_or_issuer_declaration_reaches_an_event(self):
+        self.ok("agent", "catalog", "install", "--all")
+        blob = json.dumps(self._payloads())
+        for entry in catalog.catalog().entries:
+            for version in entry.versions:
+                self.assertNotIn(version.path, blob)
+        self.assertNotIn(".passport.json", blob)
+        self.assertNotIn("declare_only", blob)
+
+    def test_from_version_and_from_lifecycle_are_null_on_fresh_install(self):
+        self.ok("agent", "catalog", "install", "--all")
+        for payload in self._payloads():
+            with self.subTest(agent=payload["agent"]):
+                self.assertIsNone(payload["from_version"])
+                self.assertIsNone(payload["from_lifecycle"])
+                self.assertEqual(payload["to_lifecycle"], "active")
+                self.assertEqual(payload["result"], "installed")
+                self.assertEqual(payload["version"], 1)
+                self.assertEqual(payload["catalog_version"], 1)
+
+
+class PublishProtectionTests(V4WorkspaceTestCase):
+    def test_ordinary_publish_refuses_owner_system_before_reading_the_file(self):
+        self.ok("agent", "catalog", "install", "aos.architect")
+        # The path does NOT exist: reaching a file-read would raise a
+        # different error, so a clean catalog-managed refusal proves the
+        # check fires BEFORE the input is read.
+        missing = self.root / "nowhere" / "passport.json"
+        self.assertFalse(missing.exists())
+        err = self.fails(
+            "agent", "passport", "publish", "aos.architect", "--file", str(missing)
+        )
+        self.assertIn("catalog-managed", err)
+        self.assertIn("agent catalog show aos.architect --fragment", err)
+        self.assertIn("agent create", err)
+
+    def test_ordinary_publish_refusal_reads_no_file_at_all(self):
+        self.ok("agent", "catalog", "install", "aos.architect")
+        target = self.root / "passport.json"
+        target.write_text("{}")
+        with mock.patch.object(
+            protocols, "read_artifact_bytes", side_effect=AssertionError("read the file")
+        ):
+            err = self.fails(
+                "agent", "passport", "publish", "aos.architect", "--file", str(target)
+            )
+        self.assertIn("catalog-managed", err)
+
+    def test_publish_refusal_changes_nothing(self):
+        self.ok("agent", "catalog", "install", "aos.architect")
+        before = _table_snapshot(self.query)
+        self.fails(
+            "agent", "passport", "publish", "aos.architect",
+            "--file", str(self.root / "nope.json"),
+        )
+        self.assertEqual(_table_snapshot(self.query), before)
+
+    def test_human_owned_publish_from_file_is_unchanged(self):
+        self.ok("agent", "create", "mybot", "--role", "A human's own agent.")
+        self.ok("agent", "passport", "publish", "mybot")
+        document = protocols.parse_canonical(
+            self.ok("agent", "export", "mybot").encode("utf-8")
+        )
+        document["passport_version"] = 2
+        document["mission"] = "A revised mission, authored by the human who owns it."
+        target = self.root / "v2.json"
+        target.write_bytes(protocols.serialize_canonical_file_bytes(_seal(document)))
+        self.ok("agent", "passport", "publish", "mybot", "--file", str(target))
+        row = self.query("SELECT * FROM agents WHERE name='mybot'")[0]
+        self.assertEqual(row["current_passport_version"], 2)
+        self.assertEqual(row["owner"], "human")
+
+    def test_human_owned_protected_agent_can_still_publish(self):
+        # The boundary is owner=='system', NOT `protected`: a human-owned
+        # protected identity keeps publishing exactly as it always has.
+        self.ok("agent", "create", "mybot", "--role", "A human's own agent.")
+        self.ok("agent", "passport", "publish", "mybot")
+        conn = db.connect(self.db_path)
+        try:
+            with conn:
+                agent_id = conn.execute(
+                    "SELECT id FROM agents WHERE name='mybot'"
+                ).fetchone()[0]
+                conn.execute("UPDATE agents SET protected=1 WHERE id=?", (agent_id,))
+                passports._rehash_agent(conn, agent_id)
+        finally:
+            conn.close()
+        document = protocols.parse_canonical(
+            self.ok("agent", "export", "mybot").encode("utf-8")
+        )
+        document["passport_version"] = 2
+        document["mission"] = "A revised mission, authored by the human who owns it."
+        target = self.root / "v2.json"
+        target.write_bytes(protocols.serialize_canonical_file_bytes(_seal(document)))
+        self.ok("agent", "passport", "publish", "mybot", "--file", str(target))
+        self.assertEqual(
+            self.query("SELECT * FROM agents WHERE name='mybot'")[0][
+                "current_passport_version"
+            ],
+            2,
+        )
+
+    def test_lifecycle_verbs_remain_refused_against_a_catalog_identity(self):
+        self.ok("agent", "catalog", "install", "aos.architect")
+        before = _table_snapshot(self.query)
+        for verb in ("suspend", "archive", "revoke", "discard"):
+            with self.subTest(verb=verb):
+                err = self.fails("agent", verb, "aos.architect")
+                self.assertIn("protected", err)
+        self.assertEqual(_table_snapshot(self.query), before)
+
+    def test_agent_create_and_import_still_refuse_the_catalog_namespace(self):
+        err = self.fails("agent", "create", "aos.architect")
+        self.assertIn("reserved", err)
+
+
+class ModeTests(V4WorkspaceTestCase):
+    def test_recovery_blocks_install_with_a_byte_identical_database(self):
+        self.ok("power", "set", "recovery")
+        before = _table_snapshot(self.query)
+        with mock.patch.object(
+            catalog, "install", side_effect=AssertionError("dispatched")
+        ):
+            code, out, err = self.aos("agent", "catalog", "install", "--all")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")  # recovery leaves stdout empty
+        self.assertIn("blocked in recovery mode", err)
+        self.assertEqual(_table_snapshot(self.query), before)
+
+    def test_deep_damaged_ledger_preflight_blocks_before_dispatch(self):
+        # A secret-shaped value in the ledger is a deep_check hard finding.
+        self.ok("agent", "create", "mybot", "--role", FAKE_SECRET)
+        self.ok("power", "set", "deep")
+        before = _table_snapshot(self.query)
+        with mock.patch.object(
+            catalog, "install", side_effect=AssertionError("dispatched")
+        ):
+            code, out, err = self.aos("agent", "catalog", "install", "--all")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("deep mode's preflight", err)
+        self.assertIn("before `agent catalog install` wrote anything", err)
+        self.assertEqual(_table_snapshot(self.query), before)
+
+    def test_deep_installs_on_a_healthy_ledger(self):
+        self.ok("power", "set", "deep")
+        out = self.ok("agent", "catalog", "install", "--all")
+        self.assertIn("Installed 12 agent(s)", out)
+
+    def test_eco_performs_the_requested_install_immediately(self):
+        self.ok("power", "set", "eco")
+        out = self.ok("agent", "catalog", "install", "aos.architect")
+        self.assertIn("Installed 1 agent(s)", out)
+        self.assertEqual(
+            self.query("SELECT COUNT(*) c FROM agents")[0]["c"], 1
+        )
+
+    def test_no_mode_auto_installs_or_auto_upgrades(self):
+        for mode in ("eco", "standard", "deep"):
+            with self.subTest(mode=mode):
+                self.ok("power", "set", mode)
+                for argv in (
+                    ("status",),
+                    ("doctor",),
+                    ("agent", "catalog", "status"),
+                    ("agent", "catalog", "plan", "--all"),
+                    ("agent", "catalog", "verify"),
+                    ("sync",),
+                ):
+                    self.aos(*argv)
+                self.assertEqual(
+                    self.query("SELECT COUNT(*) c FROM agents")[0]["c"], 0
+                )
+
+    def test_init_never_installs_the_catalog(self):
+        fresh = self.root / "fresh"
+        (fresh / "x").mkdir(parents=True)
+        code, _out, err = run_cli("--root", str(fresh), "init")
+        self.assertEqual(code, 0, err)
+        conn = db.connect(fresh / ".agentic-os" / "aos.db")
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0], 0
+            )
+        finally:
+            conn.close()
+
+
+class TransactionOwnershipTests(V4WorkspaceTestCase):
+    """The primitives are transaction PARTICIPANTS (D-v0.4.18): they open,
+    commit and roll back nothing, and refuse to run outside a caller's
+    already-open transaction."""
+
+    def test_create_catalog_identity_refuses_outside_a_transaction(self):
+        conn = db.connect(self.db_path)
+        try:
+            self.assertFalse(conn.in_transaction)
+            with self.assertRaises(RuntimeError) as caught:
+                passports.create_catalog_identity(
+                    conn, name="aos.stub", agent_class="specialist",
+                    documents=[(1, "{}")],
+                )
+        finally:
+            conn.close()
+        self.assertIn("transaction participant", str(caught.exception))
+        self.assertEqual(self.query("SELECT COUNT(*) c FROM agents")[0]["c"], 0)
+
+    def test_append_catalog_version_refuses_outside_a_transaction(self):
+        self.ok("agent", "catalog", "install", "aos.architect")
+        conn = db.connect(self.db_path)
+        try:
+            agent = passports.get_agent(conn, "aos.architect")
+            with self.assertRaises(RuntimeError) as caught:
+                passports.append_catalog_version(
+                    conn, agent=agent, version=2, document_text="{}"
+                )
+        finally:
+            conn.close()
+        self.assertIn("transaction participant", str(caught.exception))
+
+    def test_install_holds_exactly_one_transaction(self):
+        opened = {"n": 0}
+        real = catalog.db.transaction
+
+        def counting(conn):
+            opened["n"] += 1
+            return real(conn)
+
+        conn = db.connect(self.db_path)
+        try:
+            with mock.patch.object(catalog.db, "transaction", counting):
+                catalog.install(conn, None)
+        finally:
+            conn.close()
+        self.assertEqual(opened["n"], 1)
+        self.assertEqual(self.query("SELECT COUNT(*) c FROM agents")[0]["c"], 12)
+
+    def test_primitives_emit_no_event(self):
+        conn = db.connect(self.db_path)
+        try:
+            with db.transaction(conn):
+                conn.execute("BEGIN IMMEDIATE")
+                entry = catalog.catalog().get("aos.architect")
+                document, _text = catalog.load_document(entry, entry.latest)
+                passports.create_catalog_identity(
+                    conn,
+                    name="aos.architect",
+                    agent_class="specialist",
+                    documents=[
+                        (1, protocols.serialize_canonical(document).decode("utf-8"))
+                    ],
+                )
+        finally:
+            conn.close()
+        self.assertEqual(self.query("SELECT COUNT(*) c FROM agents")[0]["c"], 1)
+        self.assertEqual(
+            self.query("SELECT COUNT(*) c FROM events WHERE action LIKE 'catalog_%'")[0]["c"],
+            0,
+        )
 
 
 # ---------------------------------------------------------------------------

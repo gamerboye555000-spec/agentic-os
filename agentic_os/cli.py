@@ -755,6 +755,34 @@ def cmd_agent_catalog_plan(args) -> int:
     return 0
 
 
+def cmd_agent_catalog_install(args) -> int:
+    from . import catalog
+
+    if args.all and args.names:
+        raise AosError("Pass either NAME(s) or --all, not both.")
+    if not args.all and not args.names:
+        raise AosError("Pass at least one NAME, or --all.")
+    names = None if args.all else list(args.names)
+
+    with _ledger(args) as (aos_dir, conn):
+        result = catalog.install(conn, names)
+        if args.json:
+            _print_json({"result": result})
+            return 0
+        if not result["changed"]:
+            print(
+                f"Nothing to do: {result['unchanged']} entry(ies) already "
+                f"installed at catalog v{result['catalog_version']}."
+            )
+            return 0
+        print(
+            f"Installed {result['installed']} agent(s), upgraded "
+            f"{result['upgraded']}, unchanged {result['unchanged']} "
+            f"(catalog v{result['catalog_version']})."
+        )
+    return 0
+
+
 def cmd_evidence_git(args) -> int:
     task_id = ids.parse_id(args.id, "task")
     with _ledger(args) as (aos_dir, conn):
@@ -2624,6 +2652,15 @@ def build_parser() -> _Parser:
     p_catalog_plan.add_argument("--all", action="store_true")
     p_catalog_plan.add_argument("--json", action="store_true")
     p_catalog_plan.set_defaults(func=cmd_agent_catalog_plan)
+
+    p_catalog_install = catalog_sub.add_parser(
+        "install", help="install (or upgrade) catalog entries into this "
+        "workspace — the only command that writes a catalog row"
+    )
+    p_catalog_install.add_argument("names", nargs="*", metavar="NAME")
+    p_catalog_install.add_argument("--all", action="store_true")
+    p_catalog_install.add_argument("--json", action="store_true")
+    p_catalog_install.set_defaults(func=cmd_agent_catalog_install)
 
     p_ingest = sub.add_parser("ingest", help="ingest agent write-back artifacts")
     ingest_sub = p_ingest.add_subparsers(

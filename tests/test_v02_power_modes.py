@@ -716,6 +716,9 @@ class RecoveryTests(PowerCase):
         (("agent", "restore"), ("agent", "restore", "newbot")),
         (("agent", "revoke"), ("agent", "revoke", "newbot")),
         (("agent", "discard"), ("agent", "discard", "newbot")),
+        # U-A2's only catalog writer: identity + passport rows, pointers,
+        # hashes and an event in one transaction.
+        (("agent", "catalog", "install"), ("agent", "catalog", "install", "--all")),
         (("ingest", "dropfile"), ("ingest", "dropfile", "SELF")),
         (("done",), ("done", "T-0002", "--no-evidence", "--reason", "because")),
         (("pack", "build"), ("pack", "build", "T-0002")),
