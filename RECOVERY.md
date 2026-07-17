@@ -338,6 +338,65 @@ step was atomic; you are genuinely at the version reported. You choose:
 - **Do not** delete the migrated database before the restore is proven
   (step 4 moves it aside for exactly this reason).
 
+## Catalog tamper or divergence (U-A2)
+
+The built-in specialist catalog (`agentic_os/catalog/`, twelve checked-in
+passport artifacts) follows the same posture as everything else here:
+**restore from a trusted source, never rewrite in place.**
+
+**In recovery mode, the read-only catalog leaves stay available; only
+`install` is blocked:**
+
+```bash
+python3 aos.py agent catalog list      # works in recovery
+python3 aos.py agent catalog show NAME # works in recovery
+python3 aos.py agent catalog verify    # works in recovery
+python3 aos.py agent catalog status    # works in recovery
+python3 aos.py agent catalog plan --all  # works in recovery
+
+python3 aos.py agent catalog install --all
+# → blocked BEFORE dispatch: stdout stays empty, no mutation is reachable
+#   while the ledger is in recovery.
+```
+
+Inspecting the catalog while the ledger is damaged is exactly when `verify`
+and `status` earn their keep — they need no write access and change nothing.
+
+**Doctor never auto-installs, upgrades, or repairs the catalog.** Checks
+35-37 are read-only: check 35 verifies the SHIPPED catalog (manifest +
+twelve artifacts) against itself; check 36 verifies every INSTALLED catalog
+identity against the shipped catalog; check 37 warns (never fails) on an
+actionable upgrade or a name collision. Nothing here writes a row, and a
+workspace that has never run `agent catalog install` reports healthy on all
+three.
+
+**If check 35 FAILs** (the shipped catalog itself does not verify): this is
+a corrupted or tampered *installation of the software*, not a ledger
+problem. Re-obtain `agentic_os/catalog/` from a trusted source (a clean
+checkout, a clean wheel, or a clean `aos.pyz`) — never hand-edit a passport
+or the manifest to make the check pass. Editing `content_sha256` to match a
+changed body does not repair anything; it destroys the only evidence the
+artifact was altered.
+
+**If check 36 FAILs** (an installed catalog identity is `tampered` or
+`diverged` from the shipped catalog): this is the same posture as a
+tampered agent registry row (see "Rolling back a migration" above) — doctor
+names the identity and the verdict, every further write against it refuses
+(the no-laundering gate), and there is **no automatic repair path**.
+`agent catalog install` will not "fix" it either: it refuses the whole
+operation rather than writing over a divergent or tampered row. The
+recovery is the same drill as any other tampered ledger row: restore the
+database from a verified backup (see "Restore drill" above). There is no
+narrower "just fix this one agent" repair, on purpose — a governed row's
+history is either intact or it is not, and a partial rewrite would be a
+guess wearing a fact's clothes.
+
+**Never** hand-edit `owner`, `protected`, `lifecycle`, `agent_class`, or a
+stored passport `document` to make a catalog identity look installed or
+healthy again. Every one of those fields is bound into the identity or
+passport hash; editing it without going through the governed write path is
+exactly the tamper doctor exists to catch.
+
 ## Restoring somewhere else (inspection copy)
 
 `restore` writes to any path that does not exist yet, so you can open a

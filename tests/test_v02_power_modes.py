@@ -951,14 +951,16 @@ class DoctorIntegrationTests(PowerCase):
         self.assertNotIn('{"version"', line)
         self.assertNotIn(str(self.aos_dir), line)
 
-    def test_doctor_check_count_is_thirty_four(self):
-        """(25) 20 → 21 → 25 → 30 → 31: the mandated power check joined the
-        set at U-E2, then U-M2's four memory-claim checks, then U-M3's five
-        memory-graph checks, then U-M5's one retrieval-benchmark registry
-        check (the D-W8.1 pattern — the pin moves UP with a mandated new
-        check)."""
+    def test_doctor_check_count_is_thirty_seven(self):
+        """(25) 20 → 21 → 25 → 30 → 31 → 34 → 37: the mandated power check
+        joined the set at U-E2, then U-M2's four memory-claim checks, then
+        U-M3's five memory-graph checks, then U-M5's one retrieval-benchmark
+        registry check, then U-A1's three agent-registry checks, then
+        U-A2's three built-in catalog checks (the D-W8.1 pattern — the pin
+        moves UP with a mandated new check; fixture never installs the
+        catalog, so all three stay [PASS])."""
         out = self.aos("doctor")
-        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 34)
+        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 37)
 
     def test_doctor_still_passes_cleanly_on_the_baseline_fixture(self):
         """(25) The new checks do not disturb the ones already there."""
@@ -1290,7 +1292,12 @@ class EntrypointParityTests(unittest.TestCase):
                     f"unexpected archive member: {name}",
                 )
                 self.assertFalse(name.endswith(".db"))
-                self.assertFalse(name.endswith(".json"))
+                # U-A2: the built-in catalog's manifest + twelve passports
+                # are the ONLY .json members the archive legitimately
+                # carries — checked-in, read-only data, never workspace
+                # state, config, or a ledger.
+                if name.endswith(".json"):
+                    self.assertTrue(name.startswith("agentic_os/catalog/"), name)
                 self.assertNotIn("power.json", name)
                 self.assertNotIn(".agentic-os", name)
                 self.assertNotIn("tests/", name)

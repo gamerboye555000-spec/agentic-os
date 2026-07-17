@@ -2105,11 +2105,21 @@ class ParityTests(unittest.TestCase):
         self.assertNotIn("protocols/registry.json", members)
 
     def test_no_checked_in_json_artifact_entered_the_archive(self):
+        """No PROTOCOL registry JSON enters the archive (D-v0.3.2/D-v0.3.61
+        still hold: protocols/registry.json is never archived). U-A2
+        (D-v0.4.14) is the one deliberate exception: the built-in catalog's
+        manifest + twelve passports are checked-in JSON that DOES belong in
+        the archive, manifest-driven and independently re-verified by the
+        builder — never a broad *.json sweep."""
         import zipfile
 
         with zipfile.ZipFile(self.standalone) as archive:
             names = archive.namelist()
-        self.assertEqual([n for n in names if n.endswith(".json")], [])
+        json_members = [n for n in names if n.endswith(".json")]
+        self.assertTrue(
+            all(n.startswith("agentic_os/catalog/") for n in json_members), json_members
+        )
+        self.assertFalse([n for n in json_members if n.startswith("protocols/")])
 
     def test_list_matches_across_all_three_entrypoints(self):
         results = self._all_three(["protocol", "list"])

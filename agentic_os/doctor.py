@@ -52,6 +52,16 @@ with no published passport, which every migrated legacy agent honestly is.
 The secret sweep extends over stored passport documents. Same rule as every
 line above: name-or-`agent #id`, `v<N>`, closed verdicts and counts only.
 Never a role, mission, note, document excerpt, or a hash value.
+
+U-A2 adds three built-in-catalog lines (checks 35-37): the shipped catalog
+verifies as a whole (FAIL), every installed catalog identity is coherent
+with it (FAIL), and any actionable upgrade or name collision is surfaced
+(WARN-ONLY — never firing merely because the catalog was never installed).
+All three reuse `catalog.verify()`/`catalog.status()` rather than reading
+`agents`/`agent_passports` directly, and reduce every problem to a bounded
+count plus closed reason codes drawn from `catalog._REASON_HINTS` — never
+the message text itself, an artifact value, a path, or a full hash. Doctor
+never installs, upgrades, or otherwise mutates the catalog.
 """
 
 from __future__ import annotations
@@ -871,6 +881,7 @@ def run_checks(conn: sqlite3.Connection, aos_dir: Path) -> list[Check]:
     checks.extend(_memory_graph_checks(conn, aos_dir, aos_root))
     checks.append(_retrieval_benchmark_check())
     checks.extend(_agent_registry_checks(conn))
+    checks.extend(_catalog_checks(conn))
 
     return checks
 
@@ -980,6 +991,152 @@ def _agent_registry_checks(conn: sqlite3.Connection) -> list[Check]:
             _bounded_ids(uncovered, "agent"),
             warn_only=True,
         ),
+    ]
+
+
+
+# ---------------------------------------------------------------------------
+# U-A2 built-in specialist catalog (checks 35-37)
+#
+# All three reuse catalog.verify()/catalog.status() — the existing
+# read-only verifier and state classification — rather than re-parsing an
+# artifact, re-walking the catalog directory, or reading agents/
+# agent_passports directly here. Doctor never installs, upgrades, repairs,
+# rehashes or mutates the catalog: every check below only reads.
+
+#: catalog.verify()'s problem strings are built from a closed hint
+#: vocabulary (catalog._REASON_HINTS) plus a bounded artifact-name or
+#: field-path segment — never a document value, a full hash, or arbitrary
+#: parsed content. Doctor still never prints that text: it reduces every
+#: problem line to the REASON CODE alone, so a malformed catalog cannot
+#: smuggle anything but a closed code out through doctor's stdout.
+_CATALOG_EXTRA_ARTIFACT_SUFFIX = "not referenced by the catalog manifest"
+_CATALOG_INTERNAL_ERROR = "catalog_unavailable"
+
+
+def _catalog_reason_code(problem: str) -> str:
+    from . import catalog
+
+    if problem.endswith(_CATALOG_EXTRA_ARTIFACT_SUFFIX):
+        return "extra_artifact"
+    for code, hint in catalog._REASON_HINTS.items():
+        if problem.endswith(hint):
+            return code
+    return "other"
+
+
+def _catalog_verify_check() -> Check:
+    """35 (FAIL). The shipped catalog — manifest plus all twelve artifacts —
+    verifies as a whole: canonical form, self-digest, structural closure,
+    per-document digest/binding/secret-shape, and no unreferenced file.
+
+    `catalog.verify()` never raises by its own contract, but this check
+    catches any unexpected exception anyway and reports one bounded FAIL
+    rather than crashing doctor.
+    """
+    from . import catalog
+
+    try:
+        problems = catalog.verify()
+    except Exception:
+        return Check(
+            "built-in catalog verified", False, f"1 problem(s): {_CATALOG_INTERNAL_ERROR}"
+        )
+
+    if problems:
+        codes = sorted({_catalog_reason_code(p) for p in problems})
+        return Check(
+            "built-in catalog verified",
+            False,
+            f"{len(problems)} problem(s): " + ", ".join(codes[:UH2_DISPLAY_LIMIT]),
+        )
+
+    cat = catalog.catalog()
+    passport_count = sum(len(entry.versions) for entry in cat.entries)
+    return Check(
+        "built-in catalog verified",
+        True,
+        f"{len(cat.entries)} entry(ies), {passport_count} passport(s)",
+    )
+
+
+def _catalog_identity_check(conn: sqlite3.Connection) -> Check:
+    """36 (FAIL). Every catalog-named identity actually installed in this
+    ledger is coherent with the shipped catalog: owner/protected/class/
+    lifecycle, identity hash, passport-row hashes, issuer, and
+    installed-history digests (via `catalog.status()`/`installed_state()`,
+    which already covers all of these — no direct SQL here).
+
+    A name collision with a human, imported-human, or legacy identity
+    ('blocked') is not a system-owned row at all, so it never fails this
+    check; check 37 is where a collision becomes visible.
+    """
+    from . import catalog
+
+    try:
+        rows = catalog.status(conn)
+    except Exception:
+        return Check(
+            "installed catalog identities verified",
+            False,
+            f"1 problem(s): {_CATALOG_INTERNAL_ERROR}",
+        )
+
+    bad = [row for row in rows if row["state"] in ("diverged", "tampered")]
+    if bad:
+        shown = [f"{row['agent']} ({row['state']})" for row in bad[:UH2_DISPLAY_LIMIT]]
+        extra = len(bad) - UH2_DISPLAY_LIMIT
+        detail = f"{len(bad)} problem(s): " + ", ".join(shown)
+        if extra > 0:
+            detail += f" (+{extra} more)"
+        return Check("installed catalog identities verified", False, detail)
+
+    installed = sum(1 for row in rows if row["state"] in ("installed", "upgradable"))
+    return Check("installed catalog identities verified", True, f"{installed} installed")
+
+
+def _catalog_availability_check(conn: sqlite3.Connection) -> Check:
+    """37 (WARN, never fatal). An actionable catalog-install condition: an
+    upgradable entry, or a name collision with a human, imported-human, or
+    legacy identity. Never fires merely because the catalog was never
+    installed — an honest workspace that has never run
+    `agent catalog install` stays silent and healthy.
+    """
+    from . import catalog
+
+    try:
+        rows = catalog.status(conn)
+    except Exception:
+        return Check(
+            "catalog entries available to install",
+            False,
+            f"1 problem(s): {_CATALOG_INTERNAL_ERROR}",
+            warn_only=True,
+        )
+
+    actionable = [row for row in rows if row["state"] in ("upgradable", "blocked")]
+    if not actionable:
+        return Check(
+            "catalog entries available to install",
+            True,
+            "no actionable catalog upgrades or collisions",
+            warn_only=True,
+        )
+
+    shown = [f"{row['agent']} ({row['state']})" for row in actionable[:UH2_DISPLAY_LIMIT]]
+    extra = len(actionable) - UH2_DISPLAY_LIMIT
+    detail = f"{len(actionable)} actionable: " + ", ".join(shown)
+    if extra > 0:
+        detail += f" (+{extra} more)"
+    return Check("catalog entries available to install", False, detail, warn_only=True)
+
+
+def _catalog_checks(conn: sqlite3.Connection) -> list[Check]:
+    """The three U-A2 built-in-catalog lines (checks 35-37)."""
+    return [
+        _catalog_verify_check(),
+        _catalog_identity_check(conn),
+        _catalog_availability_check(conn),
     ]
 
 

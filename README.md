@@ -283,6 +283,75 @@ ready to govern them. Registered agents get generated `AOS/Agents/<name>.md`
 notes on sync. There is deliberately no `--trust-level` flag anywhere:
 autonomy is earned through the ladder, never set by hand.
 
+## Specialist agent catalog (U-A2)
+
+Twelve built-in specialist identities ship inside the package under
+`agentic_os/catalog/`, indexed by a checked-in `manifest.json`:
+
+| Agent | Category | Maturity |
+|---|---|---|
+| `aos.architect` | design | stable |
+| `aos.planner` | design | stable |
+| `aos.builder` | delivery | stable |
+| `aos.verifier` | assurance | stable |
+| `aos.reviewer` | assurance | stable |
+| `aos.security-auditor` | assurance | stable |
+| `aos.debugger` | operations | stable |
+| `aos.release-engineer` | operations | stable |
+| `aos.researcher` | knowledge | stable |
+| `aos.curator` | knowledge | stable |
+| `aos.analyst` | knowledge | provisional |
+| `aos.technical-writer` | knowledge | stable |
+
+Each is a `beast.agent-passport/v1` **declaration** — a mission, task
+families, evidence expectations and limitations — not a capability grant.
+Like every U-A1 passport field, `autonomy`, `skill_requirements`,
+`tool_requirements` and `model_requirements` are inert stored text: no code
+path in this unit reads them to grant capability, spend, or execution. U-A2
+adds no routing, execution, scheduling, provider, or credential behavior of
+any kind, and the schema stays version 4 — this unit performs no migration.
+
+```bash
+# Inspect the catalog (no ledger required for list/show/verify):
+python aos.py agent catalog list
+python aos.py agent catalog show aos.architect              # rendered
+python aos.py agent catalog show aos.architect --document    # exact canonical bytes
+python aos.py agent catalog verify                            # catalog integrity, exit 1 on any problem
+
+# Ledger-aware, still read-only:
+python aos.py agent catalog status                            # per-entry install state
+python aos.py agent catalog plan --all                        # what `install --all` would do
+
+# The only writer in this unit — explicit, one leaf, one transaction:
+python aos.py agent catalog install aos.architect
+python aos.py agent catalog install --all
+```
+
+Installation is **explicit only**: no command other than `agent catalog
+install` ever creates or modifies a catalog-managed row, in any power mode,
+in `init`, `migrate apply`, `doctor`, or `sync`. A workspace that has never
+run `agent catalog install` is a healthy workspace — `doctor` never warns or
+fails merely because the catalog is uninstalled.
+
+Reinstalling an already-installed set of entries at matching digests is a
+**true no-op**: no transaction opens, no row is written, and no event is
+emitted. `agent catalog install --all` a second time in a row prints
+"Nothing to do" and leaves every table byte-identical to before.
+
+Every catalog identity is `owner=system` and `protected=1`, so ordinary
+`suspend`/`archive`/`revoke`/`discard` refuse it exactly as they refuse any
+other protected identity. To build your own variant, derive it — no clone
+command exists because none is needed:
+
+```bash
+python aos.py agent catalog show aos.architect --fragment > body.json
+python aos.py agent create my-architect --class specialist --from-file body.json
+```
+
+The derived identity is `owner=human`, `origin=create`, from the moment it
+is created, and is never touched by a later catalog upgrade — it shares no
+row, name, or code path with the catalog entry it was derived from.
+
 ## Weekend commands
 
 Decisions, handoffs, and memory are first-class ledger rows (each mutation

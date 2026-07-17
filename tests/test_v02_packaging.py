@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import runpy
 import shutil
@@ -24,6 +25,8 @@ import unittest
 import zipfile
 from pathlib import Path
 from unittest import mock
+
+from agentic_os import protocols
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PACKAGE_DIR = REPO_ROOT / "agentic_os"
@@ -58,14 +61,93 @@ def _run(argv, cwd, env) -> subprocess.CompletedProcess:
 
 
 def _expected_members() -> set[str]:
-    """The allowlist, derived from the real package: root shim + package .py."""
+    """The allowlist, derived from the real package: root shim + package .py
+    + the manifest-driven catalog data allowlist (U-A2, D-v0.4.14)."""
     members = {"__main__.py"}
     for path in PACKAGE_DIR.rglob("*.py"):
         rel = path.relative_to(PACKAGE_DIR)
         if "__pycache__" in rel.parts:
             continue
         members.add(f"agentic_os/{rel.as_posix()}")
+    for resource in build_zipapp.catalog_resources(PACKAGE_DIR):
+        members.add(f"agentic_os/{resource.relative_to(PACKAGE_DIR).as_posix()}")
     return members
+
+
+# ---------------------------------------------------------------------------
+# Synthetic catalog fixture builders (U-A2) — never touch the real checked-in
+# agentic_os/catalog/; every test below writes its own throwaway tree.
+
+def _stub_passport(agent: str = "aos.stub", version: int = 1, **overrides) -> dict:
+    document = {
+        "schema": "beast.agent-passport/v1",
+        "protocol_version": 1,
+        "content_hash_alg": protocols.CONTENT_HASH_ALG,
+        "created_at": "2026-07-17T00:00:00Z",
+        "issuer": "aos.catalog",
+        "agent": agent,
+        "passport_version": version,
+        "agent_class": "specialist",
+        "agent_scope": {"level": "global"},
+        "role": "Stub role for tests.",
+        "mission": "Stub mission for tests, long enough to be plausible prose.",
+        "autonomy": "declare_only",
+        "escalation": "ask_human",
+        "provenance": {"created_by": "human", "method": "import"},
+        "data_classification": "public",
+    }
+    document.update(overrides)
+    document.pop(protocols.CONTENT_HASH_FIELD, None)
+    document[protocols.CONTENT_HASH_FIELD] = protocols.content_digest(document)
+    return document
+
+
+def _write_stub_catalog(catalog_dir: Path, entries_spec) -> dict:
+    """entries_spec: [(agent, category, maturity, [document, ...]), ...], in
+    the EXACT order given (not auto-sorted) -> writes manifest.json plus
+    every passport under catalog_dir, canonical bytes on disk throughout;
+    returns the manifest dict."""
+    catalog_dir.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for agent, category, maturity, documents in entries_spec:
+        versions = []
+        for doc in documents:
+            path = f"{agent}.v{doc['passport_version']}.passport.json"
+            (catalog_dir / path).write_bytes(protocols.serialize_canonical_file_bytes(doc))
+            versions.append(
+                {
+                    "document_sha256": protocols.content_digest(doc),
+                    "passport_version": doc["passport_version"],
+                    "path": path,
+                }
+            )
+        entries.append(
+            {"agent": agent, "category": category, "maturity": maturity, "versions": versions}
+        )
+    manifest = {
+        "canonical_json": protocols.CANONICAL_JSON,
+        "catalog_version": 1,
+        "content_hash_alg": protocols.CONTENT_HASH_ALG,
+        "entries": entries,
+        "issuer": "aos.catalog",
+        "manifest_version": 1,
+    }
+    manifest.pop(protocols.CONTENT_HASH_FIELD, None)
+    manifest[protocols.CONTENT_HASH_FIELD] = protocols.content_digest(manifest)
+    (catalog_dir / "manifest.json").write_bytes(protocols.serialize_canonical_file_bytes(manifest))
+    return manifest
+
+
+def _retarget_document_digest(manifest: dict, new_digest: str) -> dict:
+    """Deep-copy a single-entry/single-version manifest and repoint its one
+    version's document_sha256 at `new_digest`, then reseal the self-digest —
+    isolates the artifact-vs-manifest digest check from the manifest's own
+    self-digest check."""
+    manifest = json.loads(json.dumps(manifest))
+    manifest["entries"][0]["versions"][0]["document_sha256"] = new_digest
+    manifest.pop(protocols.CONTENT_HASH_FIELD, None)
+    manifest[protocols.CONTENT_HASH_FIELD] = protocols.content_digest(manifest)
+    return manifest
 
 
 class ModuleEntrypointTests(unittest.TestCase):
@@ -192,6 +274,41 @@ class ZipappBuildTests(unittest.TestCase):
         self.assertTrue(imported)
         self.assertEqual(imported - stdlib, set())
 
+    def test_builder_never_imports_agentic_os(self):
+        """The builder must remain runnable standalone: it verifies the
+        catalog with its own small stdlib-only duplicate of the canonical-
+        JSON/digest rules, never by importing the package it is packaging."""
+        for line in BUILDER_PATH.read_text().splitlines():
+            stripped = line.strip()
+            self.assertFalse(stripped.startswith("import agentic_os"), line)
+            self.assertFalse(stripped.startswith("from agentic_os"), line)
+
+    def test_archive_contains_exactly_thirteen_catalog_resources(self):
+        manifest = build_zipapp.load_catalog_manifest(PACKAGE_DIR / "catalog")
+        expected = {"agentic_os/catalog/manifest.json"}
+        for entry in manifest["entries"]:
+            for version in entry["versions"]:
+                expected.add(f"agentic_os/catalog/{version['path']}")
+        self.assertEqual(len(expected), 13)
+        with zipfile.ZipFile(self.archive) as archive:
+            members = {n for n in archive.namelist() if not n.endswith("/")}
+        catalog_members = {n for n in members if n.startswith("agentic_os/catalog/")}
+        self.assertEqual(catalog_members, expected)
+
+    def test_catalog_resource_bytes_are_deterministic_across_builds(self):
+        tmp2 = Path(tempfile.mkdtemp(prefix="aos-pyz-build2-"))
+        self.addCleanup(shutil.rmtree, tmp2, ignore_errors=True)
+        archive2 = build_zipapp.build(tmp2 / "aos.pyz")
+        with zipfile.ZipFile(self.archive) as a1, zipfile.ZipFile(archive2) as a2:
+            names1 = [n for n in a1.namelist() if n.startswith("agentic_os/catalog/")]
+            names2 = [n for n in a2.namelist() if n.startswith("agentic_os/catalog/")]
+            # zipapp.create_archive writes members in sorted(path) order —
+            # deterministic by construction, proven here rather than assumed.
+            self.assertEqual(names1, sorted(names1))
+            self.assertEqual(names1, names2)
+            for name in names1:
+                self.assertEqual(a1.read(name), a2.read(name), name)
+
 
 class ZipappExclusionTests(unittest.TestCase):
     """(10) The allowlist excludes non-runtime files even from a dirty tree."""
@@ -220,6 +337,17 @@ class ZipappExclusionTests(unittest.TestCase):
             ledger.mkdir()
             (ledger / "aos.db").write_bytes(b"SQLite format 3\x00LEDGER")
 
+            # A legitimate minimal catalog (U-A2), PLUS catalog-local
+            # contamination: an unreferenced passport and a credentials.json
+            # sitting right next to the referenced files. Both must stay
+            # excluded — never by name, only by absence from the manifest.
+            catalog_dir = package / "catalog"
+            _write_stub_catalog(catalog_dir, [("aos.stub", "design", "stable", [_stub_passport()])])
+            (catalog_dir / "aos.unreferenced.v1.passport.json").write_bytes(
+                protocols.serialize_canonical_file_bytes(_stub_passport("aos.unreferenced"))
+            )
+            (catalog_dir / "credentials.json").write_text('{"token": "sk-live-CATALOGSECRET"}\n')
+
             # Contamination at the repo root.
             for name in (".git", ".agentic-os", "tests", "adapters", "research"):
                 (fake_root / name).mkdir()
@@ -240,9 +368,15 @@ class ZipappExclusionTests(unittest.TestCase):
 
         self.assertEqual(
             set(members),
-            {"__main__.py", "agentic_os/__init__.py", "agentic_os/__main__.py",
-             "agentic_os/cli.py"},
+            {
+                "__main__.py", "agentic_os/__init__.py", "agentic_os/__main__.py",
+                "agentic_os/cli.py", "agentic_os/catalog/manifest.json",
+                "agentic_os/catalog/aos.stub.v1.passport.json",
+            },
         )
+        self.assertNotIn("agentic_os/catalog/aos.unreferenced.v1.passport.json", members)
+        self.assertNotIn("agentic_os/catalog/credentials.json", members)
+        self.assertNotIn(b"CATALOGSECRET", blob)
 
         # Nothing secret or stateful rode along, in name or in content.
         self.assertNotIn(b"sk-live-SECRET", blob)
@@ -250,13 +384,316 @@ class ZipappExclusionTests(unittest.TestCase):
         self.assertNotIn(b"LEDGER", blob)
         self.assertNotIn(b"BACKUP", blob)
 
+        catalog_members = {
+            "agentic_os/catalog/manifest.json",
+            "agentic_os/catalog/aos.stub.v1.passport.json",
+        }
         for member in members:
             parts = Path(member).parts
-            self.assertTrue(member.endswith(".py"), member)
+            if member not in catalog_members:
+                self.assertTrue(member.endswith(".py"), member)
             self.assertFalse(member.endswith((".pyc", ".pyo")), member)
             for banned in ("__pycache__", ".git", ".agentic-os", "tests", "backups"):
                 self.assertNotIn(banned, parts, member)
             self.assertNotIn(member, ("aos_hooks.py", "README.md"))
+
+
+class CatalogAllowlistTests(unittest.TestCase):
+    """(U-A2, D-v0.4.14) build_zipapp.catalog_resources()'s manifest and
+    passport verification, exercised directly against synthetic package
+    trees — never the real checked-in agentic_os/catalog/."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aos-catalog-allowlist-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.package_dir = self.tmp / "agentic_os"
+        self.catalog_dir = self.package_dir / "catalog"
+
+    def _resources(self):
+        return build_zipapp.catalog_resources(self.package_dir)
+
+    # -- happy path -----------------------------------------------------
+
+    def test_valid_single_entry_catalog_resolves_to_manifest_plus_one_passport(self):
+        _write_stub_catalog(
+            self.catalog_dir, [("aos.stub", "design", "stable", [_stub_passport()])]
+        )
+        names = {p.name for p in self._resources()}
+        self.assertEqual(names, {"manifest.json", "aos.stub.v1.passport.json"})
+
+    def test_multi_entry_catalog_resolves_deterministically_in_sorted_order(self):
+        _write_stub_catalog(
+            self.catalog_dir,
+            [
+                ("aos.aaa", "design", "stable", [_stub_passport("aos.aaa")]),
+                ("aos.bbb", "design", "stable", [_stub_passport("aos.bbb")]),
+            ],
+        )
+        names = [p.name for p in self._resources()]
+        self.assertEqual(
+            names, ["manifest.json", "aos.aaa.v1.passport.json", "aos.bbb.v1.passport.json"]
+        )
+
+    # -- exclusion --------------------------------------------------------
+
+    def test_extra_unreferenced_passport_is_excluded(self):
+        _write_stub_catalog(
+            self.catalog_dir, [("aos.stub", "design", "stable", [_stub_passport()])]
+        )
+        (self.catalog_dir / "aos.other.v1.passport.json").write_bytes(
+            protocols.serialize_canonical_file_bytes(_stub_passport("aos.other"))
+        )
+        names = {p.name for p in self._resources()}
+        self.assertNotIn("aos.other.v1.passport.json", names)
+
+    def test_credentials_json_under_catalog_is_excluded(self):
+        _write_stub_catalog(
+            self.catalog_dir, [("aos.stub", "design", "stable", [_stub_passport()])]
+        )
+        (self.catalog_dir / "credentials.json").write_text('{"token":"sk-live-x"}\n')
+        names = {p.name for p in self._resources()}
+        self.assertNotIn("credentials.json", names)
+
+    # -- missing / unsafe ---------------------------------------------------
+
+    def test_missing_manifest_fails_the_build(self):
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
+
+    def test_missing_referenced_passport_fails_the_build(self):
+        _write_stub_catalog(
+            self.catalog_dir, [("aos.stub", "design", "stable", [_stub_passport()])]
+        )
+        (self.catalog_dir / "aos.stub.v1.passport.json").unlink()
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
+
+    def test_symlinked_manifest_is_refused(self):
+        _write_stub_catalog(
+            self.catalog_dir, [("aos.stub", "design", "stable", [_stub_passport()])]
+        )
+        real = self.catalog_dir / "manifest.json"
+        target = self.tmp / "manifest-target.json"
+        target.write_bytes(real.read_bytes())
+        real.unlink()
+        real.symlink_to(target)
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
+
+    def test_symlinked_passport_is_refused(self):
+        _write_stub_catalog(
+            self.catalog_dir, [("aos.stub", "design", "stable", [_stub_passport()])]
+        )
+        real = self.catalog_dir / "aos.stub.v1.passport.json"
+        target = self.tmp / "passport-target.json"
+        target.write_bytes(real.read_bytes())
+        real.unlink()
+        real.symlink_to(target)
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
+
+    def test_oversized_referenced_passport_is_refused(self):
+        _write_stub_catalog(
+            self.catalog_dir, [("aos.stub", "design", "stable", [_stub_passport()])]
+        )
+        (self.catalog_dir / "aos.stub.v1.passport.json").write_bytes(
+            b"{" + b" " * (build_zipapp.MAX_ARTIFACT_BYTES + 10) + b"}\n"
+        )
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
+
+    def test_unsafe_manifest_path_is_refused(self):
+        manifest = _write_stub_catalog(
+            self.catalog_dir, [("aos.stub", "design", "stable", [_stub_passport()])]
+        )
+        bad_manifest = json.loads(json.dumps(manifest))
+        bad_manifest["entries"][0]["versions"][0]["path"] = "../evil.json"
+        bad_manifest.pop(protocols.CONTENT_HASH_FIELD, None)
+        bad_manifest[protocols.CONTENT_HASH_FIELD] = protocols.content_digest(bad_manifest)
+        (self.catalog_dir / "manifest.json").write_bytes(
+            protocols.serialize_canonical_file_bytes(bad_manifest)
+        )
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
+
+    # -- malformed / duplicate-key / non-canonical ---------------------------
+
+    def test_duplicate_json_key_in_manifest_is_refused(self):
+        _write_stub_catalog(
+            self.catalog_dir, [("aos.stub", "design", "stable", [_stub_passport()])]
+        )
+        (self.catalog_dir / "manifest.json").write_text('{"a":1,"a":2}\n')
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
+
+    def test_duplicate_json_key_in_passport_is_refused(self):
+        _write_stub_catalog(
+            self.catalog_dir, [("aos.stub", "design", "stable", [_stub_passport()])]
+        )
+        (self.catalog_dir / "aos.stub.v1.passport.json").write_text('{"a":1,"a":2}\n')
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
+
+    def test_malformed_manifest_json_is_refused(self):
+        _write_stub_catalog(
+            self.catalog_dir, [("aos.stub", "design", "stable", [_stub_passport()])]
+        )
+        (self.catalog_dir / "manifest.json").write_text("not json at all\n")
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
+
+    def test_non_canonical_manifest_bytes_are_refused(self):
+        manifest = _write_stub_catalog(
+            self.catalog_dir, [("aos.stub", "design", "stable", [_stub_passport()])]
+        )
+        pretty = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        (self.catalog_dir / "manifest.json").write_text(pretty)
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
+
+    def test_non_canonical_passport_bytes_are_refused(self):
+        doc = _stub_passport()
+        _write_stub_catalog(self.catalog_dir, [("aos.stub", "design", "stable", [doc])])
+        pretty = json.dumps(doc, indent=2, sort_keys=True) + "\n"
+        (self.catalog_dir / "aos.stub.v1.passport.json").write_text(pretty)
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
+
+    def test_missing_trailing_newline_is_refused(self):
+        _write_stub_catalog(
+            self.catalog_dir, [("aos.stub", "design", "stable", [_stub_passport()])]
+        )
+        path = self.catalog_dir / "aos.stub.v1.passport.json"
+        path.write_bytes(path.read_bytes().rstrip(b"\n"))
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
+
+    def test_manifest_entries_out_of_order_are_refused(self):
+        _write_stub_catalog(
+            self.catalog_dir,
+            [
+                ("aos.bbb", "design", "stable", [_stub_passport("aos.bbb")]),
+                ("aos.aaa", "design", "stable", [_stub_passport("aos.aaa")]),
+            ],
+        )
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
+
+    def test_manifest_duplicate_agent_is_refused(self):
+        self.catalog_dir.mkdir(parents=True, exist_ok=True)
+        doc = _stub_passport("aos.stub")
+        (self.catalog_dir / "aos.stub.v1.passport.json").write_bytes(
+            protocols.serialize_canonical_file_bytes(doc)
+        )
+        manifest = {
+            "canonical_json": protocols.CANONICAL_JSON,
+            "catalog_version": 1,
+            "content_hash_alg": protocols.CONTENT_HASH_ALG,
+            "entries": [
+                {
+                    "agent": "aos.stub", "category": "design", "maturity": "stable",
+                    "versions": [
+                        {
+                            "document_sha256": protocols.content_digest(doc),
+                            "passport_version": 1, "path": "aos.stub.v1.passport.json",
+                        }
+                    ],
+                },
+                {
+                    "agent": "aos.stub", "category": "design", "maturity": "stable",
+                    "versions": [
+                        {
+                            "document_sha256": protocols.content_digest(doc),
+                            "passport_version": 1, "path": "aos.stub.v1.passport.json",
+                        }
+                    ],
+                },
+            ],
+            "issuer": "aos.catalog",
+            "manifest_version": 1,
+        }
+        manifest[protocols.CONTENT_HASH_FIELD] = protocols.content_digest(manifest)
+        (self.catalog_dir / "manifest.json").write_bytes(
+            protocols.serialize_canonical_file_bytes(manifest)
+        )
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
+
+    # -- digest / binding equalities -----------------------------------------
+
+    def test_document_digest_mismatch_between_passport_and_manifest_is_refused(self):
+        doc = _stub_passport()
+        manifest = _write_stub_catalog(
+            self.catalog_dir, [("aos.stub", "design", "stable", [doc])]
+        )
+        bad_manifest = _retarget_document_digest(manifest, "0" * 64)
+        (self.catalog_dir / "manifest.json").write_bytes(
+            protocols.serialize_canonical_file_bytes(bad_manifest)
+        )
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
+
+    def test_tampered_internal_content_sha256_is_refused(self):
+        doc = _stub_passport()
+        _write_stub_catalog(self.catalog_dir, [("aos.stub", "design", "stable", [doc])])
+        bad_doc = dict(doc)
+        bad_doc["content_sha256"] = "0" * 64
+        (self.catalog_dir / "aos.stub.v1.passport.json").write_bytes(
+            protocols.serialize_canonical_file_bytes(bad_doc)
+        )
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
+
+    def test_malformed_internal_content_sha256_format_is_refused(self):
+        doc = _stub_passport()
+        _write_stub_catalog(self.catalog_dir, [("aos.stub", "design", "stable", [doc])])
+        bad_doc = dict(doc)
+        bad_doc["content_sha256"] = "ABCDEF" + "0" * 58  # uppercase: not lowercase-hex
+        (self.catalog_dir / "aos.stub.v1.passport.json").write_bytes(
+            protocols.serialize_canonical_file_bytes(bad_doc)
+        )
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
+
+    def test_agent_binding_mismatch_is_refused_even_when_digests_agree(self):
+        # A self-consistent document for a DIFFERENT agent, swapped in at the
+        # same path, with the manifest's recorded digest repointed at its
+        # real hash — isolates the binding check from the (already-total)
+        # digest-equality check.
+        wrong_agent_doc = _stub_passport(agent="aos.other", version=1)
+        stub_doc = _stub_passport(agent="aos.stub", version=1)
+        manifest = _write_stub_catalog(
+            self.catalog_dir, [("aos.stub", "design", "stable", [stub_doc])]
+        )
+        (self.catalog_dir / "aos.stub.v1.passport.json").write_bytes(
+            protocols.serialize_canonical_file_bytes(wrong_agent_doc)
+        )
+        bad_manifest = _retarget_document_digest(
+            manifest, protocols.content_digest(wrong_agent_doc)
+        )
+        (self.catalog_dir / "manifest.json").write_bytes(
+            protocols.serialize_canonical_file_bytes(bad_manifest)
+        )
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
+
+    def test_passport_version_binding_mismatch_is_refused_even_when_digests_agree(self):
+        wrong_version_doc = _stub_passport(agent="aos.stub", version=2)
+        stub_doc = _stub_passport(agent="aos.stub", version=1)
+        manifest = _write_stub_catalog(
+            self.catalog_dir, [("aos.stub", "design", "stable", [stub_doc])]
+        )
+        (self.catalog_dir / "aos.stub.v1.passport.json").write_bytes(
+            protocols.serialize_canonical_file_bytes(wrong_version_doc)
+        )
+        bad_manifest = _retarget_document_digest(
+            manifest, protocols.content_digest(wrong_version_doc)
+        )
+        (self.catalog_dir / "manifest.json").write_bytes(
+            protocols.serialize_canonical_file_bytes(bad_manifest)
+        )
+        with self.assertRaises(build_zipapp.BuildError):
+            self._resources()
 
 
 class ZipappOutputSafetyTests(unittest.TestCase):
@@ -569,6 +1006,47 @@ class PyprojectTests(unittest.TestCase):
             self.config["tool"]["setuptools"]["dynamic"]["version"],
             {"attr": "agentic_os.__version__"},
         )
+
+    def test_package_data_declares_only_the_catalog_json_subtree(self):
+        """(U-A2, D-v0.4.14) A restricted, repo-subtree-scoped pattern, never
+        a repository-wide *.json rule: only agentic_os/catalog/*.json."""
+        self.assertEqual(
+            self.config["tool"]["setuptools"]["package-data"],
+            {"agentic_os": ["catalog/*.json"]},
+        )
+
+
+class CatalogPackageResourceReadingTests(unittest.TestCase):
+    """(U-A2) The manifest and all twelve passports are readable through the
+    SAME importlib.resources reader agentic_os/catalog.py uses at runtime —
+    proving package-data actually reaches the resource-reading API, not just
+    that pyproject.toml declares it.
+
+    This environment has no pip/wheel/network available (verified: no `pip`
+    binary, no `ensurepip` module, no `wheel` package, and setuptools 68.1.2
+    has no built-in bdist_wheel), so a real `pip install` of a built wheel
+    cannot be exercised here. importlib.resources.files() is installation-
+    method-agnostic — it resolves the same way whether agentic_os came from
+    a pip-installed site-packages copy or a checkout on sys.path — so reading
+    through it against the live imported package is the offline-safe proxy
+    for "the installed package exposes these resources."
+    """
+
+    def test_manifest_and_all_referenced_passports_are_readable_as_resources(self):
+        import importlib.resources
+
+        manifest_bytes = (
+            importlib.resources.files("agentic_os") / "catalog" / "manifest.json"
+        ).read_bytes()
+        manifest = json.loads(manifest_bytes)
+        self.assertEqual(len(manifest["entries"]), 12)
+        for entry in manifest["entries"]:
+            for version in entry["versions"]:
+                data = (
+                    importlib.resources.files("agentic_os")
+                    / "catalog" / version["path"]
+                ).read_bytes()
+                self.assertGreater(len(data), 0)
 
 
 class GitignoreTests(unittest.TestCase):

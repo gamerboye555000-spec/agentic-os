@@ -19,6 +19,10 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,7 +31,7 @@ from unittest import mock
 from test_v04_agent_passports import V4WorkspaceTestCase
 from weekend_harness import core_schema, run_cli
 
-from agentic_os import catalog, cli, db, models, passports, power, protocols, secretscan
+from agentic_os import catalog, cli, db, doctor, models, passports, power, protocols, secretscan
 from agentic_os.utils import AosError
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -2193,6 +2197,276 @@ class TransactionOwnershipTests(V4WorkspaceTestCase):
 
 
 # ---------------------------------------------------------------------------
+# (10) Doctor: checks 35-37 (U-A2 Wave 3). Every check is exercised directly
+# via doctor.run_checks (fast, precise) and the end-to-end CLI count/order
+# is proven once through `aos doctor` itself.
+
+class DoctorCatalogTests(V4WorkspaceTestCase):
+    def _checks(self) -> list[doctor.Check]:
+        conn = db.connect(self.db_path)
+        try:
+            return doctor.run_checks(conn, self.aos_dir)
+        finally:
+            conn.close()
+
+    def _named(self, name: str) -> doctor.Check:
+        for check in self._checks():
+            if check.name == name:
+                return check
+        raise AssertionError(f"no doctor check named {name!r}")
+
+    def test_doctor_emits_exactly_37_checks_with_the_three_catalog_checks_last(self):
+        checks = self._checks()
+        self.assertEqual(len(checks), 37)
+        self.assertEqual(
+            [c.name for c in checks[-3:]],
+            [
+                "built-in catalog verified",
+                "installed catalog identities verified",
+                "catalog entries available to install",
+            ],
+        )
+
+    def test_doctor_check_count_matches_the_cli(self):
+        out = self.ok("doctor")
+        lines = [l for l in out.strip().splitlines() if l]
+        self.assertEqual(len(lines), 37)
+        self.assertTrue(lines[-3].startswith("[PASS] built-in catalog verified"))
+        self.assertTrue(lines[-2].startswith("[PASS] installed catalog identities verified"))
+        self.assertTrue(lines[-1].startswith("[PASS] catalog entries available to install"))
+
+    # -- 35: built-in catalog verified -------------------------------------
+
+    def test_35_passes_on_the_real_shipped_catalog(self):
+        check = self._named("built-in catalog verified")
+        self.assertTrue(check.ok)
+        self.assertFalse(check.warn_only)
+        self.assertEqual(check.detail, "12 entry(ies), 12 passport(s)")
+
+    def test_35_fails_on_a_manifest_self_digest_mismatch(self):
+        _manifest, files = _stub_catalog(
+            [("aos.stub", "design", "stable", [_stub_document()])]
+        )
+        bad_files = dict(files)
+        # Corrupts the self-digest without disturbing structure or vocabulary.
+        bad_files[catalog.MANIFEST_FILENAME] = bad_files[catalog.MANIFEST_FILENAME].replace(
+            b'"catalog_version":1', b'"catalog_version":2'
+        )
+        with synthetic_catalog(bad_files):
+            check = self._named("built-in catalog verified")
+        self.assertFalse(check.ok)
+        self.assertFalse(check.warn_only)
+        self.assertIn("1 problem(s):", check.detail)
+        self.assertIn("manifest_digest_mismatch", check.detail)
+        # Bounded reason codes only — never artifact text, a path, or a hash.
+        self.assertNotIn("aos.stub", check.detail)
+        self.assertNotIn("sha256", check.detail)
+
+    def test_35_reports_a_secret_shaped_document_by_reason_code_only(self):
+        document = _stub_document(mission="Investigate outages. Token: " + FAKE_SECRET)
+        _manifest, files = _stub_catalog(
+            [("aos.stub", "design", "stable", [document])]
+        )
+        with synthetic_catalog(files):
+            check = self._named("built-in catalog verified")
+        self.assertFalse(check.ok)
+        self.assertIn("secret_shaped", check.detail)
+        self.assertNotIn(FAKE_SECRET, check.detail)
+
+    def test_35_reports_an_unreferenced_artifact_by_reason_code_only(self):
+        _manifest, files = _stub_catalog(
+            [("aos.stub", "design", "stable", [_stub_document()])]
+        )
+        files = dict(files)
+        files["aos.extra.v1.passport.json"] = protocols.serialize_canonical_file_bytes(
+            _stub_document("aos.extra")
+        )
+        with synthetic_catalog(files):
+            check = self._named("built-in catalog verified")
+        self.assertFalse(check.ok)
+        self.assertIn("extra_artifact", check.detail)
+        self.assertNotIn("aos.extra", check.detail)
+
+    def test_35_never_crashes_doctor_on_an_unexpected_exception(self):
+        with mock.patch.object(catalog, "verify", side_effect=RuntimeError("boom")):
+            check = self._named("built-in catalog verified")
+        self.assertFalse(check.ok)
+        self.assertFalse(check.warn_only)
+        self.assertNotIn("boom", check.detail)
+        self.assertNotIn("RuntimeError", check.detail)
+
+    # -- 36: installed catalog identities verified --------------------------
+
+    def test_36_passes_with_zero_installed(self):
+        check = self._named("installed catalog identities verified")
+        self.assertTrue(check.ok)
+        self.assertFalse(check.warn_only)
+        self.assertEqual(check.detail, "0 installed")
+
+    def test_36_passes_when_the_full_catalog_is_validly_installed(self):
+        self.ok("agent", "catalog", "install", "--all")
+        check = self._named("installed catalog identities verified")
+        self.assertTrue(check.ok)
+        self.assertEqual(check.detail, "12 installed")
+
+    def test_36_fails_on_a_tampered_installed_identity(self):
+        self.ok("agent", "catalog", "install", "aos.architect")
+        self.execute("UPDATE agents SET lifecycle='suspended' WHERE name='aos.architect'")
+        check = self._named("installed catalog identities verified")
+        self.assertFalse(check.ok)
+        self.assertFalse(check.warn_only)
+        self.assertIn("1 problem(s):", check.detail)
+        self.assertIn("aos.architect (tampered)", check.detail)
+
+    def test_36_fails_on_a_diverged_installed_identity(self):
+        # Diverged is a SELF-CONSISTENT installed history that simply does
+        # not match the catalog — as opposed to tampered (an internally
+        # broken row hash) — so the edited row must be REHASHED afterward,
+        # exactly like StateModelTests.test_diverged_on_hand_edited_shared_version.
+        self.ok("agent", "catalog", "install", "aos.builder")
+        document = protocols.parse_canonical(
+            self.query("SELECT document FROM agent_passports")[0]["document"].encode("utf-8")
+        )
+        document["mission"] = document["mission"] + " (diverged, hand-edited)"
+        bad_text = protocols.serialize_canonical(_seal(document)).decode("utf-8")
+        conn = db.connect(self.db_path)
+        try:
+            with conn:
+                agent_id = conn.execute(
+                    "SELECT id FROM agents WHERE name='aos.builder'"
+                ).fetchone()[0]
+                passport_id = conn.execute(
+                    "SELECT id FROM agent_passports WHERE agent_id=?", (agent_id,)
+                ).fetchone()[0]
+                conn.execute(
+                    "UPDATE agent_passports SET document=? WHERE id=?",
+                    (bad_text, passport_id),
+                )
+            with conn:
+                passports._rehash_passport(conn, passport_id)
+                passports._rehash_agent(conn, agent_id)
+        finally:
+            conn.close()
+        check = self._named("installed catalog identities verified")
+        self.assertFalse(check.ok)
+        self.assertIn("aos.builder (diverged)", check.detail)
+
+    def test_36_does_not_fail_on_a_blocked_collision(self):
+        # A name collision belongs to check 37, never 36 — it is not a
+        # system-owned row at all.
+        now = "2026-07-17T00:00:00Z"
+        conn = db.connect(self.db_path)
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO agents (name, agent_class, scope, project_id, lifecycle, "
+                    "protected, owner, origin, current_passport_version, created_at, "
+                    "updated_at, content_sha256) VALUES (?,?,?,?,?,?,?,?,NULL,?,?,'')",
+                    ("aos.planner", "custom", "global", None, "draft", 0, "human", "legacy",
+                     now, now),
+                )
+        finally:
+            conn.close()
+        check = self._named("installed catalog identities verified")
+        self.assertTrue(check.ok)
+        self.assertEqual(check.detail, "0 installed")
+
+    def test_36_output_is_bounded_when_many_identities_are_tampered(self):
+        self.ok("agent", "catalog", "install", "--all")
+        self.execute("UPDATE agents SET lifecycle='suspended' WHERE owner='system'")
+        check = self._named("installed catalog identities verified")
+        self.assertFalse(check.ok)
+        self.assertIn("12 problem(s):", check.detail)
+        shown = check.detail.count("(tampered)")
+        self.assertEqual(shown, doctor.UH2_DISPLAY_LIMIT)
+        self.assertIn(f"+{12 - doctor.UH2_DISPLAY_LIMIT} more", check.detail)
+
+    def test_36_never_crashes_doctor_on_an_unexpected_exception(self):
+        with mock.patch.object(catalog, "status", side_effect=RuntimeError("boom")):
+            check = self._named("installed catalog identities verified")
+        self.assertFalse(check.ok)
+        self.assertFalse(check.warn_only)
+        self.assertNotIn("boom", check.detail)
+
+    # -- 37: catalog entries available to install ----------------------------
+
+    def test_37_passes_silently_on_a_fresh_uninstalled_workspace(self):
+        check = self._named("catalog entries available to install")
+        self.assertTrue(check.ok)
+        self.assertTrue(check.warn_only)
+        self.assertEqual(check.detail, "no actionable catalog upgrades or collisions")
+
+    def test_37_passes_silently_on_a_fully_installed_catalog(self):
+        self.ok("agent", "catalog", "install", "--all")
+        check = self._named("catalog entries available to install")
+        self.assertTrue(check.ok)
+        self.assertTrue(check.warn_only)
+
+    def test_37_warns_on_a_legacy_name_collision(self):
+        now = "2026-07-17T00:00:00Z"
+        conn = db.connect(self.db_path)
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO agents (name, agent_class, scope, project_id, lifecycle, "
+                    "protected, owner, origin, current_passport_version, created_at, "
+                    "updated_at, content_sha256) VALUES (?,?,?,?,?,?,?,?,NULL,?,?,'')",
+                    ("aos.planner", "custom", "global", None, "draft", 0, "human", "legacy",
+                     now, now),
+                )
+        finally:
+            conn.close()
+        check = self._named("catalog entries available to install")
+        self.assertFalse(check.ok)
+        self.assertTrue(check.warn_only)
+        self.assertIn("aos.planner (blocked)", check.detail)
+
+    def test_37_warns_on_an_upgradable_entry(self):
+        agent = "aos.stub"
+        v1 = _stub_document(agent, 1)
+        v2 = _stub_v2(agent)
+        _m1, files_v1 = _stub_catalog([(agent, "design", "stable", [v1])])
+        _m2, files_v2 = _stub_catalog([(agent, "design", "stable", [v1, v2])])
+        with synthetic_catalog(files_v1):
+            self.ok("agent", "catalog", "install", agent)
+        with synthetic_catalog(files_v2):
+            check = self._named("catalog entries available to install")
+        self.assertFalse(check.ok)
+        self.assertTrue(check.warn_only)
+        self.assertIn(f"{agent} (upgradable)", check.detail)
+
+    def test_37_never_fires_merely_because_the_catalog_was_never_installed(self):
+        # All twelve entries absent must stay a healthy, silent workspace —
+        # never a warning just for not having run `agent catalog install`.
+        check = self._named("catalog entries available to install")
+        self.assertTrue(check.ok)
+
+    def test_37_never_crashes_doctor_on_an_unexpected_exception(self):
+        with mock.patch.object(catalog, "status", side_effect=RuntimeError("boom")):
+            check = self._named("catalog entries available to install")
+        self.assertFalse(check.ok)
+        self.assertTrue(check.warn_only)
+        self.assertNotIn("boom", check.detail)
+
+    # -- doctor never mutates -------------------------------------------------
+
+    def test_doctor_never_mutates_the_database(self):
+        # Tampered on purpose (doctor must legitimately FAIL check 36 here);
+        # the point is the row snapshot, not the exit code.
+        self.ok("agent", "catalog", "install", "aos.architect")
+        self.execute("UPDATE agents SET lifecycle='suspended' WHERE name='aos.architect'")
+        before = _table_snapshot(self.query)
+        code, _out, _err = self.aos("doctor")
+        self.assertEqual(code, 1)
+        after = _table_snapshot(self.query)
+        self.assertEqual(before, after)
+
+    def test_doctor_never_auto_installs_or_upgrades_the_catalog(self):
+        self._checks()
+        self.assertEqual(self.query("SELECT COUNT(*) c FROM agents")[0]["c"], 0)
+
+
+# ---------------------------------------------------------------------------
 # (9) Source hygiene: no network, subprocess, or dynamic execution.
 
 class SourceHygieneTests(unittest.TestCase):
@@ -2222,6 +2496,148 @@ class SourceHygieneTests(unittest.TestCase):
         for token in self.FORBIDDEN + ("sqlite3", "agentic_os.db", "agentic_os import db"):
             with self.subTest(token=token):
                 self.assertNotIn(token, source)
+
+
+# ---------------------------------------------------------------------------
+# (11) Four-entrypoint parity + packaged-install smoke (U-A2 Wave 3)
+
+class EntrypointParityTests(unittest.TestCase):
+    """`agent catalog list/verify/show --document` and `doctor` produce
+    byte-identical stdout/exit codes across script, module, console-script,
+    and zipapp — and the zipapp can install one identity from its embedded
+    resources. Never touches the real primary ledger; every workspace here
+    is a disposable temp directory built fresh per test.
+
+    This sandboxed environment has no `pip` executable, no `ensurepip`
+    module, and no `wheel` package installed, and has no network access to
+    fetch any of them (verified directly: `python3 -m pip` -> "No module
+    named pip"; `python3 -m ensurepip` -> "No module named ensurepip";
+    `import wheel` -> ModuleNotFoundError; setuptools is 68.1.2, which has
+    no built-in `bdist_wheel`). A real `pip install` of a built wheel
+    therefore cannot be exercised here — see the Wave 3 report for this
+    exact blocker, reported rather than worked around per instruction.
+
+    The "console_script" leg below is the closest offline-safe proxy: it
+    invokes the EXACT function pyproject.toml's `aos = agentic_os.cli:main`
+    names — proven identical to the canonical CLI object by
+    test_v02_packaging.py's PyprojectTests.test_console_script_points_at_the_canonical_cli
+    — through a one-line shim, with the checkout on PYTHONPATH exactly as a
+    real console script's import machinery would resolve it. It is a
+    faithful behavioral proxy for the entry point's own code path, not a
+    substitute for a real wheel install onto a separate site-packages tree.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.mkdtemp(prefix="aos-a2-parity-")
+        cls.pyz = Path(cls._tmp) / "aos.pyz"
+        result = subprocess.run(
+            [
+                sys.executable, str(REPO_ROOT / "tools" / "build_zipapp.py"),
+                "--output", str(cls.pyz),
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            raise AssertionError(f"zipapp build failed: {result.stderr}")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+
+    _ENTRYPOINT_ARGV = {
+        "script": [sys.executable, str(REPO_ROOT / "aos.py")],
+        "module": [sys.executable, "-m", "agentic_os"],
+        "console_script": [
+            sys.executable, "-c",
+            "import sys\nfrom agentic_os.cli import main\nsys.exit(main())\n",
+        ],
+    }
+
+    def _run_entrypoint(self, name: str, args: list[str], root: Path) -> tuple[int, str, str]:
+        argv = self._ENTRYPOINT_ARGV[name] if name != "zipapp" else [sys.executable, str(self.pyz)]
+        cwd = Path(self._tmp) if name == "zipapp" else REPO_ROOT
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        if name in ("module", "console_script"):
+            # The one thing that differs from a real installed distribution:
+            # resolution via PYTHONPATH rather than site-packages. The
+            # reader agentic_os.catalog uses (importlib.resources.files) is
+            # installation-method-agnostic, so this does not weaken the
+            # resource-reading proof — only the "installed" framing.
+            env["PYTHONPATH"] = str(REPO_ROOT)
+        result = subprocess.run(
+            [*argv, "--root", str(root), *args],
+            capture_output=True, text=True, cwd=str(cwd), env=env,
+        )
+        return result.returncode, result.stdout, result.stderr
+
+    def _assert_four_way(self, args: list[str], root: Path) -> tuple[int, str, str]:
+        results = {
+            name: self._run_entrypoint(name, args, root)
+            for name in ("script", "module", "console_script", "zipapp")
+        }
+        script = results["script"]
+        for name, result in results.items():
+            self.assertEqual(result[0], script[0], f"{args}: {name} exit code")
+            self.assertEqual(result[1], script[1], f"{args}: {name} stdout")
+        return script
+
+    def _fresh_root(self) -> Path:
+        tmp = tempfile.mkdtemp(prefix="aos-a2-parity-ws-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        root = Path(tmp)
+        code, _out, err = self._run_entrypoint("script", ["init"], root)
+        self.assertEqual(code, 0, err)
+        return root
+
+    def test_catalog_list_is_byte_identical_across_all_four_entrypoints(self):
+        root = self._fresh_root()
+        code, out, _err = self._assert_four_way(["agent", "catalog", "list"], root)
+        self.assertEqual(code, 0)
+        self.assertIn("12 entry(ies), catalog v1", out)
+
+    def test_catalog_verify_is_byte_identical_across_all_four_entrypoints(self):
+        root = self._fresh_root()
+        code, out, _err = self._assert_four_way(["agent", "catalog", "verify"], root)
+        self.assertEqual(code, 0)
+        self.assertIn("12 entry(ies), 12 passport(s): OK", out)
+
+    def test_catalog_show_document_is_byte_identical_across_all_four_entrypoints(self):
+        root = self._fresh_root()
+        code, out, _err = self._assert_four_way(
+            ["agent", "catalog", "show", "aos.architect", "--document"], root
+        )
+        self.assertEqual(code, 0)
+        self.assertIn('"agent":"aos.architect"', out)
+
+    def test_doctor_is_byte_identical_with_37_lines_across_all_four_entrypoints(self):
+        root = self._fresh_root()
+        code, out, _err = self._assert_four_way(["doctor"], root)
+        self.assertEqual(code, 0)
+        lines = [l for l in out.strip().splitlines() if l]
+        self.assertEqual(len(lines), 37)
+        self.assertNotIn("[FAIL]", out)
+
+    def test_packaged_zipapp_install_smoke_creates_one_valid_catalog_identity(self):
+        """The packaged entrypoint reads its EMBEDDED resources and creates
+        one valid catalog identity. Never the real primary ledger; no
+        network; no downloaded dependency."""
+        tmp = tempfile.mkdtemp(prefix="aos-a2-pyz-smoke-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        root = Path(tmp)
+        code, _out, err = self._run_entrypoint("zipapp", ["init"], root)
+        self.assertEqual(code, 0, err)
+
+        code, out, err = self._run_entrypoint(
+            "zipapp", ["agent", "catalog", "install", "aos.architect"], root
+        )
+        self.assertEqual(code, 0, err)
+        self.assertIn("Installed 1 agent(s)", out)
+
+        code, out, err = self._run_entrypoint("zipapp", ["agent", "show", "aos.architect"], root)
+        self.assertEqual(code, 0, err)
+        self.assertIn("owner:        system", out)
+        self.assertIn("protected:    yes", out)
 
 
 if __name__ == "__main__":
