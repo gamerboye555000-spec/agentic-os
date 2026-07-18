@@ -30,6 +30,7 @@ Groups:
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import inspect
@@ -39,10 +40,11 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from types import MappingProxyType
 
 from fixtures.v3_workspace import build_v3_workspace, table_contents
 
-from agentic_os import db, ids, migrations, models, passports, protocols
+from agentic_os import db, ids, migrations, models, passports, protocols, routing
 from agentic_os.utils import AosError
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -1201,6 +1203,1410 @@ class HistoricalMigrationGuardTests(unittest.TestCase):
                     f"historical migration body {name!r} changed; U-A3's "
                     "migration must be purely additive and touch no shipped step.",
                 )
+
+
+# ---------------------------------------------------------------------------
+# U-A3 Wave 2: canonical routing request validation and deterministic
+# eligibility (agentic-os-v0.4-u-a3-routing-handoffs-contract.md §6-7).
+#
+# Pure-function tests only: no real workspace, no `conn`. Fixtures build
+# `models.Agent` / `models.AgentPassport` rows and `routing.CandidateSnapshot`
+# objects directly, and a minimal-but-real `beast.agent-passport/v1` document
+# serialized through `protocols.serialize_canonical` — the same canonical
+# bytes a real passport row would carry.
+
+VALID_REQUEST = {
+    "request_schema": routing.REQUEST_SCHEMA,
+    "algorithm_version": routing.ALGORITHM_VERSION,
+}
+
+
+def _passport_document(**over) -> dict:
+    doc = dict(
+        schema="beast.agent-passport/v1",
+        protocol_version=1,
+        content_hash_alg=protocols.CONTENT_HASH_ALG,
+        content_sha256=HASH,
+        created_at=NOW,
+        issuer="human",
+        agent="alpha",
+        passport_version=1,
+        agent_class="custom",
+        agent_scope={"level": "global"},
+        role="worker",
+        mission="do stuff",
+        autonomy="supervised",
+        escalation="ask_human",
+        provenance={"created_by": "human:tester", "method": "create"},
+        task_families=["build.code"],
+        capabilities=["cap.write"],
+        evidence_expectations={"evidence_kinds": ["file"], "min_evidence_count": 1},
+        data_classifications=["internal"],
+        skill_requirements=["skill.python"],
+        tool_requirements=["tool.git"],
+        model_requirements={"min_context_tokens": 50000, "modalities": ["text"]},
+    )
+    doc.update(over)
+    return doc
+
+
+def _passport_document_text(**over) -> str:
+    return protocols.serialize_canonical(_passport_document(**over)).decode("utf-8")
+
+
+def _routing_agent(**over) -> models.Agent:
+    fields = dict(
+        id=1,
+        name="alpha",
+        agent_class="custom",
+        scope="global",
+        project_id=None,
+        lifecycle="active",
+        protected=0,
+        owner="human",
+        origin="create",
+        current_passport_version=1,
+        created_at=NOW,
+        updated_at=NOW,
+        kind=None,
+        invoke_hint=None,
+        capabilities_json=None,
+        trust_level=None,
+        notes=None,
+        content_sha256=HASH,
+    )
+    fields.update(over)
+    return models.Agent(**fields)
+
+
+def _routing_passport(**over) -> models.AgentPassport:
+    fields = dict(
+        id=1,
+        agent_id=1,
+        version=1,
+        status="published",
+        created_at=NOW,
+        published_at=NOW,
+        document=_passport_document_text(),
+        content_sha256=HASH,
+    )
+    fields.update(over)
+    return models.AgentPassport(**fields)
+
+
+def _snapshot(**over) -> routing.CandidateSnapshot:
+    fields = dict(
+        agent=_routing_agent(),
+        identity_integrity="ok",
+        history_problems=(),
+        current_passport=_routing_passport(),
+        project_slug=None,
+        catalog_upgrade_available=False,
+    )
+    fields.update(over)
+    return routing.CandidateSnapshot(**fields)
+
+
+def _request(**over) -> dict:
+    return routing.validate_request(dict(VALID_REQUEST, **over))
+
+
+# ---------------------------------------------------------------------------
+# REQUEST VALIDATION (tests 1-22)
+
+class RequestValidationTests(unittest.TestCase):
+    def test_exact_required_request_schema(self):
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(
+                dict(VALID_REQUEST, request_schema="aos.routing-request/v2")
+            )
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request({"algorithm_version": routing.ALGORITHM_VERSION})
+        normalized = routing.validate_request(dict(VALID_REQUEST))
+        self.assertEqual(normalized["request_schema"], "aos.routing-request/v1")
+
+    def test_exact_required_algorithm_version(self):
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(
+                dict(VALID_REQUEST, algorithm_version="aos-routing-order/v2")
+            )
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request({"request_schema": routing.REQUEST_SCHEMA})
+        normalized = routing.validate_request(dict(VALID_REQUEST))
+        self.assertEqual(normalized["algorithm_version"], "aos-routing-order/v1")
+
+    def test_unknown_top_level_key_refuses(self):
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(dict(VALID_REQUEST, bogus_field=1))
+
+    def test_missing_required_identity_fields(self):
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request({})
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request({"request_schema": routing.REQUEST_SCHEMA})
+
+    def test_task_positive_integer_and_bool_rejection(self):
+        normalized = routing.validate_request(dict(VALID_REQUEST, task=42))
+        self.assertEqual(normalized["task"], 42)
+        normalized = routing.validate_request(dict(VALID_REQUEST, task=ids.MAX_ID))
+        self.assertEqual(normalized["task"], ids.MAX_ID)
+        for bad in (0, -1, True, False, 1.5, "5", ids.MAX_ID + 1, None):
+            with self.assertRaises(routing.RoutingRequestError):
+                routing.validate_request(dict(VALID_REQUEST, task=bad))
+
+    def test_project_slug_validation(self):
+        normalized = routing.validate_request(dict(VALID_REQUEST, project="demo-project"))
+        self.assertEqual(normalized["project"], "demo-project")
+        normalized = routing.validate_request(dict(VALID_REQUEST, project="a" * 64))
+        self.assertEqual(normalized["project"], "a" * 64)
+        for bad in ("Bad Slug", "UP", "a" * 65, "", 5, None, "proj\n"):
+            with self.assertRaises(routing.RoutingRequestError):
+                routing.validate_request(dict(VALID_REQUEST, project=bad))
+
+    def test_pattern_bound_requirement_arrays_minimum_and_maximum(self):
+        cases = {
+            "task_families": "fam.a",
+            "capabilities": "cap.a",
+            "skills": "skill.a",
+            "tools": "tool.a",
+        }
+        for field, prefix in cases.items():
+            with self.subTest(field=field):
+                with self.assertRaises(routing.RoutingRequestError):
+                    routing.validate_request(dict(VALID_REQUEST, **{field: []}))
+                too_many = [f"{prefix}{i}" for i in range(17)]
+                with self.assertRaises(routing.RoutingRequestError):
+                    routing.validate_request(dict(VALID_REQUEST, **{field: too_many}))
+                exactly_16 = [f"{prefix}{i}" for i in range(16)]
+                normalized = routing.validate_request(
+                    dict(VALID_REQUEST, **{field: exactly_16})
+                )
+                self.assertEqual(len(normalized[field]), 16)
+
+    def test_vocabulary_bound_requirement_arrays_minimum_and_maximum(self):
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(dict(VALID_REQUEST, evidence_kinds=[]))
+        normalized = routing.validate_request(
+            dict(VALID_REQUEST, evidence_kinds=list(models.EVIDENCE_KINDS))
+        )
+        self.assertEqual(len(normalized["evidence_kinds"]), len(models.EVIDENCE_KINDS))
+
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(dict(VALID_REQUEST, required_autonomy=[]))
+        normalized = routing.validate_request(
+            dict(VALID_REQUEST, required_autonomy=list(models.AGENT_AUTONOMY_LEVELS))
+        )
+        self.assertEqual(
+            len(normalized["required_autonomy"]), len(models.AGENT_AUTONOMY_LEVELS)
+        )
+
+    def test_duplicate_refusal_before_sorting(self):
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(
+                dict(VALID_REQUEST, capabilities=["b.cap", "a.cap", "a.cap"])
+            )
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(
+                dict(VALID_REQUEST, required_autonomy=["scoped", "scoped"])
+            )
+
+    def test_canonical_code_point_sorting(self):
+        normalized = routing.validate_request(
+            dict(VALID_REQUEST, capabilities=["cap.zz", "cap.aa", "cap.ab"])
+        )
+        self.assertEqual(
+            normalized["capabilities"], ("cap.aa", "cap.ab", "cap.zz")
+        )
+        normalized = routing.validate_request(
+            dict(VALID_REQUEST, required_autonomy=["suggest", "declare_only"])
+        )
+        self.assertEqual(normalized["required_autonomy"], ("declare_only", "suggest"))
+
+    def test_no_case_folding(self):
+        normalized = routing.validate_request(
+            dict(VALID_REQUEST, preferred_agent="Alpha-Agent")
+        )
+        self.assertEqual(normalized["preferred_agent"], "Alpha-Agent")
+        source = (REPO_ROOT / "agentic_os" / "routing.py").read_text(encoding="utf-8")
+        for token in (".lower(", ".upper(", ".casefold("):
+            self.assertNotIn(token, source)
+
+    def test_no_unicode_normalization(self):
+        # NFD-composed accented input to an ASCII-anchored field must be
+        # flatly refused, never silently normalized into an accepted form.
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(
+                dict(VALID_REQUEST, preferred_agent="café-agent")
+            )
+        source = (REPO_ROOT / "agentic_os" / "routing.py").read_text(encoding="utf-8")
+        self.assertNotIn("unicodedata", source)
+        self.assertNotIn(".normalize(", source)
+
+    def test_closed_enum_fields_reject_unknown_values(self):
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(dict(VALID_REQUEST, required_scope="cosmic"))
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(
+                dict(VALID_REQUEST, required_agent_class="cosmic")
+            )
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(
+                dict(VALID_REQUEST, evidence_kinds=["not_a_real_kind"])
+            )
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(
+                dict(VALID_REQUEST, required_data_classification="cosmic")
+            )
+        for scope in models.AGENT_SCOPES:
+            self.assertEqual(
+                routing.validate_request(dict(VALID_REQUEST, required_scope=scope))[
+                    "required_scope"
+                ],
+                scope,
+            )
+        for cls in models.AGENT_CLASSES:
+            self.assertEqual(
+                routing.validate_request(
+                    dict(VALID_REQUEST, required_agent_class=cls)
+                )["required_agent_class"],
+                cls,
+            )
+
+    def test_required_autonomy_membership_semantics(self):
+        normalized = routing.validate_request(
+            dict(VALID_REQUEST, required_autonomy=["scoped", "supervised"])
+        )
+        self.assertEqual(normalized["required_autonomy"], ("scoped", "supervised"))
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(
+                dict(VALID_REQUEST, required_autonomy=["not_a_level"])
+            )
+
+    def test_no_autonomy_rank_helper(self):
+        self.assertFalse(hasattr(routing, "autonomy_rank"))
+        autonomy_symbols = [n for n in dir(routing) if "autonomy" in n.lower()]
+        self.assertEqual(autonomy_symbols, [])
+        source = (REPO_ROOT / "agentic_os" / "routing.py").read_text(encoding="utf-8")
+        self.assertNotIn("autonomy_rank", source)
+
+    def test_required_data_classification_membership_semantics(self):
+        for level in models.MEMORY_SENSITIVITIES:
+            normalized = routing.validate_request(
+                dict(VALID_REQUEST, required_data_classification=level)
+            )
+            self.assertEqual(normalized["required_data_classification"], level)
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(
+                dict(VALID_REQUEST, required_data_classification="not_a_level")
+            )
+
+    def test_model_capabilities_closed_keys(self):
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(
+                dict(VALID_REQUEST, model_capabilities={"temperature": 0.5})
+            )
+        normalized = routing.validate_request(
+            dict(VALID_REQUEST, model_capabilities={"min_context_tokens": 1000})
+        )
+        self.assertEqual(
+            normalized["model_capabilities"], {"min_context_tokens": 1000}
+        )
+
+    def test_model_capabilities_requires_one_key(self):
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(dict(VALID_REQUEST, model_capabilities={}))
+
+    def test_min_context_tokens_bounds_and_bool_rejection(self):
+        normalized = routing.validate_request(
+            dict(VALID_REQUEST, model_capabilities={"min_context_tokens": 1})
+        )
+        self.assertEqual(normalized["model_capabilities"]["min_context_tokens"], 1)
+        normalized = routing.validate_request(
+            dict(
+                VALID_REQUEST,
+                model_capabilities={"min_context_tokens": 99_999_999},
+            )
+        )
+        self.assertEqual(
+            normalized["model_capabilities"]["min_context_tokens"], 99_999_999
+        )
+        for bad in (0, -1, 100_000_000, True, 1.5, "1000"):
+            with self.assertRaises(routing.RoutingRequestError):
+                routing.validate_request(
+                    dict(VALID_REQUEST, model_capabilities={"min_context_tokens": bad})
+                )
+
+    def test_modalities_vocabulary_bounds_duplicates_and_sorting(self):
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(
+                dict(VALID_REQUEST, model_capabilities={"modalities": []})
+            )
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(
+                dict(
+                    VALID_REQUEST,
+                    model_capabilities={"modalities": ["text", "text"]},
+                )
+            )
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(
+                dict(
+                    VALID_REQUEST,
+                    model_capabilities={"modalities": ["not_a_modality"]},
+                )
+            )
+        normalized = routing.validate_request(
+            dict(
+                VALID_REQUEST,
+                model_capabilities={"modalities": ["image", "code", "audio", "text"]},
+            )
+        )
+        self.assertEqual(
+            normalized["model_capabilities"]["modalities"],
+            ("audio", "code", "image", "text"),
+        )
+
+    def test_defaults(self):
+        normalized = routing.validate_request(dict(VALID_REQUEST))
+        self.assertEqual(normalized["scope_preference"], "specific_first")
+        self.assertEqual(normalized["surplus_policy"], "minimal")
+        self.assertEqual(normalized["max_candidates"], 5)
+        self.assertIs(normalized["include_diagnostics"], True)
+        # Spelled out explicitly, the defaults normalize identically.
+        explicit = routing.validate_request(
+            dict(
+                VALID_REQUEST,
+                scope_preference="specific_first",
+                surplus_policy="minimal",
+                max_candidates=5,
+                include_diagnostics=True,
+            )
+        )
+        self.assertEqual(normalized, explicit)
+
+    def test_empty_requirement_arrays_refuse(self):
+        for field in (
+            "task_families",
+            "capabilities",
+            "evidence_kinds",
+            "required_autonomy",
+            "skills",
+            "tools",
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(routing.RoutingRequestError):
+                    routing.validate_request(dict(VALID_REQUEST, **{field: []}))
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(
+                dict(VALID_REQUEST, model_capabilities={"modalities": []})
+            )
+
+    def test_forbidden_prose_keys_refuse(self):
+        for key in (
+            "prompt",
+            "instructions",
+            "credentials",
+            "provider",
+            "objective",
+            "secret",
+            "tool_arguments",
+            "actor",
+            "created_at",
+        ):
+            with self.subTest(key=key):
+                with self.assertRaises(routing.RoutingRequestError):
+                    routing.validate_request(dict(VALID_REQUEST, **{key: "anything"}))
+
+
+# ---------------------------------------------------------------------------
+# CANONICALIZATION AND DIGEST (tests 23-29)
+
+class CanonicalizationAndDigestTests(unittest.TestCase):
+    def test_equivalent_key_order_identical_bytes(self):
+        raw_a = {
+            "request_schema": routing.REQUEST_SCHEMA,
+            "algorithm_version": routing.ALGORITHM_VERSION,
+            "capabilities": ["a.cap"],
+            "task": 5,
+        }
+        raw_b = {
+            "task": 5,
+            "capabilities": ["a.cap"],
+            "algorithm_version": routing.ALGORITHM_VERSION,
+            "request_schema": routing.REQUEST_SCHEMA,
+        }
+        bytes_a = routing.canonicalize_request(routing.validate_request(raw_a))
+        bytes_b = routing.canonicalize_request(routing.validate_request(raw_b))
+        self.assertEqual(bytes_a, bytes_b)
+        self.assertEqual(routing.request_digest(routing.validate_request(raw_a)),
+                          routing.request_digest(routing.validate_request(raw_b)))
+
+    def test_equivalent_array_order_identical_bytes(self):
+        normalized_a = routing.validate_request(
+            dict(VALID_REQUEST, capabilities=["b.cap", "a.cap"])
+        )
+        normalized_b = routing.validate_request(
+            dict(VALID_REQUEST, capabilities=["a.cap", "b.cap"])
+        )
+        self.assertEqual(
+            routing.canonicalize_request(normalized_a),
+            routing.canonicalize_request(normalized_b),
+        )
+
+    def test_canonical_round_trip_through_existing_parser(self):
+        normalized = routing.validate_request(
+            dict(VALID_REQUEST, capabilities=["b.cap", "a.cap"], task=7)
+        )
+        canonical = routing.canonicalize_request(normalized)
+        parsed = protocols.parse_canonical(canonical)
+        self.assertEqual(protocols.serialize_canonical(parsed), canonical)
+        self.assertEqual(parsed["task"], 7)
+        self.assertEqual(parsed["capabilities"], ["a.cap", "b.cap"])
+
+    def test_digest_is_lowercase_64_hex_sha256(self):
+        normalized = routing.validate_request(dict(VALID_REQUEST))
+        digest = routing.request_digest(normalized)
+        self.assertEqual(len(digest), 64)
+        self.assertTrue(all(c in "0123456789abcdef" for c in digest))
+        expected = hashlib.sha256(
+            protocols.serialize_canonical(normalized)
+        ).hexdigest()
+        self.assertEqual(digest, expected)
+
+    def test_semantic_change_alters_bytes_and_digest(self):
+        base = routing.validate_request(dict(VALID_REQUEST, capabilities=["a.cap"]))
+        changed = routing.validate_request(dict(VALID_REQUEST, capabilities=["b.cap"]))
+        self.assertNotEqual(
+            routing.canonicalize_request(base), routing.canonicalize_request(changed)
+        )
+        self.assertNotEqual(
+            routing.request_digest(base), routing.request_digest(changed)
+        )
+
+    def test_no_actor_time_workspace_facts_in_request(self):
+        for key in ("actor", "created_at", "workspace_id", "row_id", "db_id"):
+            self.assertNotIn(key, routing._ALLOWED_REQUEST_KEYS)
+            with self.assertRaises(routing.RoutingRequestError):
+                routing.validate_request(dict(VALID_REQUEST, **{key: "x"}))
+
+    def test_validate_request_does_not_mutate_input(self):
+        raw_list = ["b.cap", "a.cap"]
+        raw = dict(VALID_REQUEST, capabilities=raw_list)
+        before = copy.deepcopy(raw)
+        routing.validate_request(raw)
+        self.assertEqual(raw, before)
+        self.assertEqual(raw_list, ["b.cap", "a.cap"])
+
+
+# ---------------------------------------------------------------------------
+# BASE ELIGIBILITY (tests 30-40)
+
+class BaseEligibilityTests(unittest.TestCase):
+    def test_active_valid_current_passport_is_eligible(self):
+        result = routing.evaluate_candidate(_request(), _snapshot())
+        self.assertEqual(result.verdict, "eligible")
+        self.assertEqual(result.reasons, ())
+        self.assertEqual(result.warnings, ())
+
+    def test_identity_tampered(self):
+        result = routing.evaluate_candidate(
+            _request(), _snapshot(identity_integrity="mismatch")
+        )
+        self.assertEqual(result.verdict, "excluded")
+        self.assertEqual(result.reasons, ("identity_tampered",))
+
+    def test_passport_history_tampered(self):
+        result = routing.evaluate_candidate(
+            _request(), _snapshot(history_problems=("v1: mismatch",))
+        )
+        self.assertEqual(result.verdict, "excluded")
+        self.assertEqual(result.reasons, ("passport_history_tampered",))
+
+    def test_draft_only(self):
+        agent = _routing_agent(lifecycle="draft")
+        result = routing.evaluate_candidate(_request(), _snapshot(agent=agent))
+        self.assertEqual(result.verdict, "excluded")
+        self.assertEqual(result.reasons, ("draft_only",))
+
+    def test_suspended(self):
+        agent = _routing_agent(lifecycle="suspended")
+        result = routing.evaluate_candidate(_request(), _snapshot(agent=agent))
+        self.assertEqual(result.verdict, "excluded")
+        self.assertEqual(result.reasons, ("suspended",))
+
+    def test_archived(self):
+        agent = _routing_agent(lifecycle="archived")
+        result = routing.evaluate_candidate(_request(), _snapshot(agent=agent))
+        self.assertEqual(result.verdict, "excluded")
+        self.assertEqual(result.reasons, ("archived",))
+
+    def test_revoked(self):
+        agent = _routing_agent(lifecycle="revoked")
+        result = routing.evaluate_candidate(_request(), _snapshot(agent=agent))
+        self.assertEqual(result.verdict, "excluded")
+        self.assertEqual(result.reasons, ("revoked",))
+
+    def test_legacy_without_passport(self):
+        agent = _routing_agent(origin="legacy", current_passport_version=None)
+        result = routing.evaluate_candidate(
+            _request(), _snapshot(agent=agent, current_passport=None)
+        )
+        self.assertEqual(result.verdict, "excluded")
+        self.assertEqual(result.reasons, ("legacy_without_passport",))
+
+    def test_no_current_published_passport(self):
+        agent = _routing_agent(current_passport_version=None)
+        result = routing.evaluate_candidate(
+            _request(), _snapshot(agent=agent, current_passport=None)
+        )
+        self.assertEqual(result.verdict, "excluded")
+        self.assertEqual(result.reasons, ("no_current_published_passport",))
+
+    def test_multiple_base_reasons_in_canonical_order(self):
+        agent = _routing_agent(
+            lifecycle="suspended", origin="legacy", current_passport_version=None
+        )
+        result = routing.evaluate_candidate(
+            _request(),
+            _snapshot(
+                agent=agent, identity_integrity="mismatch", current_passport=None
+            ),
+        )
+        self.assertEqual(result.verdict, "excluded")
+        self.assertEqual(
+            result.reasons,
+            ("identity_tampered", "suspended", "legacy_without_passport"),
+        )
+
+    def test_hard_reason_precedence_over_unresolved(self):
+        agent = _routing_agent(lifecycle="suspended")
+        passport = _routing_passport(document=b"\x00not text or json")
+        result = routing.evaluate_candidate(
+            _request(), _snapshot(agent=agent, current_passport=passport)
+        )
+        self.assertEqual(result.verdict, "excluded")
+        self.assertIn("suspended", result.reasons)
+        self.assertIn("malformed_declaration", result.reasons)
+
+
+# ---------------------------------------------------------------------------
+# REQUIREMENT ELIGIBILITY (tests 41-55)
+
+class RequirementEligibilityTests(unittest.TestCase):
+    def test_project_match_and_mismatch(self):
+        agent = _routing_agent(scope="project", project_id=1)
+        matching = _snapshot(agent=agent, project_slug="demo")
+        result = routing.evaluate_candidate(_request(project="demo"), matching)
+        self.assertEqual(result.verdict, "eligible")
+
+        mismatched = _snapshot(agent=agent, project_slug="other")
+        result = routing.evaluate_candidate(_request(project="demo"), mismatched)
+        self.assertEqual(result.verdict, "excluded")
+        self.assertIn("project_mismatch", result.reasons)
+
+    def test_required_scope_both_directions(self):
+        global_agent = _snapshot(agent=_routing_agent(scope="global"))
+        result = routing.evaluate_candidate(
+            _request(required_scope="project"), global_agent
+        )
+        self.assertIn("scope_mismatch", result.reasons)
+
+        project_agent = _snapshot(
+            agent=_routing_agent(scope="project", project_id=1), project_slug="demo"
+        )
+        result = routing.evaluate_candidate(
+            _request(required_scope="global"), project_agent
+        )
+        self.assertIn("scope_mismatch", result.reasons)
+
+        result = routing.evaluate_candidate(
+            _request(required_scope="global"), global_agent
+        )
+        self.assertNotIn("scope_mismatch", result.reasons)
+
+    def test_agent_class_match_and_mismatch(self):
+        agent = _routing_agent(agent_class="specialist")
+        snap = _snapshot(agent=agent)
+        result = routing.evaluate_candidate(
+            _request(required_agent_class="specialist"), snap
+        )
+        self.assertNotIn("agent_class_mismatch", result.reasons)
+        result = routing.evaluate_candidate(
+            _request(required_agent_class="custom"), snap
+        )
+        self.assertIn("agent_class_mismatch", result.reasons)
+
+    def test_data_classification_declared_absent_lacking_containing(self):
+        absent = _snapshot(
+            current_passport=_routing_passport(
+                document=_passport_document_text(data_classifications=None) or None
+            )
+        )
+        # Build a document with the key entirely omitted.
+        doc = _passport_document()
+        del doc["data_classifications"]
+        absent = _snapshot(
+            current_passport=_routing_passport(
+                document=protocols.serialize_canonical(doc).decode("utf-8")
+            )
+        )
+        result = routing.evaluate_candidate(
+            _request(required_data_classification="internal"), absent
+        )
+        self.assertIn("data_classification_mismatch", result.reasons)
+        self.assertEqual(
+            result.diagnostics["data_classification"], {"declared": False}
+        )
+
+        lacking = _snapshot(
+            current_passport=_routing_passport(
+                document=_passport_document_text(data_classifications=["public"])
+            )
+        )
+        result = routing.evaluate_candidate(
+            _request(required_data_classification="confidential"), lacking
+        )
+        self.assertIn("data_classification_mismatch", result.reasons)
+        self.assertEqual(
+            result.diagnostics["data_classification"], {"declared": True}
+        )
+        # Membership, never a ceiling: declaring only "confidential" excludes
+        # an "internal" request even though "confidential" sounds "higher".
+        only_confidential = _snapshot(
+            current_passport=_routing_passport(
+                document=_passport_document_text(data_classifications=["confidential"])
+            )
+        )
+        result = routing.evaluate_candidate(
+            _request(required_data_classification="internal"), only_confidential
+        )
+        self.assertIn("data_classification_mismatch", result.reasons)
+
+        containing = _snapshot(
+            current_passport=_routing_passport(
+                document=_passport_document_text(
+                    data_classifications=["public", "internal"]
+                )
+            )
+        )
+        result = routing.evaluate_candidate(
+            _request(required_data_classification="internal"), containing
+        )
+        self.assertNotIn("data_classification_mismatch", result.reasons)
+        self.assertEqual(result.verdict, "eligible")
+
+    def test_autonomy_exact_membership(self):
+        snap = _snapshot(
+            current_passport=_routing_passport(
+                document=_passport_document_text(autonomy="scoped")
+            )
+        )
+        result = routing.evaluate_candidate(
+            _request(required_autonomy=["scoped"]), snap
+        )
+        self.assertEqual(result.verdict, "eligible")
+        result = routing.evaluate_candidate(
+            _request(required_autonomy=["suggest"]), snap
+        )
+        self.assertIn("autonomy_mismatch", result.reasons)
+
+    def test_task_family_subset_and_miss(self):
+        snap = _snapshot(
+            current_passport=_routing_passport(
+                document=_passport_document_text(
+                    task_families=["build.code", "build.research"]
+                )
+            )
+        )
+        result = routing.evaluate_candidate(
+            _request(task_families=["build.code"]), snap
+        )
+        self.assertNotIn("missing_task_family", result.reasons)
+        result = routing.evaluate_candidate(
+            _request(task_families=["build.code", "build.writing"]), snap
+        )
+        self.assertIn("missing_task_family", result.reasons)
+        self.assertEqual(
+            result.diagnostics["task_families"],
+            {"declared": True, "requested_count": 2, "missing_count": 1},
+        )
+
+    def test_capability_subset_and_miss(self):
+        snap = _snapshot()
+        result = routing.evaluate_candidate(_request(capabilities=["cap.write"]), snap)
+        self.assertNotIn("missing_capability", result.reasons)
+        result = routing.evaluate_candidate(_request(capabilities=["cap.nope"]), snap)
+        self.assertIn("missing_capability", result.reasons)
+
+    def test_evidence_kind_subset_and_miss(self):
+        snap = _snapshot()
+        result = routing.evaluate_candidate(_request(evidence_kinds=["file"]), snap)
+        self.assertNotIn("missing_evidence_kind", result.reasons)
+        result = routing.evaluate_candidate(_request(evidence_kinds=["commit"]), snap)
+        self.assertIn("missing_evidence_kind", result.reasons)
+
+    def test_skill_byte_exact_subset_and_miss(self):
+        snap = _snapshot(
+            current_passport=_routing_passport(
+                document=_passport_document_text(
+                    skill_requirements=["skill.python/v2"]
+                )
+            )
+        )
+        result = routing.evaluate_candidate(
+            _request(skills=["skill.python/v2"]), snap
+        )
+        self.assertNotIn("missing_skill_declaration", result.reasons)
+        # Byte-exact: the unversioned spelling does not match the pinned one.
+        result = routing.evaluate_candidate(_request(skills=["skill.python"]), snap)
+        self.assertIn("missing_skill_declaration", result.reasons)
+
+    def test_tool_byte_exact_subset_and_miss(self):
+        snap = _snapshot()
+        result = routing.evaluate_candidate(_request(tools=["tool.git"]), snap)
+        self.assertNotIn("missing_tool_declaration", result.reasons)
+        result = routing.evaluate_candidate(_request(tools=["tool.docker"]), snap)
+        self.assertIn("missing_tool_declaration", result.reasons)
+
+    def test_model_context_threshold(self):
+        snap = _snapshot()  # declares min_context_tokens=50000
+        result = routing.evaluate_candidate(
+            _request(model_capabilities={"min_context_tokens": 40000}), snap
+        )
+        self.assertNotIn("missing_model_capability", result.reasons)
+        result = routing.evaluate_candidate(
+            _request(model_capabilities={"min_context_tokens": 60000}), snap
+        )
+        self.assertIn("missing_model_capability", result.reasons)
+
+    def test_model_modality_subset(self):
+        snap = _snapshot()  # declares modalities=["text"]
+        result = routing.evaluate_candidate(
+            _request(model_capabilities={"modalities": ["text"]}), snap
+        )
+        self.assertNotIn("missing_model_capability", result.reasons)
+        result = routing.evaluate_candidate(
+            _request(model_capabilities={"modalities": ["text", "code"]}), snap
+        )
+        self.assertIn("missing_model_capability", result.reasons)
+
+    def test_absent_model_declaration(self):
+        doc = _passport_document()
+        del doc["model_requirements"]
+        snap = _snapshot(
+            current_passport=_routing_passport(
+                document=protocols.serialize_canonical(doc).decode("utf-8")
+            )
+        )
+        result = routing.evaluate_candidate(
+            _request(model_capabilities={"min_context_tokens": 1}), snap
+        )
+        self.assertIn("missing_model_capability", result.reasons)
+        self.assertEqual(
+            result.diagnostics["model_capabilities"]["declared"], False
+        )
+
+    def test_preferred_agent_mismatch_remains_eligible(self):
+        result = routing.evaluate_candidate(
+            _request(preferred_agent="someone-else"), _snapshot()
+        )
+        self.assertEqual(result.verdict, "eligible")
+        self.assertEqual(result.reasons, ("preferred_agent_mismatch",))
+
+    def test_absent_optional_dimensions_are_neutral(self):
+        result = routing.evaluate_candidate(_request(), _snapshot())
+        self.assertEqual(result.verdict, "eligible")
+        self.assertEqual(result.reasons, ())
+        self.assertEqual(result.warnings, ())
+
+
+# ---------------------------------------------------------------------------
+# MALFORMED AND UNKNOWN (tests 56-60)
+
+class MalformedAndUnknownTests(unittest.TestCase):
+    def test_malformed_consulted_declaration_is_unresolved(self):
+        doc = _passport_document(capabilities="not-an-array")
+        snap = _snapshot(
+            current_passport=_routing_passport(
+                document=protocols.serialize_canonical(doc).decode("utf-8")
+            )
+        )
+        result = routing.evaluate_candidate(_request(capabilities=["cap.write"]), snap)
+        self.assertEqual(result.verdict, "unresolved")
+        self.assertEqual(result.reasons, ("malformed_declaration",))
+
+    def test_unknown_consulted_vocabulary_is_unresolved(self):
+        doc = _passport_document(autonomy="from_the_future")
+        snap = _snapshot(
+            current_passport=_routing_passport(
+                document=protocols.serialize_canonical(doc).decode("utf-8")
+            )
+        )
+        result = routing.evaluate_candidate(
+            _request(required_autonomy=["scoped"]), snap
+        )
+        self.assertEqual(result.verdict, "unresolved")
+        self.assertEqual(result.reasons, ("unknown_declaration_value",))
+
+    def test_raw_malformed_value_never_appears_in_diagnostic(self):
+        secret_shaped = "AKIA" + "Q" * 16
+        doc = _passport_document(task_families=secret_shaped)
+        snap = _snapshot(
+            current_passport=_routing_passport(
+                document=protocols.serialize_canonical(doc).decode("utf-8")
+            )
+        )
+        result = routing.evaluate_candidate(
+            _request(task_families=["build.code"]), snap
+        )
+        self.assertEqual(result.verdict, "unresolved")
+        self.assertNotIn(secret_shaped, repr(result.diagnostics))
+        self.assertNotIn(secret_shaped, repr(result.reasons))
+        self.assertNotIn(secret_shaped, repr(result.warnings))
+
+    def test_malformed_with_hard_lifecycle_reason_remains_excluded(self):
+        agent = _routing_agent(lifecycle="archived")
+        passport = _routing_passport(document=12345)
+        result = routing.evaluate_candidate(
+            _request(), _snapshot(agent=agent, current_passport=passport)
+        )
+        self.assertEqual(result.verdict, "excluded")
+        self.assertIn("archived", result.reasons)
+        self.assertIn("malformed_declaration", result.reasons)
+
+    def test_blob_like_or_non_text_document_produces_closed_result(self):
+        for bad_document in (b"\x00\x01binary", 12345, None, ["not", "text"], {}):
+            with self.subTest(bad_document=repr(bad_document)[:20]):
+                passport = _routing_passport(document=bad_document)
+                snap = _snapshot(current_passport=passport)
+                result = routing.evaluate_candidate(_request(), snap)
+                self.assertEqual(result.verdict, "unresolved")
+                self.assertEqual(result.reasons, ("malformed_declaration",))
+
+
+# ---------------------------------------------------------------------------
+# WARNINGS AND PARITY (tests 61-70)
+
+class WarningsAndParityTests(unittest.TestCase):
+    def test_passport_expired_warning_only(self):
+        doc = _passport_document(expires_at="2025-01-01T00:00:00Z")
+        snap = _snapshot(
+            current_passport=_routing_passport(
+                document=protocols.serialize_canonical(doc).decode("utf-8")
+            )
+        )
+        result = routing.evaluate_candidate(
+            _request(), snap, now="2026-01-01T00:00:00Z"
+        )
+        self.assertEqual(result.verdict, "eligible")
+        self.assertEqual(result.warnings, ("passport_expired",))
+        self.assertEqual(result.reasons, ())
+        # No comparison instant supplied: no warning is fabricated.
+        result_no_now = routing.evaluate_candidate(_request(), snap)
+        self.assertEqual(result_no_now.warnings, ())
+
+    def test_catalog_upgrade_available_warning_only(self):
+        snap = _snapshot(catalog_upgrade_available=True)
+        result = routing.evaluate_candidate(_request(), snap)
+        self.assertEqual(result.verdict, "eligible")
+        self.assertEqual(result.warnings, ("catalog_upgrade_available",))
+        self.assertEqual(result.reasons, ())
+
+    def test_warning_with_eligible_verdict(self):
+        snap = _snapshot(catalog_upgrade_available=True)
+        result = routing.evaluate_candidate(_request(), snap)
+        self.assertEqual(result.verdict, "eligible")
+        self.assertTrue(result.warnings)
+
+    def test_warning_with_excluded_verdict(self):
+        agent = _routing_agent(lifecycle="suspended")
+        snap = _snapshot(agent=agent, catalog_upgrade_available=True)
+        result = routing.evaluate_candidate(_request(), snap)
+        self.assertEqual(result.verdict, "excluded")
+        self.assertEqual(result.warnings, ("catalog_upgrade_available",))
+        self.assertIn("suspended", result.reasons)
+
+    def test_custom_and_catalog_equivalent_candidates_identical_outcome(self):
+        custom_agent = _routing_agent(
+            id=1, name="custom-agent", origin="create", owner="human"
+        )
+        catalog_agent = _routing_agent(
+            id=2, name="aos.catalog-agent", origin="import", owner="system"
+        )
+        custom_doc = _passport_document(agent="custom-agent")
+        catalog_doc = _passport_document(agent="aos.catalog-agent")
+        custom_snap = _snapshot(
+            agent=custom_agent,
+            current_passport=_routing_passport(
+                agent_id=1,
+                document=protocols.serialize_canonical(custom_doc).decode("utf-8"),
+            ),
+        )
+        catalog_snap = _snapshot(
+            agent=catalog_agent,
+            current_passport=_routing_passport(
+                agent_id=2,
+                document=protocols.serialize_canonical(catalog_doc).decode("utf-8"),
+            ),
+        )
+        req = _request(capabilities=["cap.write"])
+        custom_result = routing.evaluate_candidate(req, custom_snap)
+        catalog_result = routing.evaluate_candidate(req, catalog_snap)
+        self.assertEqual(custom_result.verdict, catalog_result.verdict)
+        self.assertEqual(custom_result.reasons, catalog_result.reasons)
+        self.assertEqual(custom_result.warnings, catalog_result.warnings)
+
+    def test_owner_protected_system_catalog_provenance_have_no_effect(self):
+        req = _request(capabilities=["cap.write"])
+        variants = [
+            dict(owner="human", protected=0, origin="create"),
+            dict(owner="system", protected=1, origin="import"),
+        ]
+        outcomes = []
+        for variant in variants:
+            agent = _routing_agent(**variant)
+            outcomes.append(routing.evaluate_candidate(req, _snapshot(agent=agent)))
+        self.assertEqual(outcomes[0].verdict, outcomes[1].verdict)
+        self.assertEqual(outcomes[0].reasons, outcomes[1].reasons)
+        self.assertEqual(outcomes[0].warnings, outcomes[1].warnings)
+
+    def test_request_level_refusal_codes_never_appear_in_output(self):
+        result = routing.evaluate_candidate(_request(), _snapshot())
+        for code in models.ROUTING_REQUEST_REFUSAL_CODES:
+            self.assertNotIn(code, result.reasons)
+            self.assertNotIn(code, result.warnings)
+        agent = _routing_agent(current_passport_version=None)
+        result = routing.evaluate_candidate(
+            _request(), _snapshot(agent=agent, current_passport=None)
+        )
+        for code in models.ROUTING_REQUEST_REFUSAL_CODES:
+            self.assertNotIn(code, result.reasons)
+
+    def test_reasons_follow_canonical_order(self):
+        agent = _routing_agent(lifecycle="suspended")
+        result = routing.evaluate_candidate(
+            _request(capabilities=["cap.nope"]), _snapshot(agent=agent)
+        )
+        ordered = [c for c in models.ROUTING_REASON_CODES if c in result.reasons]
+        self.assertEqual(list(result.reasons), ordered)
+
+    def test_warnings_follow_canonical_order(self):
+        doc = _passport_document(expires_at="2025-01-01T00:00:00Z")
+        snap = _snapshot(
+            current_passport=_routing_passport(
+                document=protocols.serialize_canonical(doc).decode("utf-8")
+            ),
+            catalog_upgrade_available=True,
+        )
+        result = routing.evaluate_candidate(
+            _request(), snap, now="2026-01-01T00:00:00Z"
+        )
+        self.assertEqual(
+            result.warnings, ("passport_expired", "catalog_upgrade_available")
+        )
+
+    def test_render_reason_summary_truncates_at_8_while_result_retains_all(self):
+        many_codes = [
+            "identity_tampered",
+            "passport_history_tampered",
+            "draft_only",
+            "suspended",
+            "archived",
+            "revoked",
+            "legacy_without_passport",
+            "no_current_published_passport",
+            "project_mismatch",
+        ]
+        self.assertEqual(len(many_codes), 9)
+        summary = routing.render_reason_summary(many_codes)
+        self.assertIn("(+1 more)", summary)
+        shown = summary.split(" (+")[0].split(", ")
+        self.assertEqual(len(shown), models.ROUTING_REASON_DISPLAY_LIMIT)
+        # The value/JSON-shaped result keeps every code, never truncated.
+        self.assertEqual(len(many_codes), 9)
+
+    def test_render_reason_summary_no_truncation_under_limit(self):
+        codes = ["suspended", "missing_capability"]
+        self.assertEqual(
+            routing.render_reason_summary(codes), "suspended, missing_capability"
+        )
+
+
+# ---------------------------------------------------------------------------
+# PURITY (tests 71-75)
+
+class PurityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (REPO_ROOT / "agentic_os" / "routing.py").read_text(
+            encoding="utf-8"
+        )
+
+    def test_routing_module_does_not_import_db(self):
+        self.assertNotIn("import db", self.source)
+        self.assertFalse(hasattr(routing, "db"))
+
+    def test_no_sqlite_connection_or_sql_operation(self):
+        forbidden = (
+            "sqlite3.connect(",
+            "conn.execute(",
+            ".cursor(",
+            "SELECT ",
+            "INSERT ",
+            "UPDATE ",
+            "DELETE ",
+            "db.transaction(",
+        )
+        for token in forbidden:
+            with self.subTest(token=token):
+                self.assertNotIn(token, self.source)
+
+    def test_no_filesystem_network_subprocess_provider_or_event_behavior(self):
+        forbidden = (
+            "subprocess.",
+            "socket.",
+            "requests.",
+            "urllib.",
+            "events.emit(",
+            "open(",
+            "Path(",
+            "os.system(",
+        )
+        for token in forbidden:
+            with self.subTest(token=token):
+                self.assertNotIn(token, self.source)
+
+    def test_evaluate_candidate_does_not_mutate_inputs(self):
+        request = _request(capabilities=["cap.write"], task_families=["build.code"])
+        request_before = copy.deepcopy(request)
+        candidate = _snapshot()
+        agent_before = dict(candidate.agent.as_dict())
+        routing.evaluate_candidate(request, candidate)
+        self.assertEqual(request, request_before)
+        self.assertEqual(candidate.agent.as_dict(), agent_before)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            candidate.identity_integrity = "mismatch"
+
+    def test_repeated_evaluation_is_byte_value_identical(self):
+        request = _request(capabilities=["cap.write"])
+        candidate = _snapshot()
+        first = routing.evaluate_candidate(request, candidate)
+        second = routing.evaluate_candidate(request, candidate)
+        self.assertEqual(first, second)
+        self.assertEqual(dict(first.diagnostics), dict(second.diagnostics))
+
+
+# ---------------------------------------------------------------------------
+# U-A3 Wave 2 CONTRACT CORRECTIONS
+#
+# Defect one — global declaration validation: every routing-relevant passport
+# declaration PRESENT in the candidate's document is judged for structural
+# validity BEFORE any request-specific gate, even when the request never
+# constrains that dimension. An impossible type/shape yields
+# `malformed_declaration`; a valid value outside this build's closed vocabulary
+# yields `unknown_declaration_value`; either makes the candidate `unresolved`
+# unless a hard-ineligible reason also applies (precedence unchanged).
+#
+# Defect two — JSON-compatible diagnostics: `EligibilityResult.diagnostics`
+# (and any public projection over the result) consists only of JSON-compatible
+# values, so `json.dumps` serializes it directly; the result is a value object
+# whose returned diagnostics dict aliases nothing the caller passed in.
+
+
+def _snapshot_with_document(doc: dict) -> routing.CandidateSnapshot:
+    """A default-eligible candidate whose passport carries exactly `doc`,
+    serialized through the real canonical serializer — the same bytes a stored
+    passport row would hold."""
+    return _snapshot(
+        current_passport=_routing_passport(
+            document=protocols.serialize_canonical(doc).decode("utf-8")
+        )
+    )
+
+
+class GlobalDeclarationValidationTests(unittest.TestCase):
+    """Defect one: unrequested routing-relevant declarations are validated."""
+
+    def _assert_unresolved_single(self, doc: dict, code: str):
+        # A bare request constrains no dimension, and the agent is otherwise
+        # fully eligible — so the ONE global structural defect is the only
+        # reason, proving validation fired without any request gate.
+        result = routing.evaluate_candidate(_request(), _snapshot_with_document(doc))
+        self.assertEqual(result.verdict, "unresolved")
+        self.assertEqual(result.reasons, (code,))
+        return result
+
+    def test_1_malformed_unrequested_task_families(self):
+        self._assert_unresolved_single(
+            _passport_document(task_families=5), "malformed_declaration"
+        )
+
+    def test_2_malformed_unrequested_capabilities(self):
+        # A non-string item inside an otherwise valid array.
+        self._assert_unresolved_single(
+            _passport_document(capabilities=[123]), "malformed_declaration"
+        )
+
+    def test_3_malformed_unrequested_evidence_expectations(self):
+        # An impossible shape: the declaration is not an object at all.
+        self._assert_unresolved_single(
+            _passport_document(evidence_expectations="not-an-object"),
+            "malformed_declaration",
+        )
+        # An impossible shape one level in: evidence_kinds is not an array.
+        self._assert_unresolved_single(
+            _passport_document(
+                evidence_expectations={"evidence_kinds": "file", "min_evidence_count": 1}
+            ),
+            "malformed_declaration",
+        )
+
+    def test_4_malformed_unrequested_data_classifications(self):
+        self._assert_unresolved_single(
+            _passport_document(data_classifications="internal"),
+            "malformed_declaration",
+        )
+
+    def test_5_unknown_unrequested_autonomy(self):
+        self._assert_unresolved_single(
+            _passport_document(autonomy="from_the_future"),
+            "unknown_declaration_value",
+        )
+
+    def test_6_malformed_unrequested_skill_requirements(self):
+        self._assert_unresolved_single(
+            _passport_document(skill_requirements=5), "malformed_declaration"
+        )
+
+    def test_7_malformed_unrequested_tool_requirements(self):
+        # The example verbatim: no tools requested, tool_requirements an integer.
+        self._assert_unresolved_single(
+            _passport_document(tool_requirements=5), "malformed_declaration"
+        )
+
+    def test_8_malformed_unrequested_model_requirements(self):
+        # The declaration is not an object.
+        self._assert_unresolved_single(
+            _passport_document(model_requirements=5), "malformed_declaration"
+        )
+
+    def test_9_unknown_unrequested_model_modality(self):
+        self._assert_unresolved_single(
+            _passport_document(
+                model_requirements={
+                    "min_context_tokens": 50000,
+                    "modalities": ["hologram"],
+                }
+            ),
+            "unknown_declaration_value",
+        )
+
+    def test_10_hard_lifecycle_plus_malformed_unrequested_declaration(self):
+        # A hard lifecycle reason AND a malformed UNREQUESTED declaration:
+        # precedence keeps the verdict excluded while both codes survive, in
+        # ROUTING_REASON_CODES canonical order (archived < malformed).
+        agent = _routing_agent(lifecycle="archived")
+        snap = _snapshot(
+            agent=agent,
+            current_passport=_routing_passport(
+                document=protocols.serialize_canonical(
+                    _passport_document(tool_requirements=5)
+                ).decode("utf-8")
+            ),
+        )
+        result = routing.evaluate_candidate(_request(), snap)
+        self.assertEqual(result.verdict, "excluded")
+        self.assertEqual(result.reasons, ("archived", "malformed_declaration"))
+        canonical = [c for c in models.ROUTING_REASON_CODES if c in result.reasons]
+        self.assertEqual(list(result.reasons), canonical)
+
+    def test_11_valid_unrequested_declarations_remain_neutral(self):
+        # The full, valid default passport under a bare request: the global pass
+        # finds nothing, so the candidate stays eligible with no reasons.
+        result = routing.evaluate_candidate(_request(), _snapshot())
+        self.assertEqual(result.verdict, "eligible")
+        self.assertEqual(result.reasons, ())
+        self.assertEqual(result.warnings, ())
+
+    def test_12_malformed_raw_value_absent_from_diagnostics_and_summary(self):
+        secret = "AKIA" + "Z" * 16  # a credential-shaped raw declaration value
+        result = self._assert_unresolved_single(
+            _passport_document(tool_requirements=secret), "malformed_declaration"
+        )
+        self.assertNotIn(secret, json.dumps(result.diagnostics))
+        self.assertNotIn(secret, repr(result.diagnostics))
+        self.assertNotIn(secret, routing.render_reason_summary(result.reasons))
+        self.assertNotIn(secret, repr(result.reasons))
+        self.assertNotIn(secret, repr(result.warnings))
+
+
+def _assert_json_value_tree(test: unittest.TestCase, value) -> None:
+    """Every node is a JSON-compatible scalar or a dict/list of the same — never
+    a MappingProxyType, set, bytes, exception, sqlite row, Agent, AgentPassport
+    or arbitrary document/object fragment."""
+    forbidden = (
+        MappingProxyType,
+        set,
+        frozenset,
+        bytes,
+        bytearray,
+        BaseException,
+        models.Agent,
+        models.AgentPassport,
+        routing.CandidateSnapshot,
+        routing.EligibilityResult,
+        sqlite3.Row,
+    )
+    test.assertNotIsInstance(value, forbidden)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            test.assertIsInstance(key, str)
+            _assert_json_value_tree(test, item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _assert_json_value_tree(test, item)
+    else:
+        test.assertIsInstance(value, (str, bool, int, type(None)))
+
+
+class JsonCompatibleDiagnosticsTests(unittest.TestCase):
+    """Defect two: diagnostics and the public projection are JSON-serializable."""
+
+    def _rich_result(self) -> routing.EligibilityResult:
+        # Consults every diagnostics-bearing dimension against the valid default
+        # passport, so the result is eligible with a fully populated diagnostics
+        # dict (lifecycle, passport_version and the per-dimension sub-objects).
+        request = _request(
+            capabilities=["cap.write"],
+            task_families=["build.code"],
+            skills=["skill.python"],
+            tools=["tool.git"],
+            evidence_kinds=["file"],
+            required_data_classification="internal",
+            model_capabilities={"min_context_tokens": 40000, "modalities": ["text"]},
+        )
+        result = routing.evaluate_candidate(request, _snapshot())
+        self.assertEqual(result.verdict, "eligible")
+        return result
+
+    @staticmethod
+    def _projection(result: routing.EligibilityResult) -> dict:
+        return {
+            "agent_name": result.agent_name,
+            "verdict": result.verdict,
+            "reasons": result.reasons,
+            "warnings": result.warnings,
+            "diagnostics": result.diagnostics,
+        }
+
+    def test_13_json_dumps_diagnostics_succeeds(self):
+        result = self._rich_result()
+        # The bug: json.dumps(MappingProxyType({...})) raised TypeError. It
+        # must now serialize directly, for both a rich and a minimal result.
+        json.dumps(result.diagnostics)
+        json.dumps(routing.evaluate_candidate(_request(), _snapshot()).diagnostics)
+        self.assertIsInstance(result.diagnostics, dict)
+        self.assertNotIsInstance(result.diagnostics, MappingProxyType)
+
+    def test_14_public_projection_serializes_directly(self):
+        projection = self._projection(self._rich_result())
+        self.assertEqual(
+            set(projection),
+            {"agent_name", "verdict", "reasons", "warnings", "diagnostics"},
+        )
+        encoded = json.dumps(projection)  # tuples serialize as JSON arrays
+        decoded = json.loads(encoded)
+        self.assertEqual(decoded["verdict"], "eligible")
+        self.assertEqual(decoded["reasons"], [])
+
+    def test_15_diagnostics_contain_only_json_compatible_values(self):
+        result = self._rich_result()
+        _assert_json_value_tree(self, result.diagnostics)
+        # No passport body fragment or requested/declared string leaked in.
+        serialized = json.dumps(result.diagnostics)
+        for prose in ("cap.write", "skill.python", "tool.git", "do stuff", "worker"):
+            self.assertNotIn(prose, serialized)
+
+    def test_16_repeated_evaluation_yields_value_equal_projections(self):
+        request = _request(capabilities=["cap.write"], task_families=["build.code"])
+        candidate = _snapshot()
+        first = self._projection(routing.evaluate_candidate(request, candidate))
+        second = self._projection(routing.evaluate_candidate(request, candidate))
+        self.assertEqual(first, second)
+        self.assertEqual(json.dumps(first, sort_keys=True),
+                         json.dumps(second, sort_keys=True))
+
+    def test_17_mutating_returned_diagnostics_isolates_all_sources(self):
+        request = _request(capabilities=["cap.write"])
+        candidate = _snapshot()
+        request_before = copy.deepcopy(request)
+        document_before = candidate.current_passport.document
+        agent_before = dict(candidate.agent.as_dict())
+
+        first = routing.evaluate_candidate(request, candidate)
+        # Mutate both a top-level key and a nested sub-object of the result.
+        first.diagnostics["injected_top"] = "x"
+        first.diagnostics["capabilities"]["injected_nested"] = "y"
+
+        # The request, snapshot, and passport document are untouched.
+        self.assertEqual(request, request_before)
+        self.assertEqual(candidate.current_passport.document, document_before)
+        self.assertEqual(dict(candidate.agent.as_dict()), agent_before)
+
+        # A subsequent evaluation is a fresh value, free of the injections.
+        second = routing.evaluate_candidate(request, candidate)
+        self.assertNotIn("injected_top", second.diagnostics)
+        self.assertNotIn("injected_nested", second.diagnostics["capabilities"])
+
+
+class EligibilityPurityTests(unittest.TestCase):
+    """Purity of the corrected eligibility surface (tests 18-21)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (REPO_ROOT / "agentic_os" / "routing.py").read_text(
+            encoding="utf-8"
+        )
+
+    def test_18_no_database_import_or_operation(self):
+        for token in ("import db", "from .db", "sqlite3", ".execute(", ".cursor(",
+                      "SELECT ", "INSERT ", "UPDATE ", "DELETE ", "db.transaction("):
+            with self.subTest(token=token):
+                self.assertNotIn(token, self.source)
+        self.assertFalse(hasattr(routing, "db"))
+        self.assertFalse(hasattr(routing, "sqlite3"))
+
+    def test_19_no_filesystem_network_subprocess_provider_or_event(self):
+        for token in ("subprocess", "socket", "urllib", "requests.", "http.client",
+                      "events.emit(", "open(", "Path(", "os.system(", ".provider"):
+            with self.subTest(token=token):
+                self.assertNotIn(token, self.source)
+
+    def test_20_no_current_time_read(self):
+        for token in ("import time", "datetime", ".now(", ".utcnow(",
+                      "time.time(", "monotonic", "perf_counter"):
+            with self.subTest(token=token):
+                self.assertNotIn(token, self.source)
+
+    def test_21_evaluation_does_not_mutate_inputs(self):
+        # Exercise both the new global-validation path (an unrequested malformed
+        # declaration) and a consulted gate, then prove nothing upstream moved.
+        request = _request(capabilities=["cap.write"])
+        candidate = _snapshot_with_document(_passport_document(tool_requirements=5))
+        request_before = copy.deepcopy(request)
+        document_before = candidate.current_passport.document
+        agent_before = dict(candidate.agent.as_dict())
+
+        first = routing.evaluate_candidate(request, candidate)
+        second = routing.evaluate_candidate(request, candidate)
+
+        self.assertEqual(request, request_before)
+        self.assertEqual(candidate.current_passport.document, document_before)
+        self.assertEqual(dict(candidate.agent.as_dict()), agent_before)
+        # Determinism: the same inputs yield an equal value each time.
+        self.assertEqual(first, second)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            candidate.identity_integrity = "mismatch"
 
 
 if __name__ == "__main__":
