@@ -848,11 +848,11 @@ class StatusPlanCliTests(V4WorkspaceTestCase):
         after = _table_snapshot(self.query)
         self.assertEqual(before, after)
 
-    def test_schema_stays_version_four(self):
+    def test_schema_stays_version_five(self):
         self.ok("agent", "catalog", "status")
         self.ok("agent", "catalog", "plan", "--all")
         self.assertEqual(
-            self.query("SELECT value FROM meta WHERE key='schema_version'")[0][0], "4"
+            self.query("SELECT value FROM meta WHERE key='schema_version'")[0][0], "5"
         )
 
 
@@ -1378,7 +1378,7 @@ class InstallTests(V4WorkspaceTestCase):
         err = self.fails("agent", "catalog", "install")
         self.assertIn("at least one NAME", err)
 
-    def test_schema_stays_4_and_migration_state_is_untouched(self):
+    def test_schema_stays_5_and_migration_state_is_untouched(self):
         before_meta = [tuple(r) for r in self.query("SELECT * FROM meta ORDER BY key")]
         before_schema = core_schema(self.db_path)
         self.ok("agent", "catalog", "install", "--all")
@@ -1389,7 +1389,7 @@ class InstallTests(V4WorkspaceTestCase):
         self.assertEqual(core_schema(self.db_path), before_schema)
         conn = db.connect(self.db_path)
         try:
-            self.assertEqual(db.get_meta(conn, "schema_version"), "4")
+            self.assertEqual(db.get_meta(conn, "schema_version"), "5")
         finally:
             conn.close()
 

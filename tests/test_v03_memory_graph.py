@@ -248,11 +248,12 @@ class V3WorkspaceTestCase(unittest.TestCase):
 
 class SchemaVersionTest(V3WorkspaceTestCase):
     def test_fresh_init_creates_the_current_schema_version(self):
-        """(1) — the literal moved 3 → 4 at U-A1, mechanically."""
-        self.assertEqual(db.SCHEMA_VERSION, "4")
+        """(1) — the literal moved 3 → 4 at U-A1, then 4 → 5 at U-A3,
+        mechanically."""
+        self.assertEqual(db.SCHEMA_VERSION, "5")
         self.assertEqual(
             self.query("SELECT value FROM meta WHERE key='schema_version'")[0][0],
-            "4",
+            "5",
         )
 
     def test_fresh_init_creates_the_three_graph_tables(self):
@@ -276,6 +277,7 @@ class SchemaVersionTest(V3WorkspaceTestCase):
                 (1, 2, "u-m2-memory-claims-v2"),
                 (2, 3, "u-m3-memory-graph-v3"),
                 (3, 4, "u-a1-agent-passports-v4"),
+                (4, 5, "u-a3-routing-handoffs-v5"),
             ],
         )
         migrations.validate_registry()
@@ -283,12 +285,12 @@ class SchemaVersionTest(V3WorkspaceTestCase):
     def test_latest_version_is_derived_from_the_one_schema_declaration(self):
         """(2) A bump that lands in only one of two places fails here."""
         self.assertEqual(migrations.LATEST_VERSION, int(db.SCHEMA_VERSION))
-        self.assertEqual(migrations.LATEST_VERSION, 4)
+        self.assertEqual(migrations.LATEST_VERSION, 5)
 
-    def test_no_version_five_transition_exists(self):
-        """(2)"""
+    def test_no_version_six_transition_exists(self):
+        """(2) U-A3 raised the ceiling to 5; nothing transitions past it."""
         self.assertEqual(
-            [m.to_version for m in migrations.MIGRATIONS if m.to_version > 4], []
+            [m.to_version for m in migrations.MIGRATIONS if m.to_version > 5], []
         )
 
     def test_fresh_v3_memory_table_carries_sensitivity(self):
@@ -309,7 +311,7 @@ class StatusAndPlanTest(V2FixtureTestCase):
         """(3)"""
         report = migrations.status(self.db_path)
         self.assertEqual(report["current_version"], 2)
-        self.assertEqual(report["latest_version"], 4)
+        self.assertEqual(report["latest_version"], 5)
         self.assertTrue(report["pending"])
         self.assertEqual(
             report["plan"],
@@ -317,6 +319,8 @@ class StatusAndPlanTest(V2FixtureTestCase):
                 {"from": 2, "to": 3, "migration_id": "u-m3-memory-graph-v3"},
                 {"from": 3, "to": 4,
                  "migration_id": "u-a1-agent-passports-v4"},
+                {"from": 4, "to": 5,
+                 "migration_id": "u-a3-routing-handoffs-v5"},
             ],
         )
 
@@ -338,7 +342,7 @@ class StatusAndPlanTest(V2FixtureTestCase):
         code, out, err = self.aos("migrate", "status")
         self.assertEqual(code, 0, err)
         self.assertIn("schema version:  2", out)
-        self.assertIn("build supports:  4", out)
+        self.assertIn("build supports:  5", out)
         self.assertIn("pending:         yes", out)
 
     def test_apply_verifies_a_v2_snapshot_before_it_mutates(self):
@@ -708,7 +712,7 @@ class MigrationFailureTest(V2FixtureTestCase):
         """(15)"""
         self._apply_failing()
         self.assertEqual(self.version(), "2")
-        self.migrate(target="4")  # the real steps, unpatched
+        self.migrate(target="5")  # the real steps, unpatched, to current
         ids = [e["migration_id"] for e in self.migrate_events()]
         self.assertEqual(ids.count("u-m3-memory-graph-v3"), 1)
         self.assertEqual(

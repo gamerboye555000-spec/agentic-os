@@ -1356,7 +1356,7 @@ class ExclusionTests(PowerCase):
         """(25) U-E2 changed no schema, and must not. U-M2 owns the version:
         this pins that power modes follow it rather than declaring their own.
         """
-        self.assertEqual(db.SCHEMA_VERSION, "4")
+        self.assertEqual(db.SCHEMA_VERSION, "5")
         self.assertEqual(migrations.LATEST_VERSION, int(db.SCHEMA_VERSION))
 
     def test_power_state_lives_beside_the_ledger_not_inside_it(self):

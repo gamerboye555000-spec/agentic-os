@@ -196,9 +196,9 @@ class ProductionRegistryTest(MigrationTestCase):
         # If this fails, a migration was added without raising SCHEMA_VERSION
         # with it — or the reverse.
         self.assertEqual(migrations.LATEST_VERSION, int(db.SCHEMA_VERSION))
-        self.assertEqual(migrations.LATEST_VERSION, 4)
+        self.assertEqual(migrations.LATEST_VERSION, 5)
 
-    def test_production_registry_is_the_three_production_steps(self):
+    def test_production_registry_is_the_four_production_steps(self):
         self.assertEqual(
             [
                 (m.from_version, m.to_version, m.migration_id)
@@ -208,6 +208,7 @@ class ProductionRegistryTest(MigrationTestCase):
                 (1, 2, "u-m2-memory-claims-v2"),
                 (2, 3, "u-m3-memory-graph-v3"),
                 (3, 4, "u-a1-agent-passports-v4"),
+                (4, 5, "u-a3-routing-handoffs-v5"),
             ],
         )
         migrations.validate_registry()
@@ -222,7 +223,7 @@ class ProductionRegistryTest(MigrationTestCase):
     def test_production_registry_reports_the_pending_migrations(self):
         report = migrations.status(self.db_path)
         self.assertEqual(report["current_version"], 1)
-        self.assertEqual(report["latest_version"], 4)
+        self.assertEqual(report["latest_version"], 5)
         self.assertTrue(report["pending"])
         self.assertEqual(
             report["plan"],
@@ -230,6 +231,7 @@ class ProductionRegistryTest(MigrationTestCase):
                 {"from": 1, "to": 2, "migration_id": "u-m2-memory-claims-v2"},
                 {"from": 2, "to": 3, "migration_id": "u-m3-memory-graph-v3"},
                 {"from": 3, "to": 4, "migration_id": "u-a1-agent-passports-v4"},
+                {"from": 4, "to": 5, "migration_id": "u-a3-routing-handoffs-v5"},
             ],
         )
 
@@ -1070,6 +1072,7 @@ class RegistryValidationTest(MigrationTestCase):
                 "u-m2-memory-claims-v2",
                 "u-m3-memory-graph-v3",
                 "u-a1-agent-passports-v4",
+                "u-a3-routing-handoffs-v5",
             ],
         )
         self.assertEqual(
@@ -1078,6 +1081,7 @@ class RegistryValidationTest(MigrationTestCase):
                 "u-m2-memory-claims-v2",
                 "u-m3-memory-graph-v3",
                 "u-a1-agent-passports-v4",
+                "u-a3-routing-handoffs-v5",
             ],
         )
 

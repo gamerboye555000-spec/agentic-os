@@ -188,7 +188,7 @@ class SchemaVersionTest(V2WorkspaceTestCase):
         """(1) U-M3 moved the current version to 3. What U-M2 pins here is
         that a fresh workspace is born AT it, whatever it is — the literal
         lives in db.py and is asserted against 3 in the U-M3 suite."""
-        self.assertEqual(db.SCHEMA_VERSION, "4")
+        self.assertEqual(db.SCHEMA_VERSION, "5")
         self.assertEqual(self.query(
             "SELECT value FROM meta WHERE key='schema_version'"
         )[0][0], db.SCHEMA_VERSION)

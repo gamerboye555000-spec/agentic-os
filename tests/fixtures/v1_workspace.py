@@ -145,6 +145,16 @@ def _install_v1_memory_schema(db_path: Path) -> None:
                     "v1 fixture: agents must be empty when the v1 schema is "
                     f"installed (found {agent_rows} rows)"
                 )
+            # U-A3 adds the four routing/handoff tables to what must go, for
+            # the same reason MEMORY_GRAPH_TABLES and the agent tables do: a
+            # "v1" workspace with a routing_plans table would not be one, and
+            # the 4→5 step, which creates those tables, would fail on its
+            # CREATE when this fixture was migrated all the way forward. The
+            # list is db.ROUTING_HANDOFF_TABLES rather than four literals, so a
+            # fifth routing table cannot be added without this fixture dropping
+            # it too. Children before parents (reversed FK-parent order).
+            for table, _ddl in reversed(db.ROUTING_HANDOFF_TABLES):
+                conn.execute(f"DROP TABLE {table}")
             for table, _ddl in reversed(db.MEMORY_GRAPH_TABLES):
                 conn.execute(f"DROP TABLE {table}")
             conn.execute("DROP TABLE memory_evidence")
