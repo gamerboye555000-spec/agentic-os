@@ -192,6 +192,19 @@ COMMAND_POLICY: dict[tuple[str, ...], CommandPolicy] = {
     # operation eco is entitled to defer (U-A2 §13). No mode auto-installs:
     # every other catalog leaf is read_only and writes nothing.
     ("agent", "catalog", "install"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    # U-A3 governed routing. `route plan` writes a plan row, its candidate
+    # rows, their hashes and one audit event in a single transaction —
+    # authoritative by the same mechanical rule as everything above it, so
+    # recovery blocks it before dispatch, deep preflights and post-verifies it,
+    # and eco runs it immediately (an explicit operator request is never a
+    # background derived refresh). The other three route leaves read rows and
+    # recompute hashes; none writes, so all three are read_only and usable in
+    # recovery — inspecting a stale or tampered plan is exactly what recovery
+    # is for. `route select` does not exist.
+    ("agent", "route", "plan"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("agent", "route", "list"): _p(READ_ONLY),
+    ("agent", "route", "show"): _p(READ_ONLY),
+    ("agent", "route", "verify"): _p(READ_ONLY),
     ("ingest", "dropfile"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("done",): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("migrate", "apply"): _p(AUTHORITATIVE_WRITE, ledger=True),

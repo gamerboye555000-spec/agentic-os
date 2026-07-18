@@ -30,10 +30,12 @@ Groups:
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import hashlib
 import inspect
+import io
 import itertools
 import json
 import sqlite3
@@ -41,10 +43,23 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import MappingProxyType
+from unittest import mock
 
 from fixtures.v3_workspace import build_v3_workspace, table_contents
 
-from agentic_os import db, ids, migrations, models, passports, protocols, routing
+from agentic_os import (
+    cli,
+    db,
+    events,
+    ids,
+    migrations,
+    models,
+    ops,
+    passports,
+    power,
+    protocols,
+    routing,
+)
 from agentic_os.utils import AosError
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -2236,45 +2251,49 @@ class WarningsAndParityTests(unittest.TestCase):
 # PURITY (tests 71-75)
 
 class PurityTests(unittest.TestCase):
+    """The Wave-2 eligibility surface is pure; the Wave-3 plan layer is the
+    one database-owning caller around it (§ database_enumeration). These tests
+    keep both facts honest: `evaluate_candidate` never mutates its inputs and
+    is deterministic, while the module as a whole — including `create_plan` —
+    never executes, networks, spawns a subprocess, opens a file, or invokes a
+    provider/model/tool. The routing plan is advisory: it stores rows and one
+    event and does nothing else."""
+
     @classmethod
     def setUpClass(cls):
         cls.source = (REPO_ROOT / "agentic_os" / "routing.py").read_text(
             encoding="utf-8"
         )
 
-    def test_routing_module_does_not_import_db(self):
-        self.assertNotIn("import db", self.source)
-        self.assertFalse(hasattr(routing, "db"))
-
-    def test_no_sqlite_connection_or_sql_operation(self):
-        forbidden = (
-            "sqlite3.connect(",
-            "conn.execute(",
-            ".cursor(",
-            "SELECT ",
-            "INSERT ",
-            "UPDATE ",
-            "DELETE ",
-            "db.transaction(",
-        )
-        for token in forbidden:
-            with self.subTest(token=token):
-                self.assertNotIn(token, self.source)
-
-    def test_no_filesystem_network_subprocess_provider_or_event_behavior(self):
+    def test_no_execution_network_subprocess_or_provider_behavior(self):
+        # SQL, db.transaction and events.emit are DELIBERATELY permitted from
+        # Wave 3 on: create_plan owns exactly one transaction and emits exactly
+        # one audit event. What must never appear is execution, network,
+        # subprocess, filesystem opening or provider/model/tool invocation.
         forbidden = (
             "subprocess.",
             "socket.",
             "requests.",
             "urllib.",
-            "events.emit(",
+            "http.client",
+            "os.system(",
+            "exec(",
+            "eval(",
             "open(",
             "Path(",
-            "os.system(",
+            ".provider",
         )
         for token in forbidden:
             with self.subTest(token=token):
                 self.assertNotIn(token, self.source)
+
+    def test_plan_layer_owns_exactly_one_transaction_and_one_event(self):
+        # The database-owning boundary is a single db.transaction with one
+        # BEGIN IMMEDIATE and one routing_plan/create event — no nested
+        # transaction, no second event action.
+        self.assertEqual(self.source.count("with db.transaction("), 1)
+        self.assertEqual(self.source.count('conn.execute("BEGIN IMMEDIATE")'), 1)
+        self.assertEqual(self.source.count("events.emit("), 1)
 
     def test_evaluate_candidate_does_not_mutate_inputs(self):
         request = _request(capabilities=["cap.write"], task_families=["build.code"])
@@ -2568,17 +2587,19 @@ class EligibilityPurityTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-    def test_18_no_database_import_or_operation(self):
-        for token in ("import db", "from .db", "sqlite3", ".execute(", ".cursor(",
-                      "SELECT ", "INSERT ", "UPDATE ", "DELETE ", "db.transaction("):
-            with self.subTest(token=token):
-                self.assertNotIn(token, self.source)
-        self.assertFalse(hasattr(routing, "db"))
-        self.assertFalse(hasattr(routing, "sqlite3"))
+    def test_18_eligibility_evaluation_takes_no_connection(self):
+        # `evaluate_candidate` reasons only about the explicit CandidateSnapshot
+        # the caller passes; it never opens or receives a connection. (The
+        # Wave-3 plan layer IS the database-owning caller — that boundary is
+        # asserted in PurityTests, not forbidden here.)
+        params = inspect.signature(routing.evaluate_candidate).parameters
+        self.assertEqual(list(params)[:2], ["request", "candidate"])
+        self.assertNotIn("conn", params)
+        self.assertNotIn("connection", params)
 
-    def test_19_no_filesystem_network_subprocess_provider_or_event(self):
+    def test_19_no_filesystem_network_subprocess_or_provider(self):
         for token in ("subprocess", "socket", "urllib", "requests.", "http.client",
-                      "events.emit(", "open(", "Path(", "os.system(", ".provider"):
+                      "open(", "Path(", "os.system(", ".provider"):
             with self.subTest(token=token):
                 self.assertNotIn(token, self.source)
 
@@ -2607,6 +2628,1268 @@ class EligibilityPurityTests(unittest.TestCase):
         self.assertEqual(first, second)
         with self.assertRaises(dataclasses.FrozenInstanceError):
             candidate.identity_integrity = "mismatch"
+
+
+# ===========================================================================
+# U-A3 WAVE 3 — ordering, plan persistence, reads, verification, staleness,
+# the four route CLI leaves, and their power classifications. These run
+# against a LIVE v5 workspace with real, hash-valid agents (create_agent +
+# publish_passport), so eligibility, ordering, pins and hashes are genuine.
+# ===========================================================================
+
+
+class _LiveCase(unittest.TestCase):
+    """A live in-memory v5 workspace plus helpers that build real published
+    agents. Eligibility, ordering, pins and record hashes are all genuine."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name).resolve()
+        self.conn = db.connect(":memory:")
+        self.addCleanup(self.conn.close)
+        self.conn.executescript(db.SCHEMA_SQL)
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?)",
+            (db.SCHEMA_VERSION,),
+        )
+        self.conn.commit()
+
+    # -- workspace builders --------------------------------------------------
+
+    def add_project(self, slug="demo"):
+        project, _ = ops.add_project(
+            self.conn, slug=slug, name=slug.title(), repo=str(self.tmp)
+        )
+        return project
+
+    def add_task(self, *, project=None, title="t"):
+        return ops.add_task(self.conn, title=title, project_slug=project)
+
+    def _fragment(self, name, body):
+        frag = self.tmp / f"{name}.json"
+        frag.write_text(json.dumps(body), encoding="utf-8")
+        return frag
+
+    def publish(self, name, *, project=None, **body):
+        body.setdefault("autonomy", "supervised")
+        passports.create_agent(
+            self.conn, name=name, role="worker", mission="do",
+            project_slug=project, fragment_path=self._fragment(name, body),
+        )
+        passports.publish_passport(self.conn, name=name, path=None)
+        return passports.get_agent(self.conn, name)
+
+    def publish_v2(self, name, **body):
+        agent = passports.get_agent(self.conn, name)
+        slug = None
+        if agent.project_id is not None:
+            slug = ops.get_project(self.conn, agent.project_id).slug
+        body.setdefault("autonomy", "supervised")
+        document = passports.build_passport_document(
+            agent_name=name, passport_version=2, agent_class=agent.agent_class,
+            scope_level=agent.scope, project_slug=slug, role="worker",
+            mission="do v2", method="publish", fragment=body,
+        )
+        path = self.tmp / f"{name}_v2.json"
+        path.write_text(
+            protocols.serialize_canonical_file_bytes(document).decode("utf-8"),
+            encoding="utf-8",
+        )
+        passports.publish_passport(self.conn, name=name, path=path)
+        return passports.get_agent(self.conn, name)
+
+    def draft(self, name, **body):
+        passports.create_agent(
+            self.conn, name=name, role="worker", mission="do",
+            fragment_path=self._fragment(name, body),
+        )
+        return passports.get_agent(self.conn, name)
+
+    # -- request / plan helpers ---------------------------------------------
+
+    def request(self, **over):
+        base = {
+            "request_schema": routing.REQUEST_SCHEMA,
+            "algorithm_version": routing.ALGORITHM_VERSION,
+        }
+        base.update(over)
+        return routing.validate_request(base)
+
+    def plan(self, **over):
+        plan_id = routing.create_plan(self.conn, self.request(**over))
+        return routing.get_plan(self.conn, plan_id)
+
+    def candidates(self, plan):
+        return routing.get_candidates(self.conn, plan.id)
+
+    def by_name(self, plan):
+        out = {}
+        for c in self.candidates(plan):
+            row = self.conn.execute(
+                "SELECT name FROM agents WHERE id = ?", (c.agent_id,)
+            ).fetchone()
+            out[row["name"]] = c
+        return out
+
+    def count(self, table):
+        return self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+    def events(self):
+        return self.conn.execute(
+            "SELECT entity, action, payload_json FROM events ORDER BY id"
+        ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# (20)(21)(22) ORDERING
+
+class Wave3OrderingTests(_LiveCase):
+    def test_exact_ordering_json_and_surplus_direction(self):
+        self.publish("a1", capabilities=["cap.a"], task_families=["tf.a"])
+        self.publish(
+            "a2", capabilities=["cap.a", "cap.b"], task_families=["tf.a", "tf.b"]
+        )
+        plan = self.plan(capabilities=["cap.a"], task_families=["tf.a"])
+        rows = self.by_name(plan)
+        # Minimal surplus wins (asc): a1 (0 surplus) ranks before a2.
+        self.assertEqual(rows["a1"].rank, 1)
+        self.assertEqual(rows["a2"].rank, 2)
+        self.assertEqual(rows["a1"].ordering_json, "[0,0,0,0,0,0]")
+        self.assertEqual(rows["a2"].ordering_json, "[0,0,1,1,0,0]")
+
+    def test_preferred_agent_term_t1(self):
+        self.publish("a1", capabilities=["cap.a"])
+        self.publish("a2", capabilities=["cap.a", "cap.b"])
+        plan = self.plan(capabilities=["cap.a"], preferred_agent="a2")
+        rows = self.by_name(plan)
+        # T1 dominates surplus: preferred a2 ranks first despite more surplus.
+        self.assertEqual(rows["a2"].rank, 1)
+        self.assertEqual(json.loads(rows["a2"].ordering_json)[0], 1)
+        self.assertEqual(json.loads(rows["a1"].ordering_json)[0], 0)
+        # The non-preferred eligible agent records preference_only, ordering-only.
+        self.assertIn("preferred_agent_mismatch", json.loads(rows["a1"].reasons_json))
+
+    def test_scope_preference_specific_first_and_none(self):
+        self.add_project("demo")
+        self.publish("g", capabilities=["cap.a"])                    # global
+        self.publish("p", project="demo", capabilities=["cap.a"])    # project-scoped
+        specific = self.plan(project="demo", capabilities=["cap.a"])
+        rows = self.by_name(specific)
+        self.assertEqual(rows["p"].rank, 1)  # T2=1 for the project-scoped agent
+        self.assertEqual(json.loads(rows["p"].ordering_json)[1], 1)
+        self.assertEqual(json.loads(rows["g"].ordering_json)[1], 0)
+        none = self.plan(
+            project="demo", capabilities=["cap.a"], scope_preference="none"
+        )
+        rows2 = self.by_name(none)
+        # scope_preference=none zeroes T2 for all; the tie falls to T7 (name).
+        for candidate in rows2.values():
+            self.assertEqual(json.loads(candidate.ordering_json)[1], 0)
+        self.assertEqual(rows2["g"].rank, 1)  # 'g' < 'p' by code point
+
+    def test_surplus_policy_ignore_zeroes_only_surplus_terms(self):
+        self.publish("a1", capabilities=["cap.a"])
+        self.publish("a2", capabilities=["cap.a", "cap.b", "cap.c"])
+        minimal = self.plan(capabilities=["cap.a"], surplus_policy="minimal")
+        self.assertEqual(json.loads(self.by_name(minimal)["a2"].ordering_json)[3], 2)
+        ignore = self.plan(capabilities=["cap.a"], surplus_policy="ignore")
+        for candidate in self.by_name(ignore).values():
+            self.assertEqual(json.loads(candidate.ordering_json)[2:], [0, 0, 0, 0])
+
+    def test_final_tie_break_is_the_name(self):
+        self.publish("zed", capabilities=["cap.a"])
+        self.publish("abe", capabilities=["cap.a"])
+        rows = self.by_name(self.plan(capabilities=["cap.a"]))
+        # identical tuples ⇒ T7 (byte name) decides: abe before zed.
+        self.assertEqual(rows["abe"].rank, 1)
+        self.assertEqual(rows["zed"].rank, 2)
+
+    def test_autonomy_and_classification_never_ordered(self):
+        self.publish("a1", capabilities=["cap.a"], autonomy="scoped")
+        self.publish("a2", capabilities=["cap.a"], autonomy="supervised")
+        rows = self.by_name(self.plan(capabilities=["cap.a"]))
+        # Differing only in autonomy ⇒ identical ordering tuples; name breaks it.
+        self.assertEqual(
+            json.loads(rows["a1"].ordering_json),
+            json.loads(rows["a2"].ordering_json),
+        )
+        self.assertEqual(len(json.loads(rows["a1"].ordering_json)), 6)
+
+    def test_ranks_contiguous_and_non_eligible_are_null(self):
+        self.publish("ok1", capabilities=["cap.a"])
+        self.publish("ok2", capabilities=["cap.a", "cap.b"])
+        self.draft("drafty", capabilities=["cap.a"])            # excluded
+        self.publish("nope", capabilities=["cap.z"])            # missing_capability
+        plan = self.plan(capabilities=["cap.a"])
+        rows = self.by_name(plan)
+        self.assertEqual(sorted(c.rank for c in rows.values() if c.rank), [1, 2])
+        for name in ("drafty", "nope"):
+            self.assertIsNone(rows[name].rank)
+            self.assertIsNone(rows[name].ordering_json)
+            self.assertIsNone(rows[name].passport_version)
+            self.assertIsNone(rows[name].passport_sha256)
+            self.assertIsNone(rows[name].identity_sha256)
+
+    def test_two_workspace_determinism_excludes_content_sha256(self):
+        specs = [
+            ("alpha", ["cap.a"]),
+            ("bravo", ["cap.a", "cap.b"]),
+            ("gamma", ["cap.a", "cap.b", "cap.c"]),
+        ]
+
+        def build(order):
+            case = _LiveCase()
+            case.setUp()
+            self.addCleanup(case.doCleanups)
+            for name, caps in order:
+                case.publish(name, capabilities=caps)
+            plan = case.plan(capabilities=["cap.a"])
+            projection = [
+                (
+                    row.rank,
+                    name,
+                    row.passport_version,
+                    row.passport_sha256,
+                    json.loads(row.reasons_json),
+                )
+                for name, row in sorted(case.by_name(plan).items())
+            ]
+            return plan.request_sha256, projection, case
+
+        sha_a, proj_a, case_a = build(specs)
+        sha_b, proj_b, case_b = build(list(reversed(specs)))
+        self.assertEqual(sha_a, sha_b)                 # identical request digest
+        self.assertEqual(proj_a, proj_b)               # identical ranked projection
+        # content_sha256 legitimately differs (it binds workspace-specific ids).
+        plan_a = case_a.conn.execute(
+            "SELECT content_sha256 FROM routing_plans"
+        ).fetchone()[0]
+        plan_b = case_b.conn.execute(
+            "SELECT content_sha256 FROM routing_plans"
+        ).fetchone()[0]
+        self.assertTrue(models.is_claim_hash(plan_a))
+        self.assertTrue(models.is_claim_hash(plan_b))
+        case_a.conn.close()
+        case_b.conn.close()
+
+
+# ---------------------------------------------------------------------------
+# (23)-(32) PLAN CREATION
+
+class Wave3PlanCreationTests(_LiveCase):
+    def test_standalone_request_is_global(self):
+        self.publish("a", capabilities=["cap.a"])
+        plan = self.plan(capabilities=["cap.a"])
+        self.assertEqual(plan.scope, "global")
+        self.assertIsNone(plan.project_id)
+        self.assertIsNone(plan.task_id)
+        self.assertEqual(plan.result_status, "resolved")
+
+    def test_task_derived_project(self):
+        self.add_project("demo")
+        task = self.add_task(project="demo")
+        self.publish("a", capabilities=["cap.a"])
+        plan_id = routing.create_plan(self.conn, self.request(task=task.id))
+        plan = routing.get_plan(self.conn, plan_id)
+        self.assertEqual(plan.scope, "project")
+        self.assertEqual(plan.task_id, task.id)
+        self.assertEqual(
+            plan.project_id, ops.get_project_by_slug(self.conn, "demo").id
+        )
+        self.assertIn('"project":"demo"', plan.request_document)
+
+    def test_explicit_project(self):
+        self.add_project("demo")
+        plan = self.plan(project="demo")
+        self.assertEqual(plan.scope, "project")
+
+    def test_task_project_disagreement_refuses_with_zero_writes(self):
+        self.add_project("demo")
+        self.add_project("other")
+        task = self.add_task(project="demo")
+        before = (self.count("routing_plans"), self.count("events"))
+        with self.assertRaises(AosError):
+            routing.create_plan(
+                self.conn, self.request(task=task.id, project="other")
+            )
+        self.assertEqual(
+            (self.count("routing_plans"), self.count("events")), before
+        )
+
+    def test_preferred_installed_agent(self):
+        self.publish("pref", capabilities=["cap.a"])
+        plan = self.plan(capabilities=["cap.a"], preferred_agent="pref")
+        self.assertEqual(self.by_name(plan)["pref"].rank, 1)
+
+    def test_agent_absent_refusal_zero_writes_and_events(self):
+        self.publish("real", capabilities=["cap.a"])
+        before = (self.count("routing_plans"), self.count("routing_plan_candidates"),
+                  self.count("events"))
+        with self.assertRaises(AosError) as ctx:
+            routing.create_plan(self.conn, self.request(preferred_agent="ghost"))
+        self.assertIn("agent_absent", str(ctx.exception))
+        self.assertEqual(
+            (self.count("routing_plans"), self.count("routing_plan_candidates"),
+             self.count("events")),
+            before,
+        )
+
+    def test_catalog_not_installed_refusal_zero_writes_and_events(self):
+        from agentic_os import catalog
+
+        name = catalog.catalog().entries[0].agent
+        before = (self.count("routing_plans"), self.count("events"))
+        with self.assertRaises(AosError) as ctx:
+            routing.create_plan(self.conn, self.request(preferred_agent=name))
+        self.assertIn("catalog_not_installed", str(ctx.exception))
+        self.assertEqual(
+            (self.count("routing_plans"), self.count("events")), before
+        )
+
+    def test_more_than_256_agents_refuses_without_truncation(self):
+        # MAX+1 bare identity rows exceed the evaluation bound; the refusal must
+        # fire before evaluation and truncate nothing.
+        rows = [
+            (f"a{i:04d}", "custom", "global", None, "draft", 0, "human",
+             "create", None, NOW, NOW, HASH)
+            for i in range(models.MAX_ROUTING_EVALUATED_AGENTS + 1)
+        ]
+        self.conn.executemany(
+            "INSERT INTO agents (name, agent_class, scope, project_id, "
+            "lifecycle, protected, owner, origin, current_passport_version, "
+            "created_at, updated_at, content_sha256) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        self.conn.commit()
+        with self.assertRaises(AosError) as ctx:
+            routing.create_plan(self.conn, self.request())
+        self.assertIn("256", str(ctx.exception))
+        self.assertEqual(self.count("routing_plans"), 0)
+        self.assertEqual(self.count("routing_plan_candidates"), 0)
+
+    def test_every_agent_persisted_exactly_once(self):
+        for name in ("a", "b", "c"):
+            self.publish(name, capabilities=["cap.a"])
+        self.draft("d")
+        plan = self.plan(capabilities=["cap.a"])
+        rows = self.candidates(plan)
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(len({r.agent_id for r in rows}), 4)
+
+    def test_resolved_with_eligible_and_excluded(self):
+        self.publish("good", capabilities=["cap.a"])
+        self.publish("nope", capabilities=["cap.z"])   # excluded (missing)
+        plan = self.plan(capabilities=["cap.a"])
+        self.assertEqual(plan.result_status, "resolved")
+        self.assertEqual(plan.eligible_count, 1)
+        self.assertEqual(plan.excluded_count, 1)
+
+    def test_all_excluded_is_no_eligible_candidates(self):
+        self.publish("a", capabilities=["cap.a"])
+        plan = self.plan(capabilities=["cap.z"])
+        self.assertEqual(plan.result_status, "no_eligible_candidates")
+        self.assertEqual(plan.eligible_count, 0)
+        self.assertEqual(plan.unresolved_count, 0)
+        self.assertEqual(plan.excluded_count, 1)
+
+    def test_result_status_derivation_is_counts_only(self):
+        # `unresolved` is unreachable from a same-build published passport (the
+        # schema validates every declaration routing consults), so its storage
+        # is proven by the DDL truth table; the derivation function itself is
+        # exercised directly here. excluded_count never participates.
+        self.assertEqual(routing._result_status(2, 0), "resolved")
+        self.assertEqual(routing._result_status(2, 3), "resolved")
+        self.assertEqual(routing._result_status(0, 3), "unresolved")
+        self.assertEqual(routing._result_status(0, 0), "no_eligible_candidates")
+
+    def test_display_controls_do_not_limit_storage(self):
+        for i in range(6):
+            self.publish(f"a{i}", capabilities=["cap.a"])
+        capped = self.plan(capabilities=["cap.a"], max_candidates=1)
+        self.assertEqual(capped.eligible_count, 6)
+        self.assertEqual(len(self.candidates(capped)), 6)
+        quiet = self.plan(capabilities=["cap.a"], include_diagnostics=False)
+        self.assertEqual(len(self.candidates(quiet)), 6)
+        # Storage is byte-identical regardless of the display-only controls.
+        cols = "verdict, rank, passport_version, passport_sha256, ordering_json"
+        a = self.conn.execute(
+            f"SELECT {cols} FROM routing_plan_candidates WHERE plan_id = ? ORDER BY id",
+            (capped.id,),
+        ).fetchall()
+        b = self.conn.execute(
+            f"SELECT {cols} FROM routing_plan_candidates WHERE plan_id = ? ORDER BY id",
+            (quiet.id,),
+        ).fetchall()
+        self.assertEqual([tuple(r) for r in a], [tuple(r) for r in b])
+
+    def test_eligible_pins_are_recomputed_and_exact(self):
+        agent = self.publish("a", capabilities=["cap.a"])
+        plan = self.plan(capabilities=["cap.a"])
+        cand = self.by_name(plan)["a"]
+        agent = passports.get_agent(self.conn, "a")
+        passport = passports.get_passport(
+            self.conn, agent.id, agent.current_passport_version
+        )
+        self.assertEqual(cand.passport_version, agent.current_passport_version)
+        self.assertEqual(
+            cand.passport_sha256, passports.document_digest(passport.document)
+        )
+        self.assertEqual(
+            cand.identity_sha256, passports.agent_identity_digest(agent)
+        )
+
+    def test_no_ownership_or_catalog_advantage(self):
+        # A protected, system-owned identity and a plain custom one with the
+        # same declarations rank adjacently by name only.
+        self.publish("m.custom", capabilities=["cap.a"])
+        self.conn.execute(
+            "UPDATE agents SET owner='system', protected=1 WHERE name='m.custom'"
+        )
+        passports._rehash_agent(
+            self.conn, passports.get_agent(self.conn, "m.custom").id
+        )
+        self.publish("z.custom", capabilities=["cap.a"])
+        self.conn.commit()
+        rows = self.by_name(self.plan(capabilities=["cap.a"]))
+        self.assertEqual(rows["m.custom"].rank, 1)   # name order, not ownership
+        self.assertEqual(rows["z.custom"].rank, 2)
+
+    def test_request_bytes_digest_and_algorithm_are_exact(self):
+        self.publish("a", capabilities=["cap.a"])
+        request = self.request(capabilities=["cap.a"])
+        plan = routing.get_plan(self.conn, routing.create_plan(self.conn, request))
+        expected = protocols.serialize_canonical(request).decode("utf-8")
+        self.assertEqual(plan.request_document, expected)
+        self.assertEqual(
+            plan.request_sha256,
+            hashlib.sha256(expected.encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(plan.algorithm_version, "aos-routing-order/v1")
+        self.assertEqual(plan.request_schema, "aos.routing-request/v1")
+        # No timestamp/actor inside the document.
+        self.assertNotIn("created_at", plan.request_document)
+        self.assertNotIn("actor", plan.request_document)
+
+
+# ---------------------------------------------------------------------------
+# (33)-(43) HASHING
+
+class Wave3HashingTests(_LiveCase):
+    def _one_plan(self):
+        self.publish("a", capabilities=["cap.a"])
+        self.publish("b", capabilities=["cap.z"])   # excluded (missing)
+        return self.plan(capabilities=["cap.a"])
+
+    def test_candidate_payload_exact_field_set(self):
+        plan = self._one_plan()
+        payload = routing.candidate_payload(self.candidates(plan)[0])
+        self.assertEqual(
+            set(payload),
+            {
+                "record_schema", "id", "plan_id", "agent_id", "rank",
+                "passport_version", "verdict_sha256", "passport_sha256_sha256",
+                "identity_sha256_sha256", "reasons_json_sha256",
+                "warnings_json_sha256", "ordering_json_sha256", "created_at_sha256",
+            },
+        )
+        self.assertEqual(payload["record_schema"], "aos.routing-candidate/v1")
+        self.assertNotIn("content_sha256", payload)
+
+    def test_plan_payload_exact_field_set(self):
+        plan = self._one_plan()
+        chain = [routing.candidate_digest(c) for c in self.candidates(plan)]
+        payload = routing.plan_payload(plan, chain)
+        self.assertEqual(
+            set(payload),
+            {
+                "record_schema", "id", "task_id", "project_id", "eligible_count",
+                "unresolved_count", "excluded_count", "supersedes_id",
+                "scope_sha256", "actor_sha256", "request_schema_sha256",
+                "algorithm_version_sha256", "request_document_sha256",
+                "request_sha256_sha256", "result_status_sha256",
+                "created_at_sha256", "candidate_chain",
+            },
+        )
+        self.assertEqual(payload["record_schema"], "aos.routing-plan/v1")
+        self.assertNotIn("content_sha256", payload)
+        self.assertEqual(payload["candidate_chain"], chain)
+
+    def test_chain_is_ordered_by_candidate_id(self):
+        plan = self._one_plan()
+        cands = self.candidates(plan)
+        self.assertEqual([c.id for c in cands], sorted(c.id for c in cands))
+        chain = [routing.candidate_digest(c) for c in cands]
+        # The stored plan hash verifies against exactly this id-ordered chain.
+        self.assertEqual(routing.plan_digest(plan, chain), plan.content_sha256)
+
+    def test_every_committed_hash_is_64_lowercase_hex_no_pending(self):
+        self._one_plan()
+        hashes = [
+            r[0]
+            for r in self.conn.execute(
+                "SELECT content_sha256 FROM routing_plans "
+                "UNION ALL SELECT content_sha256 FROM routing_plan_candidates"
+            ).fetchall()
+        ]
+        self.assertTrue(hashes)
+        for value in hashes:
+            self.assertRegex(value, r"^[0-9a-f]{64}$")
+            self.assertNotEqual(value, "")
+
+    def test_tampered_candidate_column_detected(self):
+        plan = self._one_plan()
+        self.conn.execute(
+            "UPDATE routing_plan_candidates SET reasons_json='[\"suspended\"]' "
+            "WHERE plan_id=? AND verdict='eligible'",
+            (plan.id,),
+        )
+        self.conn.commit()
+        result = routing.verify_plan(self.conn, plan.id)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("mismatch" in p for p in result["problems"]))
+
+    def test_tampered_candidate_stored_hash_detected(self):
+        plan = self._one_plan()
+        self.conn.execute(
+            "UPDATE routing_plan_candidates SET content_sha256=? "
+            "WHERE plan_id=? AND verdict='eligible'",
+            ("a" * 64, plan.id),
+        )
+        self.conn.commit()
+        result = routing.verify_plan(self.conn, plan.id)
+        self.assertFalse(result["ok"])
+
+    def test_tampered_plan_column_detected(self):
+        plan = self._one_plan()
+        self.conn.execute(
+            "UPDATE routing_plans SET created_at='2000-01-01T00:00:00Z' WHERE id=?",
+            (plan.id,),
+        )
+        self.conn.commit()
+        result = routing.verify_plan(self.conn, plan.id)
+        self.assertFalse(result["ok"])
+        self.assertIn(f"{ids.render_id('routing_plan', plan.id)}: mismatch",
+                      result["problems"])
+
+    def test_tampered_plan_stored_hash_detected(self):
+        plan = self._one_plan()
+        self.conn.execute(
+            "UPDATE routing_plans SET content_sha256=? WHERE id=?",
+            ("b" * 64, plan.id),
+        )
+        self.conn.commit()
+        self.assertFalse(routing.verify_plan(self.conn, plan.id)["ok"])
+
+    def test_child_stored_hash_laundering_detected(self):
+        # Tamper ONLY the stored candidate hash (columns intact). The plan hash
+        # is built from RECOMPUTED child digests, so it still verifies — but the
+        # candidate-level check catches the stored-hash mismatch: no laundering.
+        plan = self._one_plan()
+        self.conn.execute(
+            "UPDATE routing_plan_candidates SET content_sha256=? "
+            "WHERE plan_id=? AND verdict='eligible'",
+            ("c" * 64, plan.id),
+        )
+        self.conn.commit()
+        result = routing.verify_plan(self.conn, plan.id)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("mismatch" in p for p in result["problems"]))
+
+
+# ---------------------------------------------------------------------------
+# (44)-(53) TRANSACTIONS
+
+class Wave3TransactionTests(_LiveCase):
+    def _prep(self):
+        self.publish("a", capabilities=["cap.a"])
+        return (self.count("routing_plans"), self.count("routing_plan_candidates"),
+                self.count("events"))
+
+    def _assert_rolled_back(self, before):
+        self.assertEqual(
+            (self.count("routing_plans"), self.count("routing_plan_candidates"),
+             self.count("events")),
+            before,
+        )
+        # No _PENDING_HASH survivor, no partial row.
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM routing_plans WHERE content_sha256=''"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_failure_during_candidate_finalization_rolls_back(self):
+        before = self._prep()
+        with mock.patch.object(
+            routing, "candidate_digest", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                routing.create_plan(self.conn, self.request(capabilities=["cap.a"]))
+        self._assert_rolled_back(before)
+
+    def test_failure_before_plan_hash_finalization_rolls_back(self):
+        before = self._prep()
+        with mock.patch.object(
+            routing, "plan_digest", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                routing.create_plan(self.conn, self.request(capabilities=["cap.a"]))
+        self._assert_rolled_back(before)
+
+    def test_event_failure_rolls_back_everything(self):
+        before = self._prep()
+        with mock.patch.object(
+            routing.events, "emit", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                routing.create_plan(self.conn, self.request(capabilities=["cap.a"]))
+        self._assert_rolled_back(before)
+
+    def test_successful_write_creates_exactly_one_event(self):
+        self.publish("a", capabilities=["cap.a"])
+        before = self.count("events")
+        routing.create_plan(self.conn, self.request(capabilities=["cap.a"]))
+        rows = self.conn.execute(
+            "SELECT entity, action FROM events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(self.count("events"), before + 1)
+        self.assertEqual((rows["entity"], rows["action"]), ("routing_plan", "create"))
+
+    def test_no_nested_transaction(self):
+        source = (REPO_ROOT / "agentic_os" / "routing.py").read_text(encoding="utf-8")
+        self.assertEqual(source.count("with db.transaction("), 1)
+
+    def test_two_racing_successors_permit_exactly_one(self):
+        self.publish("a", capabilities=["cap.a"])
+        p1 = self.plan(capabilities=["cap.a"])
+        routing.create_plan(
+            self.conn, self.request(capabilities=["cap.a"]), supersedes_id=p1.id
+        )
+        with self.assertRaises(AosError) as ctx:
+            routing.create_plan(
+                self.conn, self.request(capabilities=["cap.a"]), supersedes_id=p1.id
+            )
+        self.assertIn("already superseded", str(ctx.exception))
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM routing_plans WHERE supersedes_id=?", (p1.id,)
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_failed_successor_leaves_predecessor_unchanged(self):
+        self.publish("a", capabilities=["cap.a"])
+        p1 = self.plan(capabilities=["cap.a"])
+        before = dict(
+            self.conn.execute(
+                "SELECT * FROM routing_plans WHERE id=?", (p1.id,)
+            ).fetchone()
+        )
+        with mock.patch.object(
+            routing, "plan_digest", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                routing.create_plan(
+                    self.conn, self.request(capabilities=["cap.a"]),
+                    supersedes_id=p1.id,
+                )
+        after = dict(
+            self.conn.execute(
+                "SELECT * FROM routing_plans WHERE id=?", (p1.id,)
+            ).fetchone()
+        )
+        self.assertEqual(before, after)
+
+
+# ---------------------------------------------------------------------------
+# (54)-(62) SUPERSESSION AND STALENESS
+
+class Wave3SupersessionStalenessTests(_LiveCase):
+    def test_predecessor_byte_identical_after_successor(self):
+        self.publish("a", capabilities=["cap.a"])
+        p1 = self.plan(capabilities=["cap.a"])
+        before = dict(
+            self.conn.execute("SELECT * FROM routing_plans WHERE id=?", (p1.id,)).fetchone()
+        )
+        p2 = routing.create_plan(
+            self.conn, self.request(capabilities=["cap.a"]), supersedes_id=p1.id
+        )
+        after = dict(
+            self.conn.execute("SELECT * FROM routing_plans WHERE id=?", (p1.id,)).fetchone()
+        )
+        self.assertEqual(before, after)
+        self.assertEqual(routing.get_plan(self.conn, p2).supersedes_id, p1.id)
+
+    def test_supersession_is_derived_not_stored_as_state(self):
+        self.publish("a", capabilities=["cap.a"])
+        p1 = self.plan(capabilities=["cap.a"])
+        self.assertFalse(routing.plan_staleness(self.conn, p1).superseded)
+        routing.create_plan(
+            self.conn, self.request(capabilities=["cap.a"]), supersedes_id=p1.id
+        )
+        st = routing.plan_staleness(self.conn, routing.get_plan(self.conn, p1.id))
+        self.assertTrue(st.superseded)      # derived from the successor's existence
+        self.assertFalse(st.stale)          # supersession is not pin drift
+        # There is no 'state' column on routing_plans to store it in.
+        cols = [
+            r[1]
+            for r in self.conn.execute("PRAGMA table_info(routing_plans)").fetchall()
+        ]
+        self.assertNotIn("state", cols)
+
+    def test_current_passport_change_makes_stale(self):
+        self.publish("a", capabilities=["cap.a"])
+        p1 = self.plan(capabilities=["cap.a"])
+        self.assertFalse(routing.plan_staleness(self.conn, p1).stale)
+        self.publish_v2("a", capabilities=["cap.a"])
+        st = routing.plan_staleness(self.conn, routing.get_plan(self.conn, p1.id))
+        self.assertTrue(st.stale)
+        self.assertIn("passport_version_changed", st.reasons)
+        self.assertEqual(st.agent, "a")
+
+    def test_identity_change_makes_stale(self):
+        self.publish("a", capabilities=["cap.a"])
+        p1 = self.plan(capabilities=["cap.a"])
+        passports.transition_lifecycle(self.conn, name="a", verb="suspend")
+        st = routing.plan_staleness(self.conn, routing.get_plan(self.conn, p1.id))
+        self.assertTrue(st.stale)
+        self.assertIn("lifecycle_not_active", st.reasons)
+        self.assertIn("identity_changed", st.reasons)
+
+    def test_unchanged_pins_remain_fresh(self):
+        self.publish("a", capabilities=["cap.a"])
+        self.publish("b", capabilities=["cap.a", "cap.b"])
+        p1 = self.plan(capabilities=["cap.a"])
+        st = routing.plan_staleness(self.conn, p1)
+        self.assertFalse(st.stale)
+        self.assertEqual(st.reasons, ())
+        self.assertIsNone(st.agent)
+
+    def test_staleness_uses_no_clock(self):
+        source = (REPO_ROOT / "agentic_os" / "routing.py").read_text(encoding="utf-8")
+        start = source.index("def plan_staleness")
+        end = source.index("def _candidate_public")
+        body = source[start:end] + source[
+            source.index("def _candidate_stale_reasons"):
+            source.index("def plan_staleness")
+        ]
+        for token in ("utc_now_iso", "datetime", "time.time", ".now("):
+            self.assertNotIn(token, body)
+
+    def test_reads_never_mutate_a_stale_plan(self):
+        self.publish("a", capabilities=["cap.a"])
+        p1 = self.plan(capabilities=["cap.a"])
+        passports.transition_lifecycle(self.conn, name="a", verb="suspend")
+        before = dict(
+            self.conn.execute("SELECT * FROM routing_plans WHERE id=?", (p1.id,)).fetchone()
+        )
+        routing.list_plans(self.conn)
+        routing.plan_public(self.conn, routing.get_plan(self.conn, p1.id))
+        routing.verify_plan(self.conn, p1.id)
+        after = dict(
+            self.conn.execute("SELECT * FROM routing_plans WHERE id=?", (p1.id,)).fetchone()
+        )
+        self.assertEqual(before, after)
+
+
+# ---------------------------------------------------------------------------
+# (63)-(75) READS AND VERIFY
+
+class Wave3ReadVerifyTests(_LiveCase):
+    def test_list_deterministic_newest_first(self):
+        self.publish("a", capabilities=["cap.a"])
+        p1 = self.plan(capabilities=["cap.a"])
+        p2 = self.plan(capabilities=["cap.a"])
+        listing = routing.list_plans(self.conn)
+        self.assertEqual(
+            [row["plan"] for row in listing],
+            [ids.render_id("routing_plan", p2.id), ids.render_id("routing_plan", p1.id)],
+        )
+
+    def test_show_returns_all_candidate_classes(self):
+        self.publish("elig", capabilities=["cap.a"])
+        self.publish("excl", capabilities=["cap.z"])
+        plan = self.plan(capabilities=["cap.a"])
+        # `unresolved` cannot arise from a same-build published passport, so
+        # inject one directly to prove the reader renders all three classes.
+        extra = self.publish("extra", capabilities=["cap.a"])  # published AFTER
+        self.conn.execute(
+            "INSERT INTO routing_plan_candidates (plan_id, agent_id, verdict, "
+            "reasons_json, warnings_json, created_at, content_sha256) VALUES "
+            "(?, ?, 'unresolved', '[\"malformed_declaration\"]', '[]', ?, ?)",
+            (plan.id, extra.id, NOW, HASH),
+        )
+        self.conn.commit()
+        verdicts = {
+            c["agent"]: c["verdict"]
+            for c in routing.plan_public(self.conn, plan)["candidates"]
+        }
+        self.assertEqual(verdicts["elig"], "eligible")
+        self.assertEqual(verdicts["excl"], "excluded")
+        self.assertEqual(verdicts["extra"], "unresolved")
+
+    def test_verify_pristine_plan_passes(self):
+        self.publish("a", capabilities=["cap.a"])
+        plan = self.plan(capabilities=["cap.a"])
+        result = routing.verify_plan(self.conn, plan.id)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["problems"], [])
+
+    def test_request_canonical_and_digest_mismatch(self):
+        self.publish("a", capabilities=["cap.a"])
+        plan = self.plan(capabilities=["cap.a"])
+        # Non-canonical (re-spaced) request body ⇒ request_mismatch.
+        self.conn.execute(
+            "UPDATE routing_plans SET request_document=? WHERE id=?",
+            (plan.request_document.replace(",", ", "), plan.id),
+        )
+        self.conn.commit()
+        result = routing.verify_plan(self.conn, plan.id)
+        self.assertIn(f"{ids.render_id('routing_plan', plan.id)}: request_mismatch",
+                      result["problems"])
+
+    def test_rank_gap_detected(self):
+        self.publish("a", capabilities=["cap.a"])
+        self.publish("b", capabilities=["cap.a"])
+        plan = self.plan(capabilities=["cap.a"])
+        # Break rank contiguity via raw SQL (bypasses the domain layer).
+        self.conn.execute(
+            "UPDATE routing_plan_candidates SET rank=5 WHERE plan_id=? AND rank=2",
+            (plan.id,),
+        )
+        self.conn.commit()
+        self.assertIn(f"{ids.render_id('routing_plan', plan.id)}: rank_gap",
+                      routing.verify_plan(self.conn, plan.id)["problems"])
+
+    def test_count_status_incoherence_detected(self):
+        self.publish("a", capabilities=["cap.a"])
+        plan = self.plan(capabilities=["cap.a"])
+        self.conn.execute(
+            "UPDATE routing_plans SET eligible_count=9 WHERE id=?", (plan.id,)
+        )
+        self.conn.commit()
+        problems = routing.verify_plan(self.conn, plan.id)["problems"]
+        self.assertTrue(any("counts_incoherent" in p for p in problems))
+
+    def test_invalid_reason_vocabulary_detected(self):
+        self.publish("a", capabilities=["cap.a"])
+        plan = self.plan(capabilities=["cap.a"])
+        self.conn.execute(
+            "UPDATE routing_plan_candidates SET reasons_json='[\"not_a_code\"]' "
+            "WHERE plan_id=?",
+            (plan.id,),
+        )
+        self.conn.commit()
+        self.assertFalse(routing.verify_plan(self.conn, plan.id)["ok"])
+
+    def test_invalid_ordering_json_detected(self):
+        self.publish("a", capabilities=["cap.a"])
+        plan = self.plan(capabilities=["cap.a"])
+        self.conn.execute(
+            "UPDATE routing_plan_candidates SET ordering_json='[9,9,9,9,9,9]' "
+            "WHERE plan_id=? AND verdict='eligible'",
+            (plan.id,),
+        )
+        self.conn.commit()
+        self.assertFalse(routing.verify_plan(self.conn, plan.id)["ok"])
+
+    def test_dangling_pin_reference_detected(self):
+        self.publish("a", capabilities=["cap.a"])
+        plan = self.plan(capabilities=["cap.a"])
+        self.conn.commit()
+        # Point an eligible pin at a passport version that does not exist
+        # (composite FK disabled only for this out-of-band edit).
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        self.conn.execute(
+            "UPDATE routing_plan_candidates SET passport_version=99 "
+            "WHERE plan_id=? AND verdict='eligible'",
+            (plan.id,),
+        )
+        self.conn.commit()
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        problems = routing.verify_plan(self.conn, plan.id)["problems"]
+        self.assertTrue(any("reference_invalid" in p for p in problems))
+
+    def test_reads_emit_no_events_and_no_writes(self):
+        self.publish("a", capabilities=["cap.a"])
+        plan = self.plan(capabilities=["cap.a"])
+        snapshot = (self.count("events"), self.count("routing_plans"),
+                    self.count("routing_plan_candidates"))
+        routing.list_plans(self.conn)
+        routing.plan_public(self.conn, plan)
+        routing.verify_plan(self.conn, plan.id)
+        self.assertEqual(
+            (self.count("events"), self.count("routing_plans"),
+             self.count("routing_plan_candidates")),
+            snapshot,
+        )
+
+    def test_verification_details_are_bounded_and_value_free(self):
+        self.publish("secretive", capabilities=["cap.a"])
+        plan = self.plan(capabilities=["cap.a"])
+        self.conn.execute(
+            "UPDATE routing_plans SET content_sha256=? WHERE id=?", ("d" * 64, plan.id)
+        )
+        self.conn.commit()
+        for problem in routing.verify_plan(self.conn, plan.id)["problems"]:
+            self.assertNotRegex(problem, r"[0-9a-f]{64}")   # no full hash
+            self.assertNotIn("SELECT", problem)
+            self.assertNotIn("cap.a", problem)
+
+
+# ---------------------------------------------------------------------------
+# (94)-(98) EVENT PRIVACY
+
+class Wave3EventPrivacyTests(_LiveCase):
+    def _payload(self):
+        self.publish("a", capabilities=["cap.a"])
+        routing.create_plan(self.conn, self.request(capabilities=["cap.a"]))
+        row = self.conn.execute(
+            "SELECT entity, action, payload_json FROM events "
+            "WHERE entity='routing_plan' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return row["entity"], row["action"], json.loads(row["payload_json"])
+
+    def test_exact_entity_and_action(self):
+        entity, action, _ = self._payload()
+        self.assertEqual((entity, action), ("routing_plan", "create"))
+
+    def test_payload_keys_are_a_subset_of_the_allowlist(self):
+        _, _, payload = self._payload()
+        allowed = set(routing.ROUTING_PLAN_EVENT_KEYS) | {
+            "schema_version", "secret_warning", "secret_fields", "secret_patterns"
+        }
+        self.assertTrue(set(payload).issubset(allowed), set(payload) - allowed)
+
+    def test_no_full_hash_and_no_prose_in_payload(self):
+        _, _, payload = self._payload()
+        blob = json.dumps(payload)
+        self.assertNotRegex(blob, r"[0-9a-f]{64}")      # only 12-char prefixes
+        for prose in ("cap.a", "request_document", "reasons", "ordering", "role",
+                      "mission", "approval"):
+            self.assertNotIn(prose, blob)
+
+    def test_secret_shaped_input_is_warned_and_redacted_not_blocked(self):
+        # A github-token shape that also satisfies the capability pattern, so it
+        # survives validation and reaches the warn-on-write scan.
+        secret = "ghp_" + "a" * 24
+        self.publish("a", capabilities=["cap.a"])
+        request = self.request(capabilities=[secret])
+        with contextlib.redirect_stderr(io.StringIO()):  # swallow the stderr warning
+            plan_id = routing.create_plan(self.conn, request)  # NOT blocked
+        plan = routing.get_plan(self.conn, plan_id)
+        self.assertIn(secret, plan.request_document)      # canonical row keeps it
+        row = self.conn.execute(
+            "SELECT payload_json FROM events WHERE entity='routing_plan' "
+            "AND entity_id=?",
+            (plan_id,),
+        ).fetchone()
+        self.assertNotIn(secret, row["payload_json"])     # event never carries it
+        self.assertIn("secret_warning", row["payload_json"])
+
+
+# ---------------------------------------------------------------------------
+# (99)-(101) REGRESSION
+
+class Wave3RegressionTests(_LiveCase):
+    def test_no_governed_handoff_rows_created(self):
+        self.publish("a", capabilities=["cap.a"])
+        self.plan(capabilities=["cap.a"])
+        self.assertEqual(self.count("agent_handoffs"), 0)
+        self.assertEqual(self.count("agent_handoff_transitions"), 0)
+
+    def test_no_run_or_provider_execution(self):
+        self.publish("a", capabilities=["cap.a"])
+        self.plan(capabilities=["cap.a"])
+        self.assertEqual(self.count("runs"), 0)
+
+    def test_agent_handoffs_module_not_imported_by_routing(self):
+        self.assertFalse(hasattr(routing, "agent_handoffs"))
+
+    def test_legacy_handoff_table_untouched(self):
+        self.publish("a", capabilities=["cap.a"])
+        self.plan(capabilities=["cap.a"])
+        self.assertEqual(self.count("handoffs"), 0)  # legacy table, distinct
+
+
+class Wave3VerifySeparationRegressionTests(_LiveCase):
+    """verify_plan separates HISTORICAL integrity from CURRENT-ledger
+    staleness: a legitimate advance of the mutable current state (new
+    passport version, lifecycle/identity drift) reads stale-but-intact
+    (`ok` True), while tampering with the pinned historical passport itself
+    is an integrity failure (`ok` False) — never the other way around."""
+
+    def test_new_current_passport_is_stale_but_intact(self):
+        self.publish("a", capabilities=["cap.a"])
+        plan = self.plan(capabilities=["cap.a"])
+        pristine = routing.verify_plan(self.conn, plan.id)
+        self.assertTrue(pristine["ok"])
+        self.assertFalse(pristine["stale"])
+        self.assertEqual(pristine["problems"], [])
+        self.publish_v2("a", capabilities=["cap.a"])
+        result = routing.verify_plan(self.conn, plan.id)
+        # A current-passport advance is drift, not historical corruption.
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["stale"])
+        self.assertFalse(result["superseded"])
+        self.assertEqual(result["problems"], [])
+        self.assertIn("passport_version_changed", result["staleness_reasons"])
+
+    def test_lifecycle_and_identity_change_is_stale_but_intact(self):
+        self.publish("a", capabilities=["cap.a"])
+        plan = self.plan(capabilities=["cap.a"])
+        passports.transition_lifecycle(self.conn, name="a", verb="suspend")
+        result = routing.verify_plan(self.conn, plan.id)
+        # Mutable current-identity drift never fails historical verification.
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["stale"])
+        self.assertEqual(result["problems"], [])
+        self.assertIn("lifecycle_not_active", result["staleness_reasons"])
+        self.assertIn("identity_changed", result["staleness_reasons"])
+
+    def test_pinned_historical_passport_tamper_fails_verification(self):
+        self.publish("a", capabilities=["cap.a"])
+        plan = self.plan(capabilities=["cap.a"])
+        candidate = self.by_name(plan)["a"]
+        self.assertEqual(candidate.verdict, "eligible")
+        passport = passports.get_passport(
+            self.conn, candidate.agent_id, candidate.passport_version
+        )
+        # Replace the pinned historical document with a structurally valid,
+        # re-sealed canonical document whose body (and therefore digest)
+        # differs — isolating the digest pin from malformed-JSON failures.
+        # Candidate and plan rows (and their hashes) stay untouched.
+        document = protocols.parse_canonical(passport.document.encode("utf-8"))
+        document["mission"] = "do tampered mission"
+        document.pop(protocols.CONTENT_HASH_FIELD, None)
+        document[protocols.CONTENT_HASH_FIELD] = protocols.content_digest(document)
+        tampered_text = protocols.serialize_canonical(document).decode("utf-8")
+        self.assertNotEqual(tampered_text, passport.document)
+        self.conn.execute(
+            "UPDATE agent_passports SET document=? WHERE id=?",
+            (tampered_text, passport.id),
+        )
+        self.conn.commit()
+        result = routing.verify_plan(self.conn, plan.id)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["stale"])
+        self.assertIn("passport_digest_changed", result["staleness_reasons"])
+        self.assertTrue(
+            any(p.endswith("pin_mismatch") for p in result["problems"]),
+            result["problems"],
+        )
+        # Problems stay bounded and value-free: no document body, no tampered
+        # value, no full hash.
+        for problem in result["problems"]:
+            self.assertNotIn("tampered mission", problem)
+            self.assertNotIn(tampered_text, problem)
+            self.assertNotIn(passport.document, problem)
+            self.assertNotRegex(problem, r"[0-9a-f]{64}")
+
+
+# ---------------------------------------------------------------------------
+# (76)-(93) CLI + POWER
+
+class Wave3CliCase(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name).resolve()
+        self.run_cli("init")
+        self.run_cli("project", "add", "demo", "--name", "Demo", "--repo",
+                     str(self.root))
+
+    def run_cli(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(["--root", str(self.root), *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def make_agent(self, name, **body):
+        frag = self.root / f"{name}.json"
+        frag.write_text(json.dumps(body or {"capabilities": ["cap.a"]}),
+                        encoding="utf-8")
+        self.run_cli("agent", "create", name, "--role", "w", "--mission", "m",
+                     "--from-file", str(frag))
+        self.run_cli("agent", "passport", "publish", name)
+
+
+class Wave3CliParserTests(Wave3CliCase):
+    def test_parser_exposes_exactly_four_route_leaves(self):
+        leaves = {
+            p for p in power.iter_command_paths(cli.build_parser())
+            if p[:2] == ("agent", "route")
+        }
+        self.assertEqual(
+            leaves,
+            {
+                ("agent", "route", "plan"),
+                ("agent", "route", "list"),
+                ("agent", "route", "show"),
+                ("agent", "route", "verify"),
+            },
+        )
+
+    def test_no_route_select_leaf(self):
+        leaves = power.iter_command_paths(cli.build_parser())
+        self.assertNotIn(("agent", "route", "select"), leaves)
+
+    def test_require_autonomy_is_repeatable_and_require_classification_is_scalar(self):
+        parser = cli.build_parser()
+        args = parser.parse_args([
+            "agent", "route", "plan",
+            "--require-autonomy", "scoped", "--require-autonomy", "supervised",
+            "--require-classification", "internal",
+        ])
+        self.assertEqual(args.require_autonomy, ["scoped", "supervised"])
+        self.assertEqual(args.require_classification, "internal")
+
+    def test_no_autonomy_ceiling_flag(self):
+        parser = cli.build_parser()
+        with self.assertRaises(AosError):
+            parser.parse_args(
+                ["agent", "route", "plan", "--autonomy-ceiling", "scoped"]
+            )
+
+
+class Wave3CliBehaviorTests(Wave3CliCase):
+    def test_plan_text_and_json(self):
+        self.make_agent("alpha", capabilities=["cap.a"])
+        code, out, _ = self.run_cli("agent", "route", "plan", "--capability", "cap.a")
+        self.assertEqual(code, 0)
+        self.assertIn("RP-0001", out)
+        self.assertIn("1. alpha", out)
+        code, out, _ = self.run_cli(
+            "agent", "route", "plan", "--capability", "cap.a", "--json"
+        )
+        self.assertEqual(code, 0)
+        doc = json.loads(out)
+        self.assertEqual(doc["plan"]["result_status"], "resolved")
+        self.assertEqual(len(doc["plan"]["candidates"]), 1)
+
+    def test_list_show_verify(self):
+        self.make_agent("alpha", capabilities=["cap.a"])
+        self.run_cli("agent", "route", "plan", "--capability", "cap.a")
+        code, out, _ = self.run_cli("agent", "route", "list", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(json.loads(out)["plans"]), 1)
+        code, out, _ = self.run_cli("agent", "route", "show", "RP-0001")
+        self.assertEqual(code, 0)
+        self.assertIn("RP-0001", out)
+        code, out, _ = self.run_cli("agent", "route", "show", "RP-0001", "--request")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            protocols.serialize_canonical(json.loads(out)).decode("utf-8"),
+            out.strip(),
+        )
+        code, out, _ = self.run_cli("agent", "route", "verify", "RP-0001")
+        self.assertEqual(code, 0)
+        self.assertIn("OK", out)
+
+    def test_verify_exit_1_on_integrity_failure(self):
+        self.make_agent("alpha", capabilities=["cap.a"])
+        self.run_cli("agent", "route", "plan", "--capability", "cap.a")
+        conn = db.open_db(self.root / ".agentic-os")
+        try:
+            conn.execute("UPDATE routing_plans SET content_sha256=?", ("e" * 64,))
+            conn.commit()
+        finally:
+            conn.close()
+        code, out, err = self.run_cli("agent", "route", "verify", "RP-0001")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("mismatch", err)
+
+    def test_max_candidates_is_text_only(self):
+        for i in range(4):
+            self.make_agent(f"a{i}", capabilities=["cap.a"])
+        self.run_cli("agent", "route", "plan", "--capability", "cap.a",
+                     "--max-candidates", "2")
+        code, out, _ = self.run_cli("agent", "route", "show", "RP-0001")
+        ranked = [l for l in out.splitlines() if l.strip().startswith(("1.", "2.", "3.", "4."))]
+        self.assertEqual(len(ranked), 2)                          # display capped
+        code, out, _ = self.run_cli("agent", "route", "show", "RP-0001", "--json")
+        self.assertEqual(len(json.loads(out)["plan"]["candidates"]), 4)   # storage full
+
+    def test_include_diagnostics_is_text_only(self):
+        self.make_agent("good", capabilities=["cap.a"])
+        self.make_agent("bad", capabilities=["cap.z"])
+        # No CLI flag sets include_diagnostics=false; the renderer respects the
+        # STORED value, so drive it through the request/renderer layer.
+        conn = db.open_db(self.root / ".agentic-os")
+        try:
+            request = routing.validate_request({
+                "request_schema": routing.REQUEST_SCHEMA,
+                "algorithm_version": routing.ALGORITHM_VERSION,
+                "capabilities": ["cap.a"],
+                "include_diagnostics": False,
+            })
+            pid = routing.create_plan(conn, request)
+            lines = routing.render_plan_lines(conn, routing.get_plan(conn, pid))
+            self.assertFalse(any("bad" in l for l in lines))     # diagnostics hidden
+            request_on = routing.validate_request({
+                "request_schema": routing.REQUEST_SCHEMA,
+                "algorithm_version": routing.ALGORITHM_VERSION,
+                "capabilities": ["cap.a"],
+                "include_diagnostics": True,
+            })
+            pid2 = routing.create_plan(conn, request_on)
+            lines_on = routing.render_plan_lines(conn, routing.get_plan(conn, pid2))
+            self.assertTrue(any("bad" in l for l in lines_on))   # diagnostics shown
+        finally:
+            conn.close()
+
+    def test_malformed_ids_refuse(self):
+        code, _, err = self.run_cli("agent", "route", "show", "not-an-id")
+        self.assertEqual(code, 1)
+        code, _, err = self.run_cli(
+            "agent", "route", "plan", "--task", "bogus", "--capability", "cap.a"
+        )
+        self.assertEqual(code, 1)
+
+    def test_recovery_blocks_plan_and_allows_reads(self):
+        self.make_agent("alpha", capabilities=["cap.a"])
+        self.run_cli("agent", "route", "plan", "--capability", "cap.a")
+        self.run_cli("power", "set", "recovery")
+        code, out, err = self.run_cli("agent", "route", "plan", "--capability", "cap.a")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("recovery mode", err)
+        for leaf in (("agent", "route", "list"),
+                     ("agent", "route", "show", "RP-0001"),
+                     ("agent", "route", "verify", "RP-0001")):
+            with self.subTest(leaf=leaf):
+                code, _, _ = self.run_cli(*leaf)
+                self.assertEqual(code, 0)
+
+    def test_route_plan_deep_wrap_and_eco_immediate(self):
+        self.make_agent("alpha", capabilities=["cap.a"])
+        self.run_cli("power", "set", "deep")
+        code, _, _ = self.run_cli("agent", "route", "plan", "--capability", "cap.a")
+        self.assertEqual(code, 0)      # deep preflight+postverify pass on a clean ledger
+        self.run_cli("power", "set", "eco")
+        code, out, _ = self.run_cli("agent", "route", "plan", "--capability", "cap.a")
+        self.assertEqual(code, 0)      # explicit write runs immediately under eco
+        self.assertIn("RP-0002", out)
+
+    def test_entrypoints_equivalent_for_route_show(self):
+        self.make_agent("alpha", capabilities=["cap.a"])
+        self.run_cli("agent", "route", "plan", "--capability", "cap.a")
+        _, out, _ = self.run_cli("agent", "route", "show", "RP-0001", "--json")
+        import subprocess
+
+        proc = subprocess.run(
+            [
+                "python3", "aos.py", "--root", str(self.root),
+                "agent", "route", "show", "RP-0001", "--json",
+            ],
+            cwd=str(REPO_ROOT), capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(out, proc.stdout)
 
 
 if __name__ == "__main__":

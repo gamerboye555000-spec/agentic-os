@@ -783,6 +783,166 @@ def cmd_agent_catalog_install(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# U-A3 governed routing — four leaves under `agent route`. `plan` is the only
+# write (an authoritative ledger write: plan row + candidate rows + one audit
+# event, one transaction, recovery-blocked, deep-verified). `list`/`show`/
+# `verify` are read-only and usable in recovery: inspecting a stale or tampered
+# plan is exactly what recovery is for. Routing is advisory — a plan orders and
+# explains candidate declarations; it grants, executes, schedules and installs
+# nothing.
+
+def _route_request_from_args(args) -> dict:
+    """The canonical request document a `route plan` invocation authors, from
+    CLI flags only — no DB access. `validate_request` (called next) is the one
+    place vocabulary, bounds, duplicates and sorting are enforced."""
+    from . import routing
+
+    raw: dict = {
+        "request_schema": routing.REQUEST_SCHEMA,
+        "algorithm_version": routing.ALGORITHM_VERSION,
+    }
+    if args.task is not None:
+        raw["task"] = ids.parse_id(args.task, "task")
+    if args.project is not None:
+        raw["project"] = args.project
+    for flag, key in (
+        (args.family, "task_families"),
+        (args.capability, "capabilities"),
+        (args.evidence_kind, "evidence_kinds"),
+        (args.require_autonomy, "required_autonomy"),
+        (args.skill, "skills"),
+        (args.tool, "tools"),
+    ):
+        if flag:
+            raw[key] = list(flag)
+    if args.require_classification is not None:
+        raw["required_data_classification"] = args.require_classification
+    if args.require_scope is not None:
+        raw["required_scope"] = args.require_scope
+    if args.require_class is not None:
+        raw["required_agent_class"] = args.require_class
+    model_capabilities: dict = {}
+    if args.min_context_tokens is not None:
+        model_capabilities["min_context_tokens"] = args.min_context_tokens
+    if args.modality:
+        model_capabilities["modalities"] = list(args.modality)
+    if model_capabilities:
+        raw["model_capabilities"] = model_capabilities
+    if args.prefer is not None:
+        raw["preferred_agent"] = args.prefer
+    raw["scope_preference"] = args.scope_preference
+    raw["surplus_policy"] = args.surplus_policy
+    raw["max_candidates"] = args.max_candidates
+    return routing.validate_request(raw)
+
+
+def cmd_agent_route_plan(args) -> int:
+    from . import routing
+
+    request = _route_request_from_args(args)
+    supersedes_id = (
+        ids.parse_id(args.supersedes, "routing_plan")
+        if args.supersedes is not None
+        else None
+    )
+    with _ledger(args) as (aos_dir, conn):
+        plan_id = routing.create_plan(conn, request, supersedes_id=supersedes_id)
+        plan = routing.get_plan(conn, plan_id)
+        if args.json:
+            _print_json({"plan": routing.plan_public(conn, plan)})
+            return 0
+        for line in routing.render_plan_lines(conn, plan):
+            print(line)
+    return 0
+
+
+def cmd_agent_route_list(args) -> int:
+    from . import routing
+
+    task_id = ids.parse_id(args.task, "task") if args.task is not None else None
+    with _ledger(args) as (aos_dir, conn):
+        plans = routing.list_plans(conn, task_id=task_id)
+        if args.json:
+            _print_json({"plans": plans})
+            return 0
+        if not plans:
+            print("(no routing plans)")
+            return 0
+        for row in plans:
+            flags = []
+            if row["stale"]:
+                flags.append("stale")
+            if row["superseded"]:
+                flags.append("superseded")
+            suffix = f"  [{', '.join(flags)}]" if flags else ""
+            print(
+                f"{row['plan']}  {row['created_at']}  {row['result_status']:<22} "
+                f"eligible {row['eligible_count']} · unresolved "
+                f"{row['unresolved_count']} · excluded {row['excluded_count']}"
+                f"{suffix}"
+            )
+    return 0
+
+
+def cmd_agent_route_show(args) -> int:
+    from . import routing
+
+    plan_id = ids.parse_id(args.id, "routing_plan")
+    with _ledger(args) as (aos_dir, conn):
+        plan = routing.get_plan(conn, plan_id)
+        if plan is None:
+            raise AosError(
+                f"No routing plan {ids.render_id('routing_plan', plan_id)}. "
+                "Run: python aos.py agent route list"
+            )
+        if args.request:
+            sys.stdout.write(plan.request_document + "\n")
+            return 0
+        if args.json:
+            _print_json({"plan": routing.plan_public(conn, plan)})
+            return 0
+        public = routing.plan_public(conn, plan)
+        for line in routing.render_plan_lines(conn, plan):
+            print(line)
+        print(f"task:         {_dash(public['task'])}")
+        print(f"project:      {_dash(public['project'])}")
+        print(f"scope:        {plan.scope}")
+        print(f"created:      {plan.created_at}")
+        print(f"algorithm:    {plan.algorithm_version}")
+        print(f"request:      {plan.request_sha256}")
+        print(f"content:      {plan.content_sha256}")
+        if public["supersedes"]:
+            print(f"supersedes:   {public['supersedes']}")
+        if public["superseded_by"]:
+            print(f"superseded by {public['superseded_by']}")
+    return 0
+
+
+def cmd_agent_route_verify(args) -> int:
+    from . import routing
+
+    plan_id = ids.parse_id(args.id, "routing_plan")
+    with _ledger(args) as (aos_dir, conn):
+        result = routing.verify_plan(conn, plan_id)
+        if args.json:
+            _print_json(result)
+            return 0 if result["ok"] else 1
+        if result["ok"]:
+            labels = []
+            if result["stale"]:
+                labels.append("stale")
+            if result["superseded"]:
+                labels.append("superseded")
+            note = f" ({', '.join(labels)})" if labels else ""
+            print(f"{result['plan']}: OK{note}")
+            return 0
+        for problem in result["problems"]:
+            print(problem, file=sys.stderr)
+        print(f"{len(result['problems'])} problem(s) found", file=sys.stderr)
+    return 1
+
+
 def cmd_evidence_git(args) -> int:
     task_id = ids.parse_id(args.id, "task")
     with _ledger(args) as (aos_dir, conn):
@@ -2661,6 +2821,110 @@ def build_parser() -> _Parser:
     p_catalog_install.add_argument("--all", action="store_true")
     p_catalog_install.add_argument("--json", action="store_true")
     p_catalog_install.set_defaults(func=cmd_agent_catalog_install)
+
+    # U-A3 governed routing. Four leaves: `plan` writes an advisory,
+    # deterministically ordered plan (the only write); `list`/`show`/`verify`
+    # are read-only. No `route select` leaf exists — explicit selection is a
+    # handoff referencing a plan, not a second record.
+    p_agent_route = agent_sub.add_parser(
+        "route", help="governed advisory routing (orders and explains "
+        "candidate declarations; never executes, schedules or installs)"
+    )
+    route_sub = p_agent_route.add_subparsers(
+        dest="subsubcommand", metavar="SUBCOMMAND", required=True
+    )
+
+    p_route_plan = route_sub.add_parser(
+        "plan", help="evaluate installed agents against a described task and "
+        "store the ranked advisory plan"
+    )
+    p_route_plan.add_argument("--task", default=None, metavar="T-…")
+    p_route_plan.add_argument("--project", default=None, metavar="SLUG")
+    p_route_plan.add_argument(
+        "--family", action="append", metavar="FAMILY",
+        help="required task family (repeatable)",
+    )
+    p_route_plan.add_argument(
+        "--capability", action="append", metavar="CAP",
+        help="required capability (repeatable)",
+    )
+    p_route_plan.add_argument(
+        "--evidence-kind", action="append", metavar="KIND",
+        help="required evidence kind (repeatable)",
+    )
+    p_route_plan.add_argument(
+        "--require-classification", default=None, metavar="LVL",
+        help="required data classification (set membership, never a ceiling)",
+    )
+    p_route_plan.add_argument(
+        "--require-autonomy", action="append", metavar="LVL",
+        help="an allowed autonomy value (repeatable; set membership, never a "
+        "rank or ceiling)",
+    )
+    p_route_plan.add_argument(
+        "--require-scope", default=None, choices=("global", "project"),
+    )
+    p_route_plan.add_argument(
+        "--require-class", default=None, metavar="CLASS",
+    )
+    p_route_plan.add_argument(
+        "--skill", action="append", metavar="SKILL",
+        help="required skill declaration (repeatable)",
+    )
+    p_route_plan.add_argument(
+        "--tool", action="append", metavar="TOOL",
+        help="required tool declaration (repeatable)",
+    )
+    p_route_plan.add_argument(
+        "--min-context-tokens", type=int, default=None, metavar="N",
+    )
+    p_route_plan.add_argument(
+        "--modality", action="append", metavar="MODALITY",
+        help="required model modality (repeatable)",
+    )
+    p_route_plan.add_argument(
+        "--prefer", default=None, metavar="NAME",
+        help="preferred agent (ordering only; never changes a verdict)",
+    )
+    p_route_plan.add_argument(
+        "--scope-preference", default="specific_first",
+        choices=("specific_first", "none"),
+    )
+    p_route_plan.add_argument(
+        "--surplus-policy", default="minimal", choices=("minimal", "ignore"),
+    )
+    p_route_plan.add_argument(
+        "--max-candidates", type=int, default=5, metavar="N",
+        help="display cap on printed eligible rows (storage keeps them all)",
+    )
+    p_route_plan.add_argument("--supersedes", default=None, metavar="RP-…")
+    p_route_plan.add_argument("--json", action="store_true")
+    p_route_plan.set_defaults(func=cmd_agent_route_plan)
+
+    p_route_list = route_sub.add_parser(
+        "list", help="routing plans, newest first"
+    )
+    p_route_list.add_argument("--task", default=None, metavar="T-…")
+    p_route_list.add_argument("--json", action="store_true")
+    p_route_list.set_defaults(func=cmd_agent_route_list)
+
+    p_route_show = route_sub.add_parser(
+        "show", help="one routing plan in full, with its staleness verdict"
+    )
+    p_route_show.add_argument("id", metavar="RP-0001")
+    p_route_show.add_argument(
+        "--request", action="store_true",
+        help="print the stored canonical request document instead",
+    )
+    p_route_show.add_argument("--json", action="store_true")
+    p_route_show.set_defaults(func=cmd_agent_route_show)
+
+    p_route_verify = route_sub.add_parser(
+        "verify", help="recompute a plan's hashes, chain, pins and staleness"
+    )
+    p_route_verify.add_argument("id", metavar="RP-0001")
+    p_route_verify.add_argument("--json", action="store_true")
+    p_route_verify.set_defaults(func=cmd_agent_route_verify)
 
     p_ingest = sub.add_parser("ingest", help="ingest agent write-back artifacts")
     ingest_sub = p_ingest.add_subparsers(

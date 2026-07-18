@@ -719,6 +719,10 @@ class RecoveryTests(PowerCase):
         # U-A2's only catalog writer: identity + passport rows, pointers,
         # hashes and an event in one transaction.
         (("agent", "catalog", "install"), ("agent", "catalog", "install", "--all")),
+        # U-A3's only routing writer: a plan row, its candidate rows, their
+        # hashes and one audit event in one transaction. The three read-only
+        # route leaves stay available in recovery and are NOT listed here.
+        (("agent", "route", "plan"), ("agent", "route", "plan")),
         (("ingest", "dropfile"), ("ingest", "dropfile", "SELF")),
         (("done",), ("done", "T-0002", "--no-evidence", "--reason", "because")),
         (("pack", "build"), ("pack", "build", "T-0002")),
