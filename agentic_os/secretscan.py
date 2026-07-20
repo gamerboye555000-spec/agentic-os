@@ -67,8 +67,15 @@ TRUSTED_FIELD_LABELS = frozenset(
         "approval",
         "capabilities",
         "claim",
+        # U-A3 governed handoff prose. objective/constraint are bounded human
+        # descriptions of a delegation; handoff_note is a per-transition note
+        # (deliberately NOT `note`, which would sit beside `notes` and invite
+        # confusion). All three reach exports and the mirror, so all are
+        # scanned at the trusted-write boundary.
+        "constraint",
         "decision",
         "from_agent",
+        "handoff_note",
         "key",
         "limitation",
         # U-M3 memory sources. A locator is a path, URL or command string the
@@ -78,6 +85,7 @@ TRUSTED_FIELD_LABELS = frozenset(
         "mission",
         "name",
         "notes",
+        "objective",
         "provenance",
         "reason",
         "ref",

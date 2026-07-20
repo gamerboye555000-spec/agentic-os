@@ -48,6 +48,7 @@ from unittest import mock
 from fixtures.v3_workspace import build_v3_workspace, table_contents
 
 from agentic_os import (
+    agent_handoffs,
     cli,
     db,
     events,
@@ -59,6 +60,7 @@ from agentic_os import (
     power,
     protocols,
     routing,
+    utils,
 )
 from agentic_os.utils import AosError
 
@@ -3890,6 +3892,1203 @@ class Wave3CliBehaviorTests(Wave3CliCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(out, proc.stdout)
+
+
+# ===========================================================================
+# WAVE 4 — governed agent handoffs (agent_handoffs.py): creation, the
+# transition engine, supersession, record hashes, the no-laundering gate,
+# reads, verification, rollback, concurrency, the discard guard and the
+# secret labels. Contract §11-16, §19, §21; test matrix groups 28-38.
+# ===========================================================================
+
+ALL_CLASSES = list(models.MEMORY_SENSITIVITIES)
+
+
+class _HandoffCase(_LiveCase):
+    """A live workspace with a project, a task and two published agents that
+    declare every data classification (so a default `internal` handoff raises
+    no advisory). The base for the Wave 4 domain tests."""
+
+    def setUp(self):
+        super().setUp()
+        self.add_project("demo")
+        self.task = self.add_task(project="demo", title="build")
+        self.alice = self.publish(
+            "alice", capabilities=["cap.a"], data_classifications=ALL_CLASSES
+        )
+        self.bob = self.publish(
+            "bob", capabilities=["cap.a"], data_classifications=ALL_CLASSES
+        )
+
+    def make_handoff(self, **over):
+        params = dict(
+            task_id=self.task.id,
+            from_agent="alice",
+            to_agent="bob",
+            objective_md="ship the widget",
+        )
+        params.update(over)
+        with contextlib.redirect_stderr(io.StringIO()):
+            handoff_id = agent_handoffs.create_handoff(self.conn, **params)
+        return agent_handoffs.get_handoff(self.conn, handoff_id)
+
+    def _mark_task_done(self):
+        self.conn.execute(
+            "UPDATE tasks SET status='done' WHERE id=?", (self.task.id,)
+        )
+        self.conn.commit()
+
+    def transition(self, handoff, verb, **kw):
+        with contextlib.redirect_stderr(io.StringIO()):
+            agent_handoffs.transition(self.conn, handoff.id, verb, **kw)
+        return agent_handoffs.get_handoff(self.conn, handoff.id)
+
+    def payloads(self, action=None):
+        query = (
+            "SELECT action, payload_json FROM events WHERE entity='agent_handoff'"
+        )
+        params: list = []
+        if action is not None:
+            query += " AND action=?"
+            params.append(action)
+        query += " ORDER BY id"
+        return [
+            (row["action"], json.loads(row["payload_json"]))
+            for row in self.conn.execute(query, params).fetchall()
+        ]
+
+    def _row(self, handoff_id):
+        return dict(
+            self.conn.execute(
+                "SELECT * FROM agent_handoffs WHERE id=?", (handoff_id,)
+            ).fetchone()
+        )
+
+
+# ---------------------------------------------------------------------------
+# (28) Handoff creation.
+
+class HandoffCreationTests(_HandoffCase):
+    def test_full_field_row_pins_and_one_propose_event(self):
+        decision = ops.add_decision(
+            self.conn, title="why", project_slug="demo", decision="because"
+        )
+        before = self.count("events")
+        handoff = self.make_handoff(
+            expected_evidence=["test", "commit"],
+            min_evidence_count=2,
+            constraints_md="stay in scope",
+            data_classification="confidential",
+            decision_id=decision.id,
+        )
+        self.assertEqual(handoff.state, "proposed")
+        self.assertEqual(handoff.created_at, handoff.updated_at)
+        self.assertEqual(handoff.from_agent_id, self.alice.id)
+        self.assertEqual(handoff.to_agent_id, self.bob.id)
+        self.assertEqual(handoff.actor, ops.ACTOR_HUMAN)
+        self.assertEqual(handoff.expected_evidence_json, '["commit","test"]')
+        self.assertEqual(handoff.min_evidence_count, 2)
+        self.assertEqual(handoff.constraints_md, "stay in scope")
+        self.assertEqual(handoff.data_classification, "confidential")
+        self.assertEqual(handoff.decision_id, decision.id)
+        # zero transition rows, empty-chain hash committed (never _PENDING_HASH)
+        self.assertEqual(agent_handoffs.get_transitions(self.conn, handoff.id), [])
+        self.assertTrue(models.is_claim_hash(handoff.content_sha256))
+        self.assertEqual(
+            handoff.content_sha256, agent_handoffs.handoff_digest(handoff, [])
+        )
+        # exactly one propose event
+        self.assertEqual(self.count("events"), before + 1)
+        actions = [a for a, _ in self.payloads()]
+        self.assertEqual(actions, ["propose"])
+
+    def test_pins_equal_recomputed_passport_digests(self):
+        handoff = self.make_handoff()
+        alice_pp = passports.get_passport(
+            self.conn, self.alice.id, self.alice.current_passport_version
+        )
+        bob_pp = passports.get_passport(
+            self.conn, self.bob.id, self.bob.current_passport_version
+        )
+        self.assertEqual(
+            handoff.from_passport_version, self.alice.current_passport_version
+        )
+        self.assertEqual(
+            handoff.from_passport_sha256,
+            passports.document_digest(alice_pp.document),
+        )
+        self.assertEqual(
+            handoff.to_passport_sha256, passports.document_digest(bob_pp.document)
+        )
+
+    def test_done_task_refused(self):
+        self._mark_task_done()
+        before = self.count("agent_handoffs"), self.count("events")
+        with self.assertRaises(AosError) as ctx:
+            self.make_handoff()
+        self.assertIn("is done", str(ctx.exception))
+        self.assertEqual(
+            (self.count("agent_handoffs"), self.count("events")), before
+        )
+
+    def test_absent_task_refused(self):
+        with self.assertRaises(AosError):
+            self.make_handoff(task_id=99999)
+
+    def test_self_handoff_refused(self):
+        with self.assertRaises(AosError) as ctx:
+            self.make_handoff(to_agent="alice")
+        self.assertIn("different agents", str(ctx.exception))
+        self.assertEqual(self.count("agent_handoffs"), 0)
+
+    def test_draft_participant_refused(self):
+        self.draft("dd", capabilities=["cap.a"])
+        with self.assertRaises(AosError) as ctx:
+            self.make_handoff(to_agent="dd")
+        self.assertIn("active", str(ctx.exception))
+        self.assertEqual(self.count("agent_handoffs"), 0)
+
+    def test_suspended_participant_refused(self):
+        passports.transition_lifecycle(self.conn, name="bob", verb="suspend")
+        with self.assertRaises(AosError):
+            self.make_handoff()
+
+    def test_absent_participant_refused(self):
+        with self.assertRaises(AosError):
+            self.make_handoff(to_agent="ghost")
+
+    def test_objective_bounds(self):
+        with self.assertRaises(AosError):
+            self.make_handoff(objective_md="")
+        with self.assertRaises(AosError):
+            self.make_handoff(objective_md="x" * 4097)
+        handoff = self.make_handoff(objective_md="x" * 4096)
+        self.assertEqual(len(handoff.objective_md), 4096)
+
+    def test_constraints_bounds(self):
+        with self.assertRaises(AosError):
+            self.make_handoff(constraints_md="y" * 4097)
+        self.assertIsNone(self.make_handoff().constraints_md)
+
+    def test_evidence_canonicalization_dedup_and_vocab(self):
+        self.assertEqual(self.make_handoff().expected_evidence_json, "[]")
+        self.assertEqual(
+            self.make_handoff(expected_evidence=["url", "note", "file"]).expected_evidence_json,
+            '["file","note","url"]',
+        )
+        with self.assertRaises(AosError):
+            self.make_handoff(expected_evidence=["note", "note"])
+        with self.assertRaises(AosError):
+            self.make_handoff(expected_evidence=["bogus"])
+
+    def test_min_evidence_bounds_and_bool_rejection(self):
+        with self.assertRaises(AosError):
+            self.make_handoff(min_evidence_count=-1)
+        with self.assertRaises(AosError):
+            self.make_handoff(min_evidence_count=33)
+        with self.assertRaises(AosError):
+            self.make_handoff(min_evidence_count=True)
+        self.assertEqual(self.make_handoff(min_evidence_count=32).min_evidence_count, 32)
+
+    def test_classification_vocabulary(self):
+        with self.assertRaises(AosError):
+            self.make_handoff(data_classification="secret")
+        for level in ALL_CLASSES:
+            self.assertEqual(
+                self.make_handoff(data_classification=level).data_classification,
+                level,
+            )
+
+    def test_decision_reference_must_exist(self):
+        with self.assertRaises(AosError) as ctx:
+            self.make_handoff(decision_id=999)
+        self.assertIn("decision", str(ctx.exception).lower())
+        self.assertEqual(self.count("agent_handoffs"), 0)
+
+
+# ---------------------------------------------------------------------------
+# (28) Optional routing-plan gate.
+
+class HandoffPlanLinkTests(_HandoffCase):
+    def _plan(self, **over):
+        plan_id = routing.create_plan(self.conn, self.request(**over))
+        return routing.get_plan(self.conn, plan_id)
+
+    def test_fresh_intact_unsuperseded_plan_accepted(self):
+        plan = self._plan(capabilities=["cap.a"])
+        handoff = self.make_handoff(plan_id=plan.id)
+        self.assertEqual(handoff.plan_id, plan.id)
+
+    def test_recipient_not_eligible_refused(self):
+        plan = self._plan(capabilities=["cap.z"])  # nobody eligible
+        with self.assertRaises(AosError) as ctx:
+            self.make_handoff(plan_id=plan.id)
+        self.assertIn("eligible candidate", str(ctx.exception))
+        self.assertEqual(self.count("agent_handoffs"), 0)
+
+    def test_stale_plan_refused(self):
+        plan = self._plan(capabilities=["cap.a"])
+        self.publish_v2(
+            "bob", capabilities=["cap.a"], data_classifications=ALL_CLASSES
+        )
+        with self.assertRaises(AosError) as ctx:
+            self.make_handoff(plan_id=plan.id)
+        self.assertIn("stale", str(ctx.exception))
+
+    def test_superseded_plan_refused(self):
+        plan = self._plan(capabilities=["cap.a"])
+        routing.create_plan(
+            self.conn, self.request(capabilities=["cap.a"]), supersedes_id=plan.id
+        )
+        with self.assertRaises(AosError) as ctx:
+            self.make_handoff(plan_id=plan.id)
+        self.assertIn("superseded", str(ctx.exception))
+
+    def test_task_mismatch_refused(self):
+        other = self.add_task(project="demo", title="other")
+        plan = self._plan(task=other.id)  # task-scoped to a different task
+        self.assertEqual(plan.task_id, other.id)
+        with self.assertRaises(AosError) as ctx:
+            self.make_handoff(plan_id=plan.id)
+        self.assertIn("scoped to task", str(ctx.exception))
+
+    def test_integrity_failure_refused(self):
+        plan = self._plan(capabilities=["cap.a"])
+        self.conn.execute(
+            "UPDATE routing_plans SET content_sha256=? WHERE id=?",
+            ("0" * 64, plan.id),
+        )
+        self.conn.commit()
+        with self.assertRaises(AosError) as ctx:
+            self.make_handoff(plan_id=plan.id)
+        self.assertIn("integrity", str(ctx.exception).lower())
+
+    def test_omitting_plan_allows_any_recipient(self):
+        self.assertEqual(self.make_handoff().plan_id, None)
+
+
+# ---------------------------------------------------------------------------
+# (28) Payloads and committed hashes.
+
+class HandoffPayloadHashTests(_HandoffCase):
+    def test_handoff_payload_binds_columns_excludes_content_sha256(self):
+        handoff = self.make_handoff(constraints_md="c")
+        payload = agent_handoffs.handoff_payload(handoff, [])
+        self.assertNotIn("content_sha256", payload)
+        self.assertEqual(payload["record_schema"], "aos.agent-handoff/v1")
+        # integers bind directly; text binds by sha256 leaf
+        self.assertEqual(payload["id"], handoff.id)
+        self.assertEqual(payload["min_evidence_count"], 0)
+        self.assertEqual(
+            payload["objective_md_sha256"],
+            utils.sha256_text(handoff.objective_md),
+        )
+        self.assertEqual(
+            payload["constraints_md_sha256"], utils.sha256_text("c")
+        )
+        self.assertEqual(payload["transition_chain"], [])
+
+    def test_transition_payload_binds_columns(self):
+        handoff = self.transition(self.make_handoff(), "accept")
+        transition = agent_handoffs.get_transitions(self.conn, handoff.id)[0]
+        payload = agent_handoffs.transition_payload(transition)
+        self.assertNotIn("content_sha256", payload)
+        self.assertEqual(
+            payload["record_schema"], "aos.agent-handoff-transition/v1"
+        )
+        self.assertEqual(payload["seq"], 1)
+        self.assertEqual(
+            payload["to_state_sha256"], utils.sha256_text("accepted")
+        )
+
+    def test_committed_hashes_recompute(self):
+        handoff = self.transition(self.make_handoff(), "clarify", reason_code="objective_unclear")
+        handoff = self.transition(handoff, "accept")
+        transitions = agent_handoffs.get_transitions(self.conn, handoff.id)
+        for transition in transitions:
+            self.assertEqual(
+                transition.content_sha256,
+                agent_handoffs.transition_digest(transition),
+            )
+        chain = [agent_handoffs.transition_digest(t) for t in transitions]
+        self.assertEqual(
+            handoff.content_sha256, agent_handoffs.handoff_digest(handoff, chain)
+        )
+
+
+# ---------------------------------------------------------------------------
+# (29-33, 38) Tamper, verification and the no-laundering gate.
+
+class HandoffTamperVerifyTests(_HandoffCase):
+    def test_clean_handoff_verifies_ok(self):
+        handoff = self.transition(self.make_handoff(), "accept")
+        report = agent_handoffs.verify_handoff(self.conn, handoff.id)
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["problems"], [])
+
+    def test_tampered_row_hash_reports_mismatch(self):
+        handoff = self.make_handoff()
+        self.conn.execute(
+            "UPDATE agent_handoffs SET content_sha256=? WHERE id=?",
+            ("1" * 64, handoff.id),
+        )
+        self.conn.commit()
+        report = agent_handoffs.verify_handoff(self.conn, handoff.id)
+        self.assertFalse(report["ok"])
+        self.assertTrue(any("mismatch" in p for p in report["problems"]))
+
+    def test_pending_hash_reports_malformed(self):
+        handoff = self.make_handoff()
+        self.conn.execute(
+            "UPDATE agent_handoffs SET content_sha256='' WHERE id=?", (handoff.id,)
+        )
+        self.conn.commit()
+        report = agent_handoffs.verify_handoff(self.conn, handoff.id)
+        self.assertTrue(any("malformed" in p for p in report["problems"]))
+
+    def test_tampered_prose_reports_mismatch(self):
+        handoff = self.make_handoff()
+        self.conn.execute(
+            "UPDATE agent_handoffs SET objective_md='hacked' WHERE id=?",
+            (handoff.id,),
+        )
+        self.conn.commit()
+        report = agent_handoffs.verify_handoff(self.conn, handoff.id)
+        self.assertTrue(any("mismatch" in p for p in report["problems"]))
+
+    def test_blob_value_reports_unhashable_without_raising(self):
+        handoff = self.make_handoff()
+        self.conn.execute(
+            "UPDATE agent_handoffs SET objective_md=? WHERE id=?",
+            (sqlite3.Binary(b"\x00\x01"), handoff.id),
+        )
+        self.conn.commit()
+        report = agent_handoffs.verify_handoff(self.conn, handoff.id)  # no raise
+        self.assertFalse(report["ok"])
+        self.assertTrue(any("unhashable" in p for p in report["problems"]))
+
+    def test_child_hash_cannot_launder(self):
+        handoff = self.transition(self.make_handoff(), "accept")
+        transition = agent_handoffs.get_transitions(self.conn, handoff.id)[0]
+        # Tamper the transition's to_state; its stored hash no longer matches,
+        # and the parent chain is rebuilt from the RECOMPUTED digest, so the
+        # handoff hash mismatches too — the tamper cannot launder itself.
+        self.conn.execute(
+            "UPDATE agent_handoff_transitions SET to_state='cancelled' WHERE id=?",
+            (transition.id,),
+        )
+        self.conn.commit()
+        report = agent_handoffs.verify_handoff(self.conn, handoff.id)
+        self.assertFalse(report["ok"])
+        self.assertTrue(any("mismatch" in p for p in report["problems"]))
+
+    def test_no_laundering_gate_refuses_write_with_zero_effect(self):
+        handoff = self.make_handoff()
+        self.conn.execute(
+            "UPDATE agent_handoffs SET content_sha256=? WHERE id=?",
+            ("2" * 64, handoff.id),
+        )
+        self.conn.commit()
+        before = self.count("agent_handoff_transitions"), self.count("events")
+        with self.assertRaises(AosError) as ctx:
+            self.transition(handoff, "accept")
+        self.assertIn("Refusing to change", str(ctx.exception))
+        self.assertEqual(
+            (self.count("agent_handoff_transitions"), self.count("events")), before
+        )
+        # Not repaired: the tampered hash is left exactly as planted.
+        self.assertEqual(self._row(handoff.id)["content_sha256"], "2" * 64)
+
+    def test_verify_missing_handoff(self):
+        report = agent_handoffs.verify_handoff(self.conn, 4242)
+        self.assertFalse(report["ok"])
+        self.assertIn("not_found", report["problems"][0])
+
+
+# ---------------------------------------------------------------------------
+# (29-33) Lifecycle matrix.
+
+class HandoffLifecycleTests(_HandoffCase):
+    def test_accept_from_proposed(self):
+        before = self.count("events")
+        handoff = self.transition(self.make_handoff(), "accept")
+        self.assertEqual(handoff.state, "accepted")
+        transitions = agent_handoffs.get_transitions(self.conn, handoff.id)
+        self.assertEqual(len(transitions), 1)
+        self.assertEqual(
+            (transitions[0].seq, transitions[0].from_state, transitions[0].to_state),
+            (1, "proposed", "accepted"),
+        )
+        self.assertEqual(self.count("events"), before + 2)  # propose + accept
+
+    def test_refuse_and_clarify_require_reason(self):
+        with self.assertRaises(AosError):
+            self.transition(self.make_handoff(), "refuse")
+        with self.assertRaises(AosError):
+            self.transition(self.make_handoff(), "clarify")
+        handoff = self.transition(
+            self.make_handoff(), "refuse", reason_code="out_of_scope"
+        )
+        self.assertEqual(handoff.state, "refused")
+        self.assertEqual(
+            agent_handoffs.get_transitions(self.conn, handoff.id)[0].reason_code,
+            "out_of_scope",
+        )
+
+    def test_unknown_reason_code_refused(self):
+        with self.assertRaises(AosError):
+            self.transition(self.make_handoff(), "refuse", reason_code="nope")
+
+    def test_accept_and_cancel_reject_supplied_reason(self):
+        with self.assertRaises(AosError):
+            self.transition(self.make_handoff(), "accept", reason_code="out_of_scope")
+        with self.assertRaises(AosError):
+            self.transition(self.make_handoff(), "cancel", reason_code="out_of_scope")
+
+    def test_clarify_then_accept_contiguous_seq(self):
+        handoff = self.transition(
+            self.make_handoff(), "clarify", reason_code="objective_unclear"
+        )
+        self.assertEqual(handoff.state, "clarification_required")
+        handoff = self.transition(handoff, "accept")
+        self.assertEqual(handoff.state, "accepted")
+        seqs = [t.seq for t in agent_handoffs.get_transitions(self.conn, handoff.id)]
+        self.assertEqual(seqs, [1, 2])
+
+    def test_cancel_from_each_legal_source(self):
+        self.assertEqual(self.transition(self.make_handoff(), "cancel").state, "cancelled")
+        clar = self.transition(
+            self.make_handoff(), "clarify", reason_code="objective_unclear"
+        )
+        self.assertEqual(self.transition(clar, "cancel").state, "cancelled")
+        acc = self.transition(self.make_handoff(), "accept")
+        self.assertEqual(self.transition(acc, "cancel").state, "cancelled")
+
+    def test_idempotent_repeat_refuses_naming_state(self):
+        handoff = self.transition(self.make_handoff(), "accept")
+        with self.assertRaises(AosError) as ctx:
+            self.transition(handoff, "accept")
+        self.assertIn("already accepted", str(ctx.exception))
+
+    def test_illegal_verb_refuses_naming_sources(self):
+        handoff = self.transition(self.make_handoff(), "accept")
+        with self.assertRaises(AosError) as ctx:
+            self.transition(handoff, "clarify", reason_code="objective_unclear")
+        message = str(ctx.exception)
+        self.assertIn("it is accepted", message)
+        self.assertIn("Legal from: proposed", message)
+
+    def test_terminal_states_reject_all_verbs(self):
+        refused = self.transition(
+            self.make_handoff(), "refuse", reason_code="out_of_scope"
+        )
+        for verb in ("accept", "cancel"):
+            with self.assertRaises(AosError):
+                self.transition(refused, verb)
+        for verb in ("refuse", "clarify"):
+            with self.assertRaises(AosError):
+                self.transition(refused, verb, reason_code="operator_judgment")
+
+    def test_note_stored_on_transition_not_event(self):
+        handoff = self.transition(self.make_handoff(), "accept", note_md="looks good")
+        transition = agent_handoffs.get_transitions(self.conn, handoff.id)[0]
+        self.assertEqual(transition.note_md, "looks good")
+        _, payload = self.payloads("accept")[0]
+        self.assertNotIn("note", payload)
+        self.assertNotIn("looks good", json.dumps(payload))
+
+    def test_note_length_bound(self):
+        with self.assertRaises(AosError):
+            self.transition(self.make_handoff(), "accept", note_md="n" * 2049)
+
+    def test_unknown_verb_refused(self):
+        with self.assertRaises(AosError):
+            self.transition(self.make_handoff(), "supersede")
+
+    def test_one_event_per_transition(self):
+        handoff = self.make_handoff()
+        before = self.count("events")
+        self.transition(handoff, "accept")
+        self.assertEqual(self.count("events"), before + 1)
+
+
+# ---------------------------------------------------------------------------
+# (30) Accept-only current-pin gate and closing verbs after invalidation.
+
+class HandoffAcceptGateTests(_HandoffCase):
+    def test_accept_refused_when_participant_suspended(self):
+        handoff = self.make_handoff()
+        passports.transition_lifecycle(self.conn, name="bob", verb="suspend")
+        before = self.count("agent_handoff_transitions"), self.count("events")
+        with self.assertRaises(AosError) as ctx:
+            self.transition(handoff, "accept")
+        self.assertIn("Cannot accept", str(ctx.exception))
+        self.assertEqual(
+            (self.count("agent_handoff_transitions"), self.count("events")), before
+        )
+        self.assertEqual(self._row(handoff.id)["state"], "proposed")
+
+    def test_accept_refused_when_pin_moved(self):
+        handoff = self.make_handoff()
+        self.publish_v2(
+            "bob", capabilities=["cap.a"], data_classifications=ALL_CLASSES
+        )
+        with self.assertRaises(AosError) as ctx:
+            self.transition(handoff, "accept")
+        self.assertIn("pinned v1, now v2", str(ctx.exception))
+
+    def test_accept_refused_when_identity_tampered(self):
+        handoff = self.make_handoff()
+        self.conn.execute(
+            "UPDATE agents SET content_sha256=? WHERE id=?", ("0" * 64, self.bob.id)
+        )
+        self.conn.commit()
+        with self.assertRaises(AosError):
+            self.transition(handoff, "accept")
+
+    def test_closing_verbs_possible_after_participant_invalidation(self):
+        for verb, kw in (
+            ("refuse", {"reason_code": "operator_judgment"}),
+            ("clarify", {"reason_code": "operator_judgment"}),
+            ("cancel", {}),
+        ):
+            with self.subTest(verb=verb):
+                handoff = self.make_handoff()
+                passports.transition_lifecycle(self.conn, name="bob", verb="suspend")
+                result = self.transition(handoff, verb, **kw)
+                self.assertIn(
+                    result.state,
+                    ("refused", "clarification_required", "cancelled"),
+                )
+                passports.transition_lifecycle(self.conn, name="bob", verb="restore")
+
+
+# ---------------------------------------------------------------------------
+# (34-36) Supersession.
+
+class HandoffSupersessionTests(_HandoffCase):
+    def _supersede(self, predecessor, **over):
+        params = dict(
+            task_id=self.task.id,
+            from_agent="alice",
+            to_agent="bob",
+            objective_md="successor",
+            supersedes_id=predecessor.id,
+        )
+        params.update(over)
+        with contextlib.redirect_stderr(io.StringIO()):
+            handoff_id = agent_handoffs.create_handoff(self.conn, **params)
+        return agent_handoffs.get_handoff(self.conn, handoff_id)
+
+    def test_successor_transitions_predecessor(self):
+        predecessor = self.make_handoff()
+        successor = self._supersede(predecessor)
+        self.assertEqual(successor.supersedes_id, predecessor.id)
+        predecessor = agent_handoffs.get_handoff(self.conn, predecessor.id)
+        self.assertEqual(predecessor.state, "superseded")
+        self.assertIsNone(predecessor.supersedes_id)  # pointer never changes
+        transitions = agent_handoffs.get_transitions(self.conn, predecessor.id)
+        self.assertEqual(len(transitions), 1)
+        self.assertEqual(transitions[0].to_state, "superseded")
+        self.assertEqual(
+            agent_handoffs.successor_id(self.conn, predecessor.id), successor.id
+        )
+
+    def test_two_events_emitted_atomically(self):
+        predecessor = self.make_handoff()
+        before = self.count("events")
+        successor = self._supersede(predecessor)
+        actions = [a for a, _ in self.payloads()][-2:]
+        self.assertEqual(self.count("events"), before + 2)
+        self.assertIn("propose", actions)
+        self.assertIn("supersede", actions)
+        _, supersede_payload = [
+            p for p in self.payloads() if p[0] == "supersede"
+        ][-1]
+        self.assertEqual(supersede_payload["to_state"], "superseded")
+
+    def test_supersede_from_accepted(self):
+        predecessor = self.transition(self.make_handoff(), "accept")
+        self._supersede(predecessor)
+        self.assertEqual(
+            agent_handoffs.get_handoff(self.conn, predecessor.id).state, "superseded"
+        )
+
+    def test_terminal_predecessor_refused(self):
+        predecessor = self.transition(
+            self.make_handoff(), "refuse", reason_code="out_of_scope"
+        )
+        with self.assertRaises(AosError) as ctx:
+            self._supersede(predecessor)
+        self.assertIn("Cannot supersede", str(ctx.exception))
+
+    def test_one_successor_rule(self):
+        predecessor = self.make_handoff()
+        self._supersede(predecessor)
+        with self.assertRaises(AosError) as ctx:
+            self._supersede(predecessor)
+        self.assertIn("already superseded", str(ctx.exception))
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM agent_handoffs WHERE supersedes_id=?",
+                (predecessor.id,),
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_failed_successor_rolls_back_predecessor(self):
+        predecessor = self.make_handoff()
+        before = self._row(predecessor.id)
+        events_before = self.count("events")
+        with mock.patch.object(
+            agent_handoffs.events, "emit", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                self._supersede(predecessor)
+        self.assertEqual(self._row(predecessor.id), before)  # byte-identical
+        self.assertEqual(
+            agent_handoffs.get_transitions(self.conn, predecessor.id), []
+        )
+        self.assertIsNone(agent_handoffs.successor_id(self.conn, predecessor.id))
+        self.assertEqual(self.count("events"), events_before)
+
+    def test_second_event_failure_rolls_back_first_event(self):
+        predecessor = self.make_handoff()
+        row_before = self._row(predecessor.id)
+        transitions_before = len(
+            agent_handoffs.get_transitions(self.conn, predecessor.id)
+        )
+        events_before = self.count("events")
+        handoffs_before = self.count("agent_handoffs")
+
+        real_emit = agent_handoffs.events.emit
+        calls = 0
+
+        def emit_then_fail(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("boom")
+            return real_emit(*args, **kwargs)
+
+        with mock.patch.object(agent_handoffs.events, "emit", emit_then_fail):
+            with self.assertRaises(RuntimeError):
+                self._supersede(predecessor)
+
+        # Proves the injected failure hit the intended boundary: the propose
+        # event genuinely executed on call 1 before supersede's call 2 raised.
+        self.assertEqual(calls, 2)
+
+        self.assertEqual(self._row(predecessor.id), row_before)
+        self.assertEqual(
+            len(agent_handoffs.get_transitions(self.conn, predecessor.id)),
+            transitions_before,
+        )
+        self.assertIsNone(agent_handoffs.successor_id(self.conn, predecessor.id))
+        self.assertEqual(self.count("agent_handoffs"), handoffs_before)
+        self.assertEqual(self.count("events"), events_before)
+        for table in ("agent_handoffs", "agent_handoff_transitions"):
+            self.assertEqual(
+                self.conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE content_sha256=''"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_predecessor_supersede_after_participant_invalidation(self):
+        predecessor = self.make_handoff()
+        passports.transition_lifecycle(self.conn, name="bob", verb="suspend")
+        self.publish(
+            "carol", capabilities=["cap.a"], data_classifications=ALL_CLASSES
+        )
+        self._supersede(predecessor, to_agent="carol")
+        self.assertEqual(
+            agent_handoffs.get_handoff(self.conn, predecessor.id).state, "superseded"
+        )
+
+    def test_direct_sql_self_and_forward_supersede_raise(self):
+        handoff = self.make_handoff()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(
+                "UPDATE agent_handoffs SET supersedes_id=id WHERE id=?", (handoff.id,)
+            )
+        self.conn.rollback()
+
+
+# ---------------------------------------------------------------------------
+# (38) Rollback injection.
+
+class HandoffRollbackTests(_HandoffCase):
+    def _assert_no_blank_hash(self):
+        for table in ("agent_handoffs", "agent_handoff_transitions"):
+            self.assertEqual(
+                self.conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE content_sha256=''"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_create_rolls_back_on_finalize_failure(self):
+        before = self.count("agent_handoffs"), self.count("events")
+        with mock.patch.object(
+            agent_handoffs, "handoff_digest", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                self.make_handoff()
+        self.assertEqual((self.count("agent_handoffs"), self.count("events")), before)
+        self._assert_no_blank_hash()
+
+    def test_create_rolls_back_on_event_failure(self):
+        before = self.count("agent_handoffs"), self.count("events")
+        with mock.patch.object(
+            agent_handoffs.events, "emit", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                self.make_handoff()
+        self.assertEqual((self.count("agent_handoffs"), self.count("events")), before)
+
+    def test_transition_rolls_back_on_finalize_failure(self):
+        handoff = self.make_handoff()
+        before = self.count("agent_handoff_transitions"), self.count("events")
+        with mock.patch.object(
+            agent_handoffs, "transition_digest", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                self.transition(handoff, "accept")
+        self.assertEqual(
+            (self.count("agent_handoff_transitions"), self.count("events")), before
+        )
+        self.assertEqual(self._row(handoff.id)["state"], "proposed")
+        self._assert_no_blank_hash()
+
+    def test_transition_rolls_back_on_event_failure(self):
+        handoff = self.make_handoff()
+        before = self.count("agent_handoff_transitions"), self.count("events")
+        with mock.patch.object(
+            agent_handoffs.events, "emit", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                self.transition(handoff, "accept")
+        self.assertEqual(
+            (self.count("agent_handoff_transitions"), self.count("events")), before
+        )
+        self.assertEqual(self._row(handoff.id)["state"], "proposed")
+
+    def test_no_blank_hash_after_successful_writes(self):
+        self.transition(self.make_handoff(), "accept")
+        self._assert_no_blank_hash()
+
+
+# ---------------------------------------------------------------------------
+# (33) Concurrency — two real connections on a file-backed workspace.
+
+class _FileHandoffCase(_HandoffCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name).resolve()
+        self.db_path = self.tmp / "aos.db"
+        self.conn = db.connect(self.db_path)
+        self.addCleanup(self.conn.close)
+        self.conn.executescript(db.SCHEMA_SQL)
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?)",
+            (db.SCHEMA_VERSION,),
+        )
+        self.conn.commit()
+        self.add_project("demo")
+        self.task = self.add_task(project="demo", title="build")
+        self.alice = self.publish(
+            "alice", capabilities=["cap.a"], data_classifications=ALL_CLASSES
+        )
+        self.bob = self.publish(
+            "bob", capabilities=["cap.a"], data_classifications=ALL_CLASSES
+        )
+
+    def other_conn(self):
+        conn = db.connect(self.db_path)
+        self.addCleanup(conn.close)
+        return conn
+
+
+class HandoffConcurrencyTests(_FileHandoffCase):
+    def test_second_writer_sees_moved_state_and_refuses(self):
+        handoff = self.make_handoff()
+        agent_handoffs.transition(self.conn, handoff.id, "accept")
+        other = self.other_conn()
+        with self.assertRaises(AosError) as ctx:
+            agent_handoffs.transition(other, handoff.id, "accept")
+        self.assertIn("already accepted", str(ctx.exception))
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM agent_handoff_transitions WHERE handoff_id=?",
+                (handoff.id,),
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_accept_versus_cancel_one_legal_one_refusal(self):
+        handoff = self.make_handoff()
+        agent_handoffs.transition(self.conn, handoff.id, "cancel")  # commits
+        other = self.other_conn()
+        with self.assertRaises(AosError) as ctx:
+            agent_handoffs.transition(other, handoff.id, "accept")
+        self.assertIn("it is cancelled", str(ctx.exception))
+        self.assertNotIsInstance(ctx.exception, sqlite3.IntegrityError)
+
+    def test_racing_successors_one_commits(self):
+        predecessor = self.make_handoff()
+        with contextlib.redirect_stderr(io.StringIO()):
+            agent_handoffs.create_handoff(
+                self.conn, task_id=self.task.id, from_agent="alice",
+                to_agent="bob", objective_md="s1", supersedes_id=predecessor.id,
+            )
+        other = self.other_conn()
+        with self.assertRaises(AosError) as ctx:
+            with contextlib.redirect_stderr(io.StringIO()):
+                agent_handoffs.create_handoff(
+                    other, task_id=self.task.id, from_agent="alice",
+                    to_agent="bob", objective_md="s2",
+                    supersedes_id=predecessor.id,
+                )
+        self.assertIn("already superseded", str(ctx.exception))
+        self.assertNotIsInstance(ctx.exception, sqlite3.IntegrityError)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM agent_handoffs WHERE supersedes_id=?",
+                (predecessor.id,),
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_sequences_are_contiguous_and_unique(self):
+        handoff = self.make_handoff()
+        agent_handoffs.transition(
+            self.conn, handoff.id, "clarify", reason_code="objective_unclear"
+        )
+        agent_handoffs.transition(self.conn, handoff.id, "accept")
+        seqs = [
+            t.seq for t in agent_handoffs.get_transitions(self.conn, handoff.id)
+        ]
+        self.assertEqual(seqs, [1, 2])
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(
+                "INSERT INTO agent_handoff_transitions (handoff_id, seq, "
+                "from_state, to_state, actor, created_at, content_sha256) "
+                "VALUES (?, 1, 'proposed', 'cancelled', 'human', ?, ?)",
+                (handoff.id, NOW, HASH),
+            )
+        self.conn.rollback()
+
+
+# ---------------------------------------------------------------------------
+# (13-group) Reads and read-only verification.
+
+class HandoffReadsTests(_HandoffCase):
+    def test_list_newest_first_and_filters(self):
+        h1 = self.make_handoff(objective_md="first")
+        h2 = self.make_handoff(objective_md="second")
+        listing = agent_handoffs.list_handoffs(self.conn)
+        self.assertEqual(
+            [row["handoff"] for row in listing],
+            [
+                ids.render_id("agent_handoff", h2.id),
+                ids.render_id("agent_handoff", h1.id),
+            ],
+        )
+        self.transition(h1, "accept")
+        accepted = agent_handoffs.list_handoffs(self.conn, state="accepted")
+        self.assertEqual(
+            [row["handoff"] for row in accepted],
+            [ids.render_id("agent_handoff", h1.id)],
+        )
+        by_task = agent_handoffs.list_handoffs(self.conn, task_id=self.task.id)
+        self.assertEqual(len(by_task), 2)
+
+    def test_restricted_list_placeholders_prose_but_show_reveals(self):
+        handoff = self.make_handoff(
+            objective_md="secret plan", data_classification="restricted"
+        )
+        row = agent_handoffs.list_handoffs(self.conn)[0]
+        self.assertEqual(row["objective"], ops.RESTRICTED_PLACEHOLDER)
+        public = agent_handoffs.handoff_public(self.conn, handoff)
+        self.assertEqual(public["objective"], "secret plan")  # show is admin
+
+    def test_handoff_public_full_projection(self):
+        handoff = self.transition(self.make_handoff(constraints_md="c"), "accept")
+        public = agent_handoffs.handoff_public(self.conn, handoff)
+        self.assertEqual(public["from_agent"], "alice")
+        self.assertEqual(public["to_agent"], "bob")
+        self.assertEqual(public["state"], "accepted")
+        self.assertTrue(public["integrity_ok"])
+        self.assertEqual(len(public["transitions"]), 1)
+        self.assertEqual(public["content_sha256"], handoff.content_sha256)  # full hash
+
+    def test_successor_id_derived(self):
+        predecessor = self.make_handoff()
+        with contextlib.redirect_stderr(io.StringIO()):
+            successor_hid = agent_handoffs.create_handoff(
+                self.conn, task_id=self.task.id, from_agent="alice",
+                to_agent="bob", objective_md="s", supersedes_id=predecessor.id,
+            )
+        self.assertEqual(
+            agent_handoffs.successor_id(self.conn, predecessor.id), successor_hid
+        )
+        self.assertIsNone(agent_handoffs.successor_id(self.conn, successor_hid))
+
+    def test_reads_never_mutate(self):
+        handoff = self.transition(self.make_handoff(), "accept")
+        before = self._row(handoff.id)
+        agent_handoffs.list_handoffs(self.conn)
+        agent_handoffs.handoff_public(self.conn, handoff)
+        agent_handoffs.verify_handoff(self.conn, handoff.id)
+        self.assertEqual(self._row(handoff.id), before)
+
+
+# ---------------------------------------------------------------------------
+# (39) Event payloads and privacy.
+
+class HandoffEventPrivacyTests(_HandoffCase):
+    def _assert_clean(self, payload, allowed):
+        keys = set(payload) - {"schema_version"}
+        secret_keys = {"secret_warning", "secret_fields", "secret_patterns"}
+        self.assertTrue(keys <= set(allowed) | secret_keys, keys - set(allowed))
+        self.assertIsNone(
+            __import__("re").search(r"[0-9a-f]{64}", json.dumps(payload))
+        )
+
+    def test_propose_event_allowlist(self):
+        self.make_handoff(objective_md="private objective text")
+        _, payload = self.payloads("propose")[0]
+        self._assert_clean(payload, agent_handoffs.PROPOSE_EVENT_KEYS)
+        self.assertNotIn("private objective text", json.dumps(payload))
+        self.assertNotIn("decision", payload)
+        self.assertEqual(len(payload["from_passport_sha256_prefix"]), 12)
+
+    def test_transition_event_allowlist(self):
+        self.transition(self.make_handoff(), "refuse", reason_code="out_of_scope")
+        _, payload = self.payloads("refuse")[0]
+        self._assert_clean(payload, agent_handoffs.TRANSITION_EVENT_KEYS)
+        self.assertEqual(payload["reason_code"], "out_of_scope")
+
+    def test_secret_objective_warns_metadata_not_value(self):
+        secret = "password: hunter2superlongsecret"
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            handoff_id = agent_handoffs.create_handoff(
+                self.conn, task_id=self.task.id, from_agent="alice",
+                to_agent="bob", objective_md=secret,
+            )
+        self.assertIn("secret-shaped", stderr.getvalue())
+        # the canonical row keeps the text; the event never carries it
+        handoff = agent_handoffs.get_handoff(self.conn, handoff_id)
+        self.assertEqual(handoff.objective_md, secret)
+        _, payload = self.payloads("propose")[-1]
+        self.assertTrue(payload.get("secret_warning"))
+        self.assertIn("objective", payload.get("secret_fields", []))
+        self.assertNotIn("hunter2superlongsecret", json.dumps(payload))
+
+    def test_note_secret_warns_not_value(self):
+        secret = "token: abcdefaddress0123456789key"
+        handoff = self.make_handoff()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            agent_handoffs.transition(
+                self.conn, handoff.id, "accept", note_md=secret
+            )
+        _, payload = self.payloads("accept")[0]
+        self.assertNotIn("abcdefaddress", json.dumps(payload))
+        transition = agent_handoffs.get_transitions(self.conn, handoff.id)[0]
+        self.assertEqual(transition.note_md, secret)
+
+    def test_decision_id_never_in_events_and_behavior_identical(self):
+        decision = ops.add_decision(
+            self.conn, title="t", project_slug="demo", decision="d"
+        )
+        with_decision = self.make_handoff(decision_id=decision.id)
+        without = self.make_handoff()
+        self.transition(with_decision, "accept")
+        self.transition(without, "accept")
+        for _, payload in self.payloads():
+            self.assertNotIn("decision", payload)
+            self.assertNotIn(
+                ids.render_id("decision", decision.id), json.dumps(payload)
+            )
+
+
+# ---------------------------------------------------------------------------
+# Classification advisory (§13, §15).
+
+class HandoffClassificationAdvisoryTests(_HandoffCase):
+    def test_advisory_printed_when_not_declared(self):
+        self.publish("carol", capabilities=["cap.a"], data_classifications=["public"])
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            handoff_id = agent_handoffs.create_handoff(
+                self.conn, task_id=self.task.id, from_agent="alice",
+                to_agent="carol", objective_md="o",
+                data_classification="confidential",
+            )
+        self.assertIn("ADVISORY", stderr.getvalue())
+        self.assertIn("confidential", stderr.getvalue())
+        # created anyway (non-blocking), and never stored in events
+        self.assertIsNotNone(agent_handoffs.get_handoff(self.conn, handoff_id))
+        for _, payload in self.payloads():
+            self.assertNotIn("ADVISORY", json.dumps(payload))
+            self.assertNotIn("does not declare", json.dumps(payload))
+
+    def test_no_advisory_when_declared(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            agent_handoffs.create_handoff(
+                self.conn, task_id=self.task.id, from_agent="alice",
+                to_agent="bob", objective_md="o", data_classification="internal",
+            )
+        self.assertNotIn("ADVISORY", stderr.getvalue())
+
+
+# ---------------------------------------------------------------------------
+# (matrix 14) Passport discard guard (§21).
+
+class HandoffDiscardGuardTests(_LiveCase):
+    def test_referenced_draft_yields_normal_refusal_not_integrity_error(self):
+        self.add_project("demo")
+        self.publish("active_one", capabilities=["cap.a"])
+        self.draft("drafty", capabilities=["cap.a"])
+        # A plan evaluates every agent; the draft becomes an excluded candidate
+        # whose row references it by id.
+        routing.create_plan(self.conn, self.request(capabilities=["cap.a"]))
+        self.assertGreater(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM routing_plan_candidates c "
+                "JOIN agents a ON a.id=c.agent_id WHERE a.name='drafty'"
+            ).fetchone()[0],
+            0,
+        )
+        with self.assertRaises(AosError) as ctx:
+            passports.discard_agent(self.conn, name="drafty")
+        self.assertNotIsInstance(ctx.exception, sqlite3.IntegrityError)
+        self.assertIn("routing_plan_candidates", str(ctx.exception))
+        # not deleted
+        self.assertIsNotNone(passports.get_agent(self.conn, "drafty"))
+
+    def test_unreferenced_draft_still_discardable(self):
+        self.add_project("demo")
+        self.draft("lonely", capabilities=["cap.a"])
+        passports.discard_agent(self.conn, name="lonely")  # COUNT(*)=0, no crash
+        self.assertIsNone(passports.get_agent(self.conn, "lonely"))
+
+    def test_reference_query_is_name_joined_and_no_handoff_entry(self):
+        labels = {label for label, _, _ in passports._REFERENCE_QUERIES}
+        self.assertIn("routing_plan_candidates", labels)
+        self.assertNotIn("agent_handoffs", labels)
+        entry = next(
+            e for e in passports._REFERENCE_QUERIES if e[0] == "routing_plan_candidates"
+        )
+        self.assertIn("JOIN agents", entry[1])
+        self.assertIn("a.name = ?", entry[1])
+        self.assertEqual(entry[2]("nm"), ("nm",))
+
+
+# ---------------------------------------------------------------------------
+# (15, 38) Static guarantees: mutation surface, forbidden runtime, no
+# completed state, single-owner transactions.
+
+class HandoffStaticTests(unittest.TestCase):
+    SOURCE = (REPO_ROOT / "agentic_os" / "agent_handoffs.py").read_text(
+        encoding="utf-8"
+    )
+
+    def test_only_sanctioned_mutations(self):
+        self.assertNotIn("DELETE FROM agent_handoffs", self.SOURCE)
+        self.assertNotIn("DELETE FROM agent_handoff_transitions", self.SOURCE)
+        # two UPDATEs on agent_handoffs (create finalize + projection), one on
+        # the transitions table (hash finalization) — nothing else mutates.
+        self.assertEqual(self.SOURCE.count("UPDATE agent_handoffs SET"), 2)
+        self.assertEqual(
+            self.SOURCE.count("UPDATE agent_handoff_transitions SET"), 1
+        )
+        self.assertIn(
+            "UPDATE agent_handoffs SET state = ?, updated_at = ?, "
+            "content_sha256 = ?",
+            self.SOURCE,
+        )
+
+    def test_single_owner_transactions_never_nested(self):
+        # Two write owners (create_handoff, transition), each owning exactly one
+        # boundary; the supersede path is a participant inside create's boundary,
+        # never a nested transaction. (Count the code statements, not the prose
+        # that also names the pattern.)
+        self.assertEqual(self.SOURCE.count("with db.transaction("), 2)
+        self.assertEqual(self.SOURCE.count('conn.execute("BEGIN IMMEDIATE")'), 2)
+
+    def test_no_forbidden_runtime(self):
+        for token in (
+            "subprocess", "socket", "requests", "urllib", "http.client",
+            "os.system", "exec(", "eval(", "provider", "workflow",
+        ):
+            self.assertNotIn(token, self.SOURCE)
+
+    def test_no_completed_state_vocabulary(self):
+        self.assertNotIn("completed", models.AGENT_HANDOFF_STATES)
+        self.assertNotIn("complete", agent_handoffs._EXPLICIT_VERBS)
+
+    def test_no_approval_substring(self):
+        # A repurposed-as-approval reading of `decision_id` would use the word
+        # "approval"; it appears nowhere in this module. The behavioural proof
+        # that `decision_id` gates nothing lives in HandoffEventPrivacyTests.
+        self.assertNotIn("approval", self.SOURCE)
+
+
+# ---------------------------------------------------------------------------
+# (58) Two-workspace isolation.
+
+class HandoffWorkspaceIsolationTests(unittest.TestCase):
+    def _workspace(self):
+        conn = db.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.executescript(db.SCHEMA_SQL)
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?)",
+            (db.SCHEMA_VERSION,),
+        )
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name).resolve()
+        ops.add_project(conn, slug="demo", name="Demo", repo=str(root))
+        task = ops.add_task(conn, title="t", project_slug="demo")
+        for name in ("alice", "bob"):
+            passports.create_agent(
+                conn, name=name, role="r", mission="m",
+                fragment_path=self._fragment(root, name),
+            )
+            passports.publish_passport(conn, name=name, path=None)
+        conn.commit()
+        return conn, task
+
+    @staticmethod
+    def _fragment(root, name):
+        path = root / f"{name}.json"
+        path.write_text(
+            json.dumps({"autonomy": "supervised", "capabilities": ["cap.a"]}),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_operations_in_one_workspace_do_not_touch_another(self):
+        conn_a, task_a = self._workspace()
+        conn_b, _ = self._workspace()
+        with contextlib.redirect_stderr(io.StringIO()):
+            agent_handoffs.create_handoff(
+                conn_a, task_id=task_a.id, from_agent="alice",
+                to_agent="bob", objective_md="only in A",
+            )
+        self.assertEqual(
+            conn_a.execute("SELECT COUNT(*) FROM agent_handoffs").fetchone()[0], 1
+        )
+        self.assertEqual(
+            conn_b.execute("SELECT COUNT(*) FROM agent_handoffs").fetchone()[0], 0
+        )
 
 
 if __name__ == "__main__":
