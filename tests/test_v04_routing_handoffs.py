@@ -2859,8 +2859,16 @@ class Wave3OrderingTests(_LiveCase):
             ]
             return plan.request_sha256, projection, case
 
-        sha_a, proj_a, case_a = build(specs)
-        sha_b, proj_b, case_b = build(list(reversed(specs)))
+        # One frozen clock for both builds: passport created_at feeds
+        # passport_sha256, so a real UTC-second boundary between the two
+        # sequential builds would make the pins differ.
+        with mock.patch.object(
+            passports.utils,
+            "utc_now_iso",
+            return_value="2026-01-01T00:00:00Z",
+        ):
+            sha_a, proj_a, case_a = build(specs)
+            sha_b, proj_b, case_b = build(list(reversed(specs)))
         self.assertEqual(sha_a, sha_b)                 # identical request digest
         self.assertEqual(proj_a, proj_b)               # identical ranked projection
         # content_sha256 legitimately differs (it binds workspace-specific ids).
