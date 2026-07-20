@@ -723,6 +723,22 @@ class RecoveryTests(PowerCase):
         # hashes and one audit event in one transaction. The three read-only
         # route leaves stay available in recovery and are NOT listed here.
         (("agent", "route", "plan"), ("agent", "route", "plan")),
+        # U-A3's five governed-handoff writers: each writes a handoff and/or
+        # transition row, its hashes and one audit event in one transaction.
+        # The two read-only handoff leaves (list/show) stay available in
+        # recovery and are NOT listed here.
+        (("agent", "handoff", "create"),
+         ("agent", "handoff", "create", "--task", "T-0002", "--from", "a",
+          "--to", "b", "--objective", "o")),
+        (("agent", "handoff", "accept"),
+         ("agent", "handoff", "accept", "AH-0001")),
+        (("agent", "handoff", "refuse"),
+         ("agent", "handoff", "refuse", "AH-0001", "--reason", "out_of_scope")),
+        (("agent", "handoff", "clarify"),
+         ("agent", "handoff", "clarify", "AH-0001", "--reason",
+          "objective_unclear")),
+        (("agent", "handoff", "cancel"),
+         ("agent", "handoff", "cancel", "AH-0001")),
         (("ingest", "dropfile"), ("ingest", "dropfile", "SELF")),
         (("done",), ("done", "T-0002", "--no-evidence", "--reason", "because")),
         (("pack", "build"), ("pack", "build", "T-0002")),

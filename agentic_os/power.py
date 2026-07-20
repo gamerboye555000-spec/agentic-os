@@ -205,6 +205,26 @@ COMMAND_POLICY: dict[tuple[str, ...], CommandPolicy] = {
     ("agent", "route", "list"): _p(READ_ONLY),
     ("agent", "route", "show"): _p(READ_ONLY),
     ("agent", "route", "verify"): _p(READ_ONLY),
+    # U-A3 governed handoffs. `create` and the four lifecycle verbs each
+    # write a handoff and/or transition row, its hashes and one audit event
+    # in a single transaction — authoritative by the same mechanical rule as
+    # everything above, so recovery blocks all five before dispatch, deep
+    # preflights and post-verifies each, and eco runs each immediately (an
+    # explicit human decision is never a deferrable background refresh).
+    # `list`/`show` read rows and recompute hashes; neither writes, so both
+    # are read_only and usable in recovery — inspecting a damaged or
+    # contested handoff is exactly what recovery is for. No `supersede`,
+    # `complete` or `verify` leaf exists: supersession is only
+    # `create --supersedes`, and `show` carries the integrity verdict. These
+    # tuples are distinct from the legacy top-level ("handoff", …) paths —
+    # no collision, and the legacy classification is untouched.
+    ("agent", "handoff", "create"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("agent", "handoff", "list"): _p(READ_ONLY),
+    ("agent", "handoff", "show"): _p(READ_ONLY),
+    ("agent", "handoff", "accept"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("agent", "handoff", "refuse"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("agent", "handoff", "clarify"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("agent", "handoff", "cancel"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("ingest", "dropfile"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("done",): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("migrate", "apply"): _p(AUTHORITATIVE_WRITE, ledger=True),

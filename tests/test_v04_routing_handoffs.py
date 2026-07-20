@@ -5099,5 +5099,799 @@ class HandoffWorkspaceIsolationTests(unittest.TestCase):
         )
 
 
+# ===========================================================================
+# WAVE 5 — handoff CLI, power, recovery (cli.py seven leaves, power.py seven
+# entries). Contract §17-18; test matrix groups 41-44 plus the parser,
+# wiring, end-to-end, privacy and entrypoint pins mandated for this wave.
+# ===========================================================================
+
+GOVERNED_HANDOFF_VERBS = (
+    "create", "list", "show", "accept", "refuse", "clarify", "cancel"
+)
+
+FORBIDDEN_LEAVES = (
+    ("agent", "route", "select"),
+    ("agent", "handoff", "supersede"),
+    ("agent", "handoff", "complete"),
+    ("agent", "handoff", "verify"),
+)
+
+
+class Wave5CliCase(Wave3CliCase):
+    """A live file-backed workspace driven end-to-end through the CLI: the
+    demo project, one task and two published agents that declare every data
+    classification (so a default `internal` handoff raises no advisory)."""
+
+    def setUp(self):
+        super().setUp()
+        self.run_cli("task", "add", "build", "-p", "demo")
+        self.make_agent(
+            "alice", capabilities=["cap.a"], data_classifications=ALL_CLASSES
+        )
+        self.make_agent(
+            "bob", capabilities=["cap.a"], data_classifications=ALL_CLASSES
+        )
+
+    def create(self, *extra):
+        return self.run_cli(
+            "agent", "handoff", "create", "--task", "T-0001", "--from",
+            "alice", "--to", "bob", "--objective", "ship the widget", *extra,
+        )
+
+    def query(self, sql, params=()):
+        conn = db.open_db(self.root / ".agentic-os")
+        try:
+            return conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+
+    def execute(self, sql, params=()):
+        conn = db.open_db(self.root / ".agentic-os")
+        try:
+            conn.execute(sql, params)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def table_counts(self):
+        return tuple(
+            self.query(f"SELECT COUNT(*) FROM {table}")[0][0]
+            for table in (
+                "agent_handoffs", "agent_handoff_transitions", "events"
+            )
+        )
+
+
+class Wave5CliParserTests(Wave3CliCase):
+    def test_parser_exposes_exactly_seven_governed_handoff_leaves(self):
+        leaves = {
+            p for p in power.iter_command_paths(cli.build_parser())
+            if p[:2] == ("agent", "handoff")
+        }
+        self.assertEqual(
+            leaves,
+            {("agent", "handoff", verb) for verb in GOVERNED_HANDOFF_VERBS},
+        )
+
+    def test_no_forbidden_leaves(self):
+        leaves = set(power.iter_command_paths(cli.build_parser()))
+        for forbidden in FORBIDDEN_LEAVES:
+            with self.subTest(leaf=forbidden):
+                self.assertNotIn(forbidden, leaves)
+
+    def test_legacy_top_level_handoff_parser_is_unchanged(self):
+        leaves = set(power.iter_command_paths(cli.build_parser()))
+        self.assertEqual(
+            {p for p in leaves if p[0] == "handoff"},
+            {("handoff", "create"), ("handoff", "accept")},
+        )
+
+    def test_create_requires_task_from_to_objective(self):
+        parser = cli.build_parser()
+        base = [
+            "agent", "handoff", "create", "--task", "T-0001", "--from", "a",
+            "--to", "b", "--objective", "o",
+        ]
+        self.assertEqual(parser.parse_args(base).task, "T-0001")
+        for drop in ("--task", "--from", "--to", "--objective"):
+            with self.subTest(missing=drop):
+                index = base.index(drop)
+                argv = base[:index] + base[index + 2:]
+                with self.assertRaises(AosError):
+                    parser.parse_args(argv)
+
+    def test_create_defaults_and_repeatable_evidence(self):
+        parser = cli.build_parser()
+        args = parser.parse_args([
+            "agent", "handoff", "create", "--task", "T-0001", "--from", "a",
+            "--to", "b", "--objective", "o",
+            "--expect-evidence", "test", "--expect-evidence", "commit",
+        ])
+        self.assertEqual(args.expect_evidence, ["test", "commit"])
+        self.assertEqual(args.min_evidence, 0)
+        self.assertEqual(
+            args.classification, agent_handoffs.DEFAULT_DATA_CLASSIFICATION
+        )
+        self.assertIsNone(args.plan)
+        self.assertIsNone(args.constraints)
+        self.assertIsNone(args.decision)
+        self.assertIsNone(args.supersedes)
+        self.assertFalse(args.json)
+        defaults = parser.parse_args([
+            "agent", "handoff", "create", "--task", "T-0001", "--from", "a",
+            "--to", "b", "--objective", "o",
+        ])
+        self.assertIsNone(defaults.expect_evidence)
+
+    def test_refuse_and_clarify_require_reason(self):
+        parser = cli.build_parser()
+        for verb in ("refuse", "clarify"):
+            with self.subTest(verb=verb):
+                with self.assertRaises(AosError):
+                    parser.parse_args(["agent", "handoff", verb, "AH-0001"])
+
+    def test_accept_and_cancel_take_no_reason(self):
+        parser = cli.build_parser()
+        for verb in ("accept", "cancel"):
+            with self.subTest(verb=verb):
+                with self.assertRaises(AosError):
+                    parser.parse_args([
+                        "agent", "handoff", verb, "AH-0001",
+                        "--reason", "out_of_scope",
+                    ])
+
+    def test_json_only_where_the_frozen_contract_grants_it(self):
+        parser = cli.build_parser()
+        for argv in (
+            ["agent", "handoff", "create", "--task", "T-0001", "--from", "a",
+             "--to", "b", "--objective", "o", "--json"],
+            ["agent", "handoff", "list", "--json"],
+            ["agent", "handoff", "show", "AH-0001", "--json"],
+            ["agent", "handoff", "accept", "AH-0001", "--json"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(parser.parse_args(argv).json)
+        for verb in ("refuse", "clarify", "cancel"):
+            with self.subTest(verb=verb):
+                argv = ["agent", "handoff", verb, "AH-0001", "--json"]
+                if verb in ("refuse", "clarify"):
+                    argv += ["--reason", "out_of_scope"]
+                with self.assertRaises(AosError):
+                    parser.parse_args(argv)
+
+    def test_usage_errors_exit_1_not_2(self):
+        for argv in (
+            ("agent", "handoff", "create", "--task", "T-0001"),
+            ("agent", "handoff", "refuse", "AH-0001"),
+            ("agent", "handoff", "clarify", "AH-0001"),
+            ("agent", "handoff", "bogus"),
+            ("agent", "handoff", "cancel", "AH-0001", "--json"),
+        ):
+            with self.subTest(argv=argv):
+                code, out, err = self.run_cli(*argv)
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "")
+
+    def test_malformed_ids_exit_1(self):
+        for argv in (
+            ("agent", "handoff", "show", "not-an-id"),
+            ("agent", "handoff", "accept", "H-0001"),
+            ("agent", "handoff", "cancel", "AH1"),
+            ("agent", "handoff", "create", "--task", "bogus", "--from", "a",
+             "--to", "b", "--objective", "o"),
+            ("agent", "handoff", "create", "--task", "T-0001", "--from", "a",
+             "--to", "b", "--objective", "o", "--plan", "PX-1"),
+            ("agent", "handoff", "create", "--task", "T-0001", "--from", "a",
+             "--to", "b", "--objective", "o", "--decision", "D1"),
+            ("agent", "handoff", "create", "--task", "T-0001", "--from", "a",
+             "--to", "b", "--objective", "o", "--supersedes", "T-0001"),
+        ):
+            with self.subTest(argv=argv):
+                code, out, err = self.run_cli(*argv)
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "")
+
+
+class Wave5CliWiringTests(Wave5CliCase):
+    HANDLERS = (
+        "cmd_agent_handoff_create",
+        "cmd_agent_handoff_list",
+        "cmd_agent_handoff_show",
+        "cmd_agent_handoff_accept",
+        "cmd_agent_handoff_refuse",
+        "cmd_agent_handoff_clarify",
+        "cmd_agent_handoff_cancel",
+        "_agent_handoff_transition",
+    )
+
+    def test_create_calls_create_handoff_exactly_once_with_defaults(self):
+        with mock.patch.object(
+            agent_handoffs, "create_handoff", return_value=1
+        ) as create:
+            code, out, _ = self.run_cli(
+                "agent", "handoff", "create", "--task", "T-0001", "--from",
+                "alice", "--to", "bob", "--objective", "obj",
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(create.call_count, 1)
+        kwargs = create.call_args.kwargs
+        self.assertEqual(kwargs["task_id"], 1)
+        self.assertEqual(kwargs["from_agent"], "alice")
+        self.assertEqual(kwargs["to_agent"], "bob")
+        self.assertEqual(kwargs["objective_md"], "obj")
+        self.assertEqual(tuple(kwargs["expected_evidence"]), ())
+        self.assertEqual(kwargs["min_evidence_count"], 0)
+        self.assertIsNone(kwargs["constraints_md"])
+        self.assertEqual(kwargs["data_classification"], "internal")
+        self.assertIsNone(kwargs["plan_id"])
+        self.assertIsNone(kwargs["decision_id"])
+        self.assertIsNone(kwargs["supersedes_id"])
+        self.assertIn("AH-0001", out)
+        self.assertIn("proposed", out)
+
+    def test_create_passes_every_optional_reference_parsed(self):
+        with mock.patch.object(
+            agent_handoffs, "create_handoff", return_value=9
+        ) as create:
+            code, _, _ = self.run_cli(
+                "agent", "handoff", "create", "--task", "T-0001", "--from",
+                "alice", "--to", "bob", "--objective", "obj",
+                "--plan", "RP-0007", "--expect-evidence", "test",
+                "--expect-evidence", "commit", "--min-evidence", "2",
+                "--constraints", "c", "--classification", "restricted",
+                "--decision", "D-0003", "--supersedes", "AH-0002",
+            )
+        self.assertEqual(code, 0)
+        kwargs = create.call_args.kwargs
+        self.assertEqual(kwargs["plan_id"], 7)
+        self.assertEqual(tuple(kwargs["expected_evidence"]), ("test", "commit"))
+        self.assertEqual(kwargs["min_evidence_count"], 2)
+        self.assertEqual(kwargs["constraints_md"], "c")
+        self.assertEqual(kwargs["data_classification"], "restricted")
+        self.assertEqual(kwargs["decision_id"], 3)
+        self.assertEqual(kwargs["supersedes_id"], 2)
+
+    def test_each_transition_verb_calls_transition_exactly_once(self):
+        for verb, extra, expected_reason in (
+            ("accept", (), None),
+            ("refuse", ("--reason", "out_of_scope"), "out_of_scope"),
+            ("clarify", ("--reason", "objective_unclear"), "objective_unclear"),
+            ("cancel", (), None),
+        ):
+            with self.subTest(verb=verb):
+                with mock.patch.object(agent_handoffs, "transition") as tr:
+                    code, _, _ = self.run_cli(
+                        "agent", "handoff", verb, "AH-0004", *extra
+                    )
+                self.assertEqual(code, 0)
+                self.assertEqual(tr.call_count, 1)
+                self.assertEqual(tr.call_args.args[1:], (4, verb))
+                self.assertEqual(
+                    tr.call_args.kwargs.get("reason_code"), expected_reason
+                )
+                self.assertIsNone(tr.call_args.kwargs.get("note_md"))
+
+    def test_note_is_forwarded_verbatim(self):
+        with mock.patch.object(agent_handoffs, "transition") as tr:
+            code, _, _ = self.run_cli(
+                "agent", "handoff", "accept", "AH-0004", "--note", "go ahead"
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(tr.call_args.kwargs.get("note_md"), "go ahead")
+
+    def test_list_and_show_call_their_read_projections_once(self):
+        self.create()
+        with mock.patch.object(
+            agent_handoffs, "list_handoffs", return_value=[]
+        ) as listing:
+            code, _, _ = self.run_cli("agent", "handoff", "list")
+        self.assertEqual(code, 0)
+        self.assertEqual(listing.call_count, 1)
+        with mock.patch.object(
+            agent_handoffs, "handoff_public", return_value={}
+        ) as public:
+            code, _, _ = self.run_cli(
+                "agent", "handoff", "show", "AH-0001", "--json"
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(public.call_count, 1)
+
+    def test_handlers_own_no_sql_transaction_event_or_forbidden_runtime(self):
+        # Forbidden-token literals only, asserted ABSENT from handler source;
+        # nothing here is ever executed (the HandoffStaticTests pattern).
+        for name in self.HANDLERS:
+            src = inspect.getsource(getattr(cli, name))
+            with self.subTest(handler=name):
+                for token in (
+                    "conn.execute", "BEGIN", "INSERT", "UPDATE", "DELETE",
+                    "SELECT", "db.transaction", "events.emit", "ADVISORY",
+                    "subprocess", "socket", "os.system", "exec(", "eval(",
+                    "provider", "workflow",
+                ):
+                    self.assertNotIn(token, src)
+
+    def test_no_duplicate_classification_advisory(self):
+        self.make_agent(
+            "carol", capabilities=["cap.a"], data_classifications=["public"]
+        )
+        code, _, err = self.run_cli(
+            "agent", "handoff", "create", "--task", "T-0001", "--from",
+            "alice", "--to", "carol", "--objective", "o",
+            "--classification", "confidential",
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(err.count("ADVISORY"), 1)
+
+
+class Wave5CliBehaviorTests(Wave5CliCase):
+    def test_create_text_and_json(self):
+        code, out, err = self.create()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.strip(), "AH-0001 proposed")
+        code, out, _ = self.create("--json")
+        self.assertEqual(code, 0)
+        doc = json.loads(out)["handoff"]
+        self.assertEqual(doc["handoff"], "AH-0002")
+        self.assertEqual(doc["state"], "proposed")
+        self.assertEqual(doc["from_agent"], "alice")
+        self.assertEqual(doc["to_agent"], "bob")
+        self.assertEqual(doc["expected_evidence"], [])
+        self.assertEqual(doc["min_evidence_count"], 0)
+        self.assertEqual(doc["data_classification"], "internal")
+        self.assertTrue(doc["integrity_ok"])
+        self.assertEqual(doc["transitions"], [])
+
+    def test_create_all_optional_references_and_supersede(self):
+        self.run_cli("agent", "route", "plan", "--capability", "cap.a")
+        self.run_cli(
+            "decision", "add", "why", "-p", "demo", "--decision", "because"
+        )
+        self.create()
+        code, out, err = self.run_cli(
+            "agent", "handoff", "create", "--task", "T-0001", "--from",
+            "alice", "--to", "bob", "--objective", "successor",
+            "--plan", "RP-0001", "--expect-evidence", "test",
+            "--expect-evidence", "commit", "--min-evidence", "2",
+            "--constraints", "stay in scope", "--classification",
+            "confidential", "--decision", "D-0001", "--supersedes", "AH-0001",
+            "--json",
+        )
+        self.assertEqual(code, 0, err)
+        doc = json.loads(out)["handoff"]
+        self.assertEqual(doc["handoff"], "AH-0002")
+        self.assertEqual(doc["plan"], "RP-0001")
+        self.assertEqual(doc["expected_evidence"], ["commit", "test"])
+        self.assertEqual(doc["min_evidence_count"], 2)
+        self.assertEqual(doc["constraints"], "stay in scope")
+        self.assertEqual(doc["data_classification"], "confidential")
+        self.assertEqual(doc["decision"], "D-0001")
+        self.assertEqual(doc["supersedes"], "AH-0001")
+        _, out, _ = self.run_cli("agent", "handoff", "show", "AH-0001", "--json")
+        predecessor = json.loads(out)["handoff"]
+        self.assertEqual(predecessor["state"], "superseded")
+        self.assertEqual(predecessor["superseded_by"], "AH-0002")
+
+    def test_empty_list_text(self):
+        code, out, _ = self.run_cli("agent", "handoff", "list")
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), "(no agent handoffs)")
+
+    def test_list_text_json_newest_first_and_filters(self):
+        self.create()
+        self.run_cli("task", "add", "second", "-p", "demo")
+        code, _, err = self.run_cli(
+            "agent", "handoff", "create", "--task", "T-0002", "--from",
+            "alice", "--to", "bob", "--objective", "second objective",
+        )
+        self.assertEqual(code, 0, err)
+        self.run_cli("agent", "handoff", "accept", "AH-0002")
+        code, out, _ = self.run_cli("agent", "handoff", "list")
+        self.assertEqual(code, 0)
+        lines = out.strip().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("AH-0002"))
+        self.assertTrue(lines[1].startswith("AH-0001"))
+        self.assertIn("alice → bob", lines[0])
+        self.assertIn("T-0002", lines[0])
+        self.assertIn("accepted", lines[0])
+        self.assertIn("second objective", lines[0])
+        doc = json.loads(self.run_cli("agent", "handoff", "list", "--json")[1])
+        self.assertEqual(
+            [h["handoff"] for h in doc["handoffs"]], ["AH-0002", "AH-0001"]
+        )
+        doc = json.loads(self.run_cli(
+            "agent", "handoff", "list", "--task", "T-0002", "--json")[1])
+        self.assertEqual([h["handoff"] for h in doc["handoffs"]], ["AH-0002"])
+        doc = json.loads(self.run_cli(
+            "agent", "handoff", "list", "--state", "proposed", "--json")[1])
+        self.assertEqual([h["handoff"] for h in doc["handoffs"]], ["AH-0001"])
+        doc = json.loads(self.run_cli(
+            "agent", "handoff", "list", "--task", "T-0009", "--json")[1])
+        self.assertEqual(doc["handoffs"], [])
+
+    def test_restricted_list_placeholder_and_show_reveals(self):
+        code, _, _ = self.create("--classification", "restricted")
+        self.assertEqual(code, 0)
+        code, out, _ = self.run_cli("agent", "handoff", "list")
+        self.assertEqual(code, 0)
+        self.assertNotIn("ship the widget", out)
+        self.assertIn(ops.RESTRICTED_PLACEHOLDER, out)
+        out_json = self.run_cli("agent", "handoff", "list", "--json")[1]
+        self.assertNotIn("ship the widget", out_json)
+        code, out, _ = self.run_cli("agent", "handoff", "show", "AH-0001")
+        self.assertEqual(code, 0)
+        self.assertIn("ship the widget", out)
+
+    def test_show_text_and_json_full_record(self):
+        self.create()
+        self.run_cli(
+            "agent", "handoff", "clarify", "AH-0001", "--reason",
+            "objective_unclear", "--note", "which widget?",
+        )
+        self.run_cli("agent", "handoff", "accept", "AH-0001")
+        code, out, _ = self.run_cli("agent", "handoff", "show", "AH-0001")
+        self.assertEqual(code, 0)
+        self.assertIn("AH-0001", out)
+        self.assertIn("accepted", out)
+        self.assertIn("alice", out)
+        self.assertIn("bob", out)
+        self.assertIn("ship the widget", out)
+        self.assertRegex(out, r"[0-9a-f]{64}")  # full hashes are show-class
+        self.assertIn("proposed → clarification_required", out)
+        self.assertIn("clarification_required → accepted", out)
+        self.assertIn("objective_unclear", out)
+        self.assertIn("which widget?", out)  # note is show-class history
+        doc = json.loads(
+            self.run_cli("agent", "handoff", "show", "AH-0001", "--json")[1]
+        )["handoff"]
+        self.assertEqual(doc["state"], "accepted")
+        self.assertEqual(len(doc["transitions"]), 2)
+        self.assertTrue(doc["integrity_ok"])
+        self.assertEqual(len(doc["content_sha256"]), 64)
+
+    def test_show_absent_exits_1(self):
+        code, out, err = self.run_cli("agent", "handoff", "show", "AH-0099")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("AH-0099", err)
+
+    def test_damaged_show_does_not_crash(self):
+        self.create()
+        self.execute(
+            "UPDATE agent_handoffs SET content_sha256=?", ("e" * 64,)
+        )
+        code, out, _ = self.run_cli("agent", "handoff", "show", "AH-0001")
+        self.assertEqual(code, 0)
+        self.assertIn("mismatch", out)
+        doc = json.loads(
+            self.run_cli("agent", "handoff", "show", "AH-0001", "--json")[1]
+        )["handoff"]
+        self.assertFalse(doc["integrity_ok"])
+
+    def test_accept_text_and_json(self):
+        self.create()
+        code, out, _ = self.run_cli(
+            "agent", "handoff", "accept", "AH-0001", "--note", "go ahead"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), "AH-0001 accepted")
+        self.assertNotIn("go ahead", out)  # notes live in show-class history
+        self.create()
+        code, out, _ = self.run_cli(
+            "agent", "handoff", "accept", "AH-0002", "--json"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            json.loads(out), {"handoff": "AH-0002", "state": "accepted"}
+        )
+
+    def test_refuse_clarify_cancel_text(self):
+        self.create()
+        self.create()
+        self.create()
+        code, out, _ = self.run_cli(
+            "agent", "handoff", "refuse", "AH-0001", "--reason", "out_of_scope"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), "AH-0001 refused")
+        code, out, _ = self.run_cli(
+            "agent", "handoff", "clarify", "AH-0002", "--reason",
+            "objective_unclear",
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), "AH-0002 clarification_required")
+        code, out, _ = self.run_cli("agent", "handoff", "cancel", "AH-0003")
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), "AH-0003 cancelled")
+
+    def test_illegal_terminal_reason_and_pin_drift_refusals_exit_1(self):
+        self.create()
+        self.run_cli("agent", "handoff", "accept", "AH-0001")
+        code, out, err = self.run_cli("agent", "handoff", "accept", "AH-0001")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("already accepted", err)
+        code, out, err = self.run_cli(
+            "agent", "handoff", "refuse", "AH-0001", "--reason", "out_of_scope"
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("it is accepted", err)
+        code, out, err = self.run_cli(
+            "agent", "handoff", "refuse", "AH-0001", "--reason", "bogus_code"
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        # pin drift: publish bob v2, then accept a proposal pinned at v1
+        self.create()  # AH-0002, pinned at bob v1
+        document = passports.build_passport_document(
+            agent_name="bob", passport_version=2, agent_class="custom",
+            scope_level="global", project_slug=None, role="worker",
+            mission="do v2", method="publish",
+            fragment={
+                "autonomy": "supervised", "capabilities": ["cap.a"],
+                "data_classifications": ALL_CLASSES,
+            },
+        )
+        artifact = self.root / "bob_v2.json"
+        artifact.write_text(
+            protocols.serialize_canonical_file_bytes(document).decode("utf-8"),
+            encoding="utf-8",
+        )
+        code, _, err = self.run_cli(
+            "agent", "passport", "publish", "bob", "--file", str(artifact)
+        )
+        self.assertEqual(code, 0, err)
+        code, out, err = self.run_cli("agent", "handoff", "accept", "AH-0002")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("pinned v1, now v2", err)
+
+    def test_no_output_implies_execution_or_completion(self):
+        self.create()
+        outputs = []
+        outputs.append(self.run_cli("agent", "handoff", "accept", "AH-0001")[1])
+        outputs.append(self.run_cli("agent", "handoff", "list")[1])
+        outputs.append(self.run_cli("agent", "handoff", "show", "AH-0001")[1])
+        outputs.append(self.create()[1])
+        for text in outputs:
+            lower = text.lower()
+            for word in ("complete", "executed", "executing", "running",
+                         "launched", "scheduled"):
+                self.assertNotIn(word, lower)
+
+    def test_cli_adds_no_extra_events_or_rows(self):
+        self.create()
+        self.run_cli("agent", "handoff", "accept", "AH-0001")
+        actions = [
+            row["action"] for row in self.query(
+                "SELECT action FROM events WHERE entity='agent_handoff' "
+                "ORDER BY id"
+            )
+        ]
+        self.assertEqual(actions, ["propose", "accept"])
+        self.assertEqual(self.table_counts()[0], 1)
+        self.run_cli("agent", "handoff", "list")
+        self.run_cli("agent", "handoff", "show", "AH-0001")
+        self.assertEqual(
+            self.query(
+                "SELECT COUNT(*) FROM events WHERE entity='agent_handoff'"
+            )[0][0],
+            2,
+        )
+
+    def test_non_show_text_outputs_carry_no_full_hash(self):
+        _, out, _ = self.create()
+        self.assertNotRegex(out, r"[0-9a-f]{64}")
+        _, out, _ = self.run_cli("agent", "handoff", "list")
+        self.assertNotRegex(out, r"[0-9a-f]{64}")
+        _, out, _ = self.run_cli("agent", "handoff", "cancel", "AH-0001")
+        self.assertNotRegex(out, r"[0-9a-f]{64}")
+
+    def test_legacy_handoff_commands_unchanged(self):
+        self.create()
+        code, out, _ = self.run_cli(
+            "handoff", "create", "T-0001", "--from", "x", "--to", "y",
+            "--state", "proposed",
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), "H-0001")
+        code, out, _ = self.run_cli("handoff", "accept", "H-0001")
+        self.assertEqual(code, 0)
+        self.assertIn("H-0001 accepted", out)
+
+
+class Wave5PowerPolicyTests(unittest.TestCase):
+    U_A3_POLICY = {
+        ("agent", "route", "plan"): (power.AUTHORITATIVE_WRITE, True),
+        ("agent", "route", "list"): (power.READ_ONLY, False),
+        ("agent", "route", "show"): (power.READ_ONLY, False),
+        ("agent", "route", "verify"): (power.READ_ONLY, False),
+        ("agent", "handoff", "create"): (power.AUTHORITATIVE_WRITE, True),
+        ("agent", "handoff", "list"): (power.READ_ONLY, False),
+        ("agent", "handoff", "show"): (power.READ_ONLY, False),
+        ("agent", "handoff", "accept"): (power.AUTHORITATIVE_WRITE, True),
+        ("agent", "handoff", "refuse"): (power.AUTHORITATIVE_WRITE, True),
+        ("agent", "handoff", "clarify"): (power.AUTHORITATIVE_WRITE, True),
+        ("agent", "handoff", "cancel"): (power.AUTHORITATIVE_WRITE, True),
+    }
+
+    def test_exactly_seven_handoff_entries_with_exact_classes(self):
+        entries = {
+            path for path in power.COMMAND_POLICY
+            if path[:2] == ("agent", "handoff")
+        }
+        self.assertEqual(
+            entries,
+            {p for p in self.U_A3_POLICY if p[:2] == ("agent", "handoff")},
+        )
+        for path, (kind, ledger) in self.U_A3_POLICY.items():
+            with self.subTest(path=path):
+                policy = power.COMMAND_POLICY[path]
+                self.assertEqual((policy.kind, policy.ledger), (kind, ledger))
+
+    def test_final_inventory_eleven_leaves_six_writes_five_reads(self):
+        u_a3 = [
+            path for path in power.COMMAND_POLICY
+            if path[:2] in (("agent", "route"), ("agent", "handoff"))
+        ]
+        self.assertEqual(len(u_a3), 11)
+        writes = [
+            path for path in u_a3
+            if power.COMMAND_POLICY[path].kind == power.AUTHORITATIVE_WRITE
+        ]
+        reads = [
+            path for path in u_a3
+            if power.COMMAND_POLICY[path].kind == power.READ_ONLY
+        ]
+        self.assertEqual(len(writes), 6)
+        self.assertEqual(len(reads), 5)
+        for path in writes:
+            with self.subTest(path=path):
+                self.assertTrue(power.COMMAND_POLICY[path].ledger)
+
+    def test_parser_and_policy_are_bijective_for_u_a3(self):
+        leaves = {
+            p for p in power.iter_command_paths(cli.build_parser())
+            if p[:2] in (("agent", "route"), ("agent", "handoff"))
+        }
+        entries = {
+            p for p in power.COMMAND_POLICY
+            if p[:2] in (("agent", "route"), ("agent", "handoff"))
+        }
+        self.assertEqual(leaves, entries)
+
+    def test_no_policy_for_forbidden_leaves(self):
+        for path in FORBIDDEN_LEAVES:
+            with self.subTest(path=path):
+                self.assertNotIn(path, power.COMMAND_POLICY)
+
+
+class Wave5RecoveryDeepEcoTests(Wave5CliCase):
+    WRITE_ARGVS = (
+        (("agent", "handoff", "create"),
+         ("agent", "handoff", "create", "--task", "T-0001", "--from", "alice",
+          "--to", "bob", "--objective", "blocked")),
+        (("agent", "handoff", "accept"),
+         ("agent", "handoff", "accept", "AH-0001")),
+        (("agent", "handoff", "refuse"),
+         ("agent", "handoff", "refuse", "AH-0001", "--reason", "out_of_scope")),
+        (("agent", "handoff", "clarify"),
+         ("agent", "handoff", "clarify", "AH-0001", "--reason",
+          "objective_unclear")),
+        (("agent", "handoff", "cancel"),
+         ("agent", "handoff", "cancel", "AH-0001")),
+    )
+
+    def test_recovery_blocks_all_five_writes_before_dispatch(self):
+        self.create()
+        self.run_cli("power", "set", "recovery")
+        before = self.table_counts()
+        for path, argv in self.WRITE_ARGVS:
+            with self.subTest(command=" ".join(path)):
+                code, out, err = self.run_cli(*argv)
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "", f"{path} wrote to stdout")
+                self.assertIn("recovery mode", err)
+                self.assertIn(f"`{' '.join(path)}`", err)
+        self.assertEqual(self.table_counts(), before)
+
+    def test_recovery_allows_list_and_show_even_on_a_tampered_record(self):
+        self.create()
+        self.execute(
+            "UPDATE agent_handoffs SET content_sha256=?", ("e" * 64,)
+        )
+        self.run_cli("power", "set", "recovery")
+        code, out, _ = self.run_cli("agent", "handoff", "list")
+        self.assertEqual(code, 0)
+        self.assertIn("AH-0001", out)
+        code, out, _ = self.run_cli("agent", "handoff", "show", "AH-0001")
+        self.assertEqual(code, 0)
+        self.assertIn("mismatch", out)
+
+    def test_deep_wraps_every_write_and_dispatches_once(self):
+        self.run_cli("power", "set", "deep")
+        code, out, err = self.create()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.strip(), "AH-0001 proposed")
+        self.assertEqual(self.table_counts()[0], 1)  # exactly one dispatch
+        for argv, transitions_after in (
+            (("agent", "handoff", "clarify", "AH-0001", "--reason",
+              "objective_unclear"), 1),
+            (("agent", "handoff", "accept", "AH-0001"), 2),
+            (("agent", "handoff", "cancel", "AH-0001"), 3),
+        ):
+            with self.subTest(argv=argv):
+                code, _, err = self.run_cli(*argv)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.table_counts()[1], transitions_after)
+        code, _, err = self.create()
+        self.assertEqual(code, 0, err)
+        code, _, err = self.run_cli(
+            "agent", "handoff", "refuse", "AH-0002", "--reason", "out_of_scope"
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.table_counts()[:2], (2, 4))
+        self.assertEqual(
+            self.query(
+                "SELECT COUNT(*) FROM events WHERE entity='agent_handoff'"
+            )[0][0],
+            6,  # two proposes + clarify + accept + cancel + refuse
+        )
+
+    def test_eco_runs_every_explicit_write_immediately(self):
+        self.run_cli("power", "set", "eco")
+        code, out, err = self.create()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.strip(), "AH-0001 proposed")
+        code, out, _ = self.run_cli("agent", "handoff", "accept", "AH-0001")
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), "AH-0001 accepted")
+        self.create()
+        code, _, _ = self.run_cli(
+            "agent", "handoff", "refuse", "AH-0002", "--reason", "out_of_scope"
+        )
+        self.assertEqual(code, 0)
+        self.create()
+        code, _, _ = self.run_cli(
+            "agent", "handoff", "clarify", "AH-0003", "--reason",
+            "objective_unclear",
+        )
+        self.assertEqual(code, 0)
+        code, _, _ = self.run_cli("agent", "handoff", "cancel", "AH-0003")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.table_counts()[0], 3)
+
+    def test_doctor_remains_thirty_seven_with_governed_handoffs_present(self):
+        self.create()
+        self.run_cli("agent", "handoff", "accept", "AH-0001")
+        self.run_cli("sync")
+        code, out, err = self.run_cli("doctor")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 37)
+
+
+class Wave5EntrypointTests(Wave5CliCase):
+    def test_entrypoints_equivalent_for_handoff_show(self):
+        self.create()
+        _, expected, _ = self.run_cli(
+            "agent", "handoff", "show", "AH-0001", "--json"
+        )
+        import subprocess
+
+        for cmd in (
+            ["python3", "aos.py"],
+            ["python3", "-m", "agentic_os"],
+        ):
+            with self.subTest(entrypoint=cmd[-1]):
+                proc = subprocess.run(
+                    [*cmd, "--root", str(self.root), "agent", "handoff",
+                     "show", "AH-0001", "--json"],
+                    cwd=str(REPO_ROOT), capture_output=True, text=True,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
