@@ -106,6 +106,21 @@ def _require_enum_scalar(value, *, field: str, allowed: tuple[str, ...]) -> str:
     return value
 
 
+def _require_project_slug(value) -> str:
+    """The exact public `project` rules (§6): a bounded, slug-valid string.
+    Shared by `validate_request` and the internal task-derived attachment so
+    the two paths cannot drift."""
+    if not isinstance(value, str):
+        raise RoutingRequestError("project must be a string.")
+    if len(value) > 64:
+        raise RoutingRequestError("project must be at most 64 characters.")
+    try:
+        models.validate_slug(value)
+    except AosError as exc:
+        raise RoutingRequestError(str(exc)) from None
+    return value
+
+
 def _require_bounded_array(
     value,
     *,
@@ -224,16 +239,7 @@ def validate_request(raw: dict) -> dict:
         )
 
     if "project" in raw:
-        project = raw["project"]
-        if not isinstance(project, str):
-            raise RoutingRequestError("project must be a string.")
-        if len(project) > 64:
-            raise RoutingRequestError("project must be at most 64 characters.")
-        try:
-            models.validate_slug(project)
-        except AosError as exc:
-            raise RoutingRequestError(str(exc)) from None
-        normalized["project"] = project
+        normalized["project"] = _require_project_slug(raw["project"])
 
     if "task_families" in raw:
         normalized["task_families"] = _require_bounded_array(
@@ -1044,6 +1050,23 @@ def _build_snapshot(conn, agent: Agent, catalog_index: dict) -> CandidateSnapsho
 # Request resolution (§ request_resolution). Authoritative task/project/
 # preferred-agent resolution, run inside the plan transaction.
 
+def _with_derived_project(request: dict, project: str) -> dict:
+    """Attach a task-derived project to an ALREADY-normalized request.
+
+    The input passed public `validate_request` before this transaction began,
+    so its array requirements are internal normalized tuples — a shape the
+    public list-only validator refuses BY DESIGN and must keep refusing. Only
+    the derived slug is new here, so only it is validated (the exact public
+    `project` rules); nothing else is re-validated or coerced. Canonical
+    serialization sorts keys, so the stored request document and its digest
+    are byte-identical to the logically equivalent explicit-project request.
+    Returns a fresh dict; never mutates `request`.
+    """
+    merged = dict(request)
+    merged["project"] = _require_project_slug(project)
+    return merged
+
+
 def _resolve_context(conn, request: dict) -> tuple[dict, int | None, int | None, str]:
     """Resolve `task`/`project` references and derive the plan's scope.
 
@@ -1087,7 +1110,7 @@ def _resolve_context(conn, request: dict) -> tuple[dict, int | None, int | None,
         scope = "project"
 
     if final_slug is not None and request.get("project") != final_slug:
-        request = validate_request({**request, "project": final_slug})
+        request = _with_derived_project(request, final_slug)
     return request, task_id, project_id, scope
 
 
@@ -1467,10 +1490,21 @@ def _candidate_stale_reasons(conn, candidate: RoutingPlanCandidate) -> set[str]:
     return reasons
 
 
+def _rank_inspectable(rank) -> bool:
+    """Whether a stored eligible rank can participate in the §10 candidate
+    inspection at all: NULL (tolerated damage the reader already orders as 0)
+    or a true integer. Any other stored type — a BLOB, text, a float — is a
+    value no honest write could have produced (§12.2 discipline) and must be
+    detected BEFORE any sort compares it."""
+    return rank is None or (isinstance(rank, int) and not isinstance(rank, bool))
+
+
 def plan_staleness(conn, plan: RoutingPlan) -> PlanStaleness:
     """Derive a plan's staleness and supersession from current ledger facts
     (§10). Reads only — mutates nothing, refreshes nothing, rewrites no
-    history. A historically stale plan stays a valid record."""
+    history. A historically stale plan stays a valid record. Total on planted
+    damage: malformed candidate rank types read as the existing closed
+    `integrity_broken` (no candidate named, no value echoed), never a raise."""
     reasons: set[str] = set()
     first_agent: str | None = None
     eligible = [
@@ -1478,14 +1512,21 @@ def plan_staleness(conn, plan: RoutingPlan) -> PlanStaleness:
         for c in get_candidates(conn, plan.id)
         if c.verdict == "eligible"
     ]
-    for candidate in sorted(eligible, key=lambda c: (c.rank if c.rank else 0)):
-        candidate_reasons = _candidate_stale_reasons(conn, candidate)
-        if candidate_reasons and first_agent is None:
-            agent_row = conn.execute(
-                "SELECT name FROM agents WHERE id = ?", (candidate.agent_id,)
-            ).fetchone()
-            first_agent = agent_row["name"] if agent_row else None
-        reasons |= candidate_reasons
+    if all(_rank_inspectable(c.rank) for c in eligible):
+        for candidate in sorted(
+            eligible, key=lambda c: (c.rank if c.rank else 0)
+        ):
+            candidate_reasons = _candidate_stale_reasons(conn, candidate)
+            if candidate_reasons and first_agent is None:
+                agent_row = conn.execute(
+                    "SELECT name FROM agents WHERE id = ?", (candidate.agent_id,)
+                ).fetchone()
+                first_agent = agent_row["name"] if agent_row else None
+            reasons |= candidate_reasons
+    else:
+        # Candidate ordering integrity cannot be inspected safely; the §10
+        # verdict for that is the existing `integrity_broken`, fail-closed.
+        reasons.add("integrity_broken")
 
     successor = _successor_id(conn, plan.id)
     return PlanStaleness(
@@ -1647,6 +1688,14 @@ def verify_plan(conn, plan_id: int) -> dict:
     try:
         plan = RoutingPlan.from_row(plan_row)
     except (TypeError, ValueError):
+        return {"plan": rp, "ok": False, "stale": False, "superseded": False,
+                "problems": [f"{rp}: malformed"]}
+    if not isinstance(plan.request_document, str):
+        # A BLOB (or any non-text) request document is a row no honest write
+        # could have produced (§12.2). Inspecting further would feed raw bytes
+        # into the per-candidate ordering re-parse, so the plan-level closed
+        # verdict `malformed` answers by itself: plan ID and verdict only,
+        # never a stored value, never an exception.
         return {"plan": rp, "ok": False, "stale": False, "superseded": False,
                 "problems": [f"{rp}: malformed"]}
 

@@ -6096,10 +6096,14 @@ class Doctor38RoutingPlansVerifyTests(_DoctorCase):
         self.assertIn("rank_gap", check.detail)
 
     def test_malformed_stored_value_does_not_crash(self):
-        # Damage the frozen verifier cannot survive on its own — a BLOB
-        # request_document breaks the ordering re-check's parse, a BLOB rank
-        # breaks the staleness sort — must still produce a bounded closed
-        # verdict, never a doctor crash and never the stored bytes.
+        # Since the routing-robustness maintenance, `verify_plan` is total on
+        # both damage shapes: a BLOB request_document reads as the plan-level
+        # `malformed` verdict from the verifier ITSELF, and a BLOB rank reads
+        # by the frozen matrix's non-integer-rank shape (an unhashable
+        # candidate plus a rank gap, plus the unhashable plan chain). Doctor
+        # echoes those closed verdicts — its exception containment remains as
+        # defense-in-depth but no longer fires here. Still: bounded closed
+        # verdicts only, never a doctor crash, never the stored bytes.
         first = self.cap_plan()
         second = self.cap_plan()
         self.conn.execute(
@@ -6115,7 +6119,9 @@ class Doctor38RoutingPlansVerifyTests(_DoctorCase):
         check = self.named(CHECK_38)  # must not raise
         self.assertFalse(check.ok)
         self.assertIn("RP-0001: malformed", check.detail)
-        self.assertIn("RP-0002: malformed", check.detail)
+        self.assertIn("RP-0002 candidate #3: unhashable", check.detail)
+        self.assertIn("RP-0002: rank_gap", check.detail)
+        self.assertIn("RP-0002: unhashable", check.detail)
         self.assertNotIn("blob", check.detail)
 
     def test_detail_is_only_rp_ids_and_closed_verdicts(self):
@@ -6544,10 +6550,14 @@ class Doctor41StaleReferencedPlansTests(_DoctorCase):
         self.assertRegex(check.detail, r"^AH-\d{4}: plan RP-\d{4} stale$")
 
     def test_malformed_candidate_ranks_do_not_crash_check_41(self):
-        # Mixed-type eligible ranks (int + BLOB) make routing.plan_staleness
-        # raise TypeError while sorting. Check 41 must contain that per
-        # handoff rather than crash doctor.run_checks; check 38 owns the
-        # damaged plan as malformed through its own, separate boundary.
+        # Since the routing-robustness maintenance, mixed-type eligible ranks
+        # (int + BLOB) no longer raise anywhere: `plan_staleness` reads the
+        # damaged plan as stale via the existing `integrity_broken`, so check
+        # 41 now SURFACES the advisory for the open pinned handoff instead of
+        # skipping blind, and check 38 reports the verifier's own closed
+        # verdicts (the frozen matrix's non-integer-rank shape). Doctor's
+        # exception containment remains as defense-in-depth but no longer
+        # fires here. Still: no crash, no mutation, no stored value.
         plan, _ = self.pinned_handoff()
         self.conn.execute(
             "UPDATE routing_plan_candidates SET rank=? "
@@ -6563,10 +6573,14 @@ class Doctor41StaleReferencedPlansTests(_DoctorCase):
         by_name = {c.name: c for c in checks}
         check38, check41 = by_name[CHECK_38], by_name[CHECK_41]
         self.assertFalse(check38.ok)
-        self.assertEqual(check38.detail, "RP-0001: malformed")
-        self.assertTrue(check41.ok)
+        self.assertEqual(
+            check38.detail,
+            "RP-0001 candidate #1: unhashable; RP-0001: rank_gap; "
+            "RP-0001: unhashable",
+        )
+        self.assertFalse(check41.ok)
         self.assertTrue(check41.warn_only)
-        self.assertEqual(check41.detail, "")
+        self.assertEqual(check41.detail, "AH-0001: plan RP-0001 stale")
         for detail in (check38.detail, check41.detail):
             self.assertNotIn("TypeError", detail)
             self.assertNotIn("bytes", detail)
@@ -6985,6 +6999,455 @@ class Wave5EntrypointTests(Wave5CliCase):
                 )
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(proc.stdout, expected)
+
+
+# ===========================================================================
+# U-A3 ROUTING ROBUSTNESS MAINTENANCE — three post-Wave-6 defects, each with
+# an exact regression: (A) a task-derived project re-sent an ALREADY-
+# normalized request (tuple arrays) through public list-only validation;
+# (B) `verify_plan` raised on a BLOB `request_document`; (C) `plan_staleness`
+# raised while sorting mixed-type candidate ranks.
+# ===========================================================================
+
+
+class MaintenanceTupleRevalidationTests(_LiveCase):
+    """Defect A: a task-derived project must be attached to the ALREADY-
+    normalized request at the internal boundary that owns normalized data —
+    its tuple arrays never re-enter public list-only validation — while the
+    public boundary itself stays strictly list-only."""
+
+    #: Every frozen array-valued request dimension, with values the default
+    #: live passport fixture can also declare.
+    ARRAY_FIELDS = {
+        "task_families": ["tf.a"],
+        "capabilities": ["cap.a"],
+        "evidence_kinds": ["file"],
+        "required_autonomy": ["supervised"],
+        "skills": ["skill.a"],
+        "tools": ["tool.a"],
+    }
+
+    def _project_task(self):
+        self.add_project("demo")
+        return self.add_task(project="demo")
+
+    def _created_plan(self, request):
+        plan = routing.get_plan(
+            self.conn, routing.create_plan(self.conn, request)
+        )
+        assert plan is not None
+        return plan
+
+    def _candidate_projection(self, plan):
+        return [
+            (c.verdict, c.rank, c.ordering_json, c.reasons_json)
+            for c in self.candidates(plan)
+        ]
+
+    def test_task_derived_project_with_capability_requirement(self):
+        # The exact reported failure: `--task T-…` without `--project`, plus
+        # one repeatable array requirement, beginning with capability.
+        task = self._project_task()
+        self.publish("a", capabilities=["cap.a"])
+        plan = self._created_plan(
+            self.request(task=task.id, capabilities=["cap.a"])
+        )
+        self.assertEqual(plan.scope, "project")
+        self.assertEqual(plan.task_id, task.id)
+        self.assertIn('"project":"demo"', plan.request_document)
+        self.assertIn('"capabilities":["cap.a"]', plan.request_document)
+        self.assertEqual(self.by_name(plan)["a"].rank, 1)
+
+    def test_task_derived_project_with_multiple_capability_values(self):
+        task = self._project_task()
+        self.publish("a", capabilities=["cap.a", "cap.b"])
+        plan = self._created_plan(
+            self.request(task=task.id, capabilities=["cap.b", "cap.a"]),
+        )
+        self.assertIn('"capabilities":["cap.a","cap.b"]', plan.request_document)
+        self.assertEqual(plan.result_status, "resolved")
+
+    def test_every_frozen_array_requirement_through_task_derived_path(self):
+        task = self._project_task()
+        self.publish(
+            "a",
+            capabilities=["cap.a"],
+            task_families=["tf.a"],
+            skill_requirements=["skill.a"],
+            tool_requirements=["tool.a"],
+            data_classifications=["internal"],
+            evidence_expectations={
+                "evidence_kinds": ["file"], "min_evidence_count": 1,
+            },
+            model_requirements={
+                "min_context_tokens": 50000, "modalities": ["text"],
+            },
+        )
+        request = self.request(
+            task=task.id,
+            model_capabilities={
+                "min_context_tokens": 1000, "modalities": ["text"],
+            },
+            **self.ARRAY_FIELDS,
+        )
+        plan = self._created_plan(request)
+        document = protocols.parse_canonical(
+            plan.request_document.encode("utf-8")
+        )
+        self.assertEqual(document["project"], "demo")
+        for field, values in self.ARRAY_FIELDS.items():
+            self.assertEqual(document[field], sorted(values))
+        self.assertEqual(document["model_capabilities"]["modalities"], ["text"])
+
+    def test_explicit_and_task_derived_requests_normalize_identically(self):
+        task = self._project_task()
+        self.publish("a", capabilities=["cap.a"])
+        self.publish("b", capabilities=["cap.a", "cap.b"])
+        derived = self._created_plan(
+            self.request(task=task.id, capabilities=["cap.a"])
+        )
+        explicit = self._created_plan(
+            self.request(task=task.id, project="demo", capabilities=["cap.a"]),
+        )
+        self.assertEqual(derived.request_document, explicit.request_document)
+        self.assertEqual(derived.request_sha256, explicit.request_sha256)
+        self.assertEqual(
+            self._candidate_projection(derived),
+            self._candidate_projection(explicit),
+        )
+        # Determinism of the derived path itself: an identical request yields
+        # an identical digest and ranked projection every time.
+        repeat = self._created_plan(
+            self.request(task=task.id, capabilities=["cap.a"])
+        )
+        self.assertEqual(repeat.request_sha256, derived.request_sha256)
+        self.assertEqual(
+            self._candidate_projection(repeat),
+            self._candidate_projection(derived),
+        )
+
+    def test_public_non_list_array_inputs_remain_rejected(self):
+        # The internal normalized tuple shape must NOT become publicly
+        # acceptable: the public contract stays list-only for every frozen
+        # array field, and every other iterable stays rejected too.
+        for field in self.ARRAY_FIELDS:
+            for bad in (
+                ("cap.a",),                      # tuple: internal shape only
+                {"cap.a"},                       # set
+                {"cap.a": True},                 # mapping
+                b"cap.a",                        # bytes
+                "cap.a",                         # bare string
+                (item for item in ["cap.a"]),    # generator
+            ):
+                with self.subTest(field=field, bad=type(bad).__name__):
+                    with self.assertRaises(routing.RoutingRequestError):
+                        routing.validate_request(
+                            dict(VALID_REQUEST, **{field: bad})
+                        )
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(
+                dict(VALID_REQUEST, model_capabilities={"modalities": ("text",)})
+            )
+
+    def test_public_bounds_and_item_rules_unchanged(self):
+        seventeen = [f"cap.c{i:02d}" for i in range(17)]
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(dict(VALID_REQUEST, capabilities=seventeen))
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(dict(VALID_REQUEST, capabilities=[]))
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(
+                dict(VALID_REQUEST, capabilities=["cap.a", 5])
+            )
+        with self.assertRaises(routing.RoutingRequestError):
+            routing.validate_request(
+                dict(VALID_REQUEST, capabilities=["cap.a", "cap.a"])
+            )
+        sixteen = [f"cap.c{i:02d}" for i in range(16)]
+        self.assertEqual(
+            len(routing.validate_request(
+                dict(VALID_REQUEST, capabilities=sixteen)
+            )["capabilities"]),
+            16,
+        )
+
+    def test_no_request_level_refusal_stored_as_candidate_exclusion(self):
+        task = self._project_task()
+        self.publish("a", capabilities=["cap.a"])
+        plan = self._created_plan(
+            self.request(task=task.id, capabilities=["cap.a"])
+        )
+        for candidate in self.candidates(plan):
+            codes = json.loads(candidate.reasons_json)
+            for refusal in models.ROUTING_REQUEST_REFUSAL_CODES:
+                self.assertNotIn(refusal, codes)
+        # A request-level refusal on the same task-derived path still stores
+        # no plan row and no event.
+        before = (self.count("routing_plans"), self.count("events"))
+        with self.assertRaises(AosError) as ctx:
+            routing.create_plan(
+                self.conn,
+                self.request(
+                    task=task.id,
+                    capabilities=["cap.a"],
+                    preferred_agent="ghost",
+                ),
+            )
+        self.assertIn("agent_absent", str(ctx.exception))
+        self.assertEqual(
+            (self.count("routing_plans"), self.count("events")), before
+        )
+
+
+class MaintenanceTupleRevalidationCliTests(Wave3CliCase):
+    def test_route_plan_task_derived_project_with_capability_succeeds(self):
+        # The real CLI path of the reported failure.
+        self.run_cli("task", "add", "build", "-p", "demo")
+        self.make_agent("alpha", capabilities=["cap.a"])
+        code, out, err = self.run_cli(
+            "agent", "route", "plan", "--task", "T-0001",
+            "--capability", "cap.a",
+        )
+        self.assertEqual(code, 0, err)
+        self.assertIn("RP-0001", out)
+        code, out, err = self.run_cli(
+            "agent", "route", "plan", "--task", "T-0001",
+            "--capability", "cap.a", "--json",
+        )
+        self.assertEqual(code, 0, err)
+        doc = json.loads(out)["plan"]
+        self.assertEqual(doc["project"], "demo")
+        self.assertEqual(doc["scope"], "project")
+
+
+class MaintenanceVerifyPlanTotalityTests(_LiveCase):
+    """Defect B: `verify_plan` is total on a malformed/BLOB
+    `routing_plans.request_document` — the frozen closed plan-level
+    `malformed` verdict, never an exception, never a stored byte."""
+
+    def _live_plan(self, **over):
+        plan = self.plan(**over)
+        assert plan is not None
+        return plan
+
+    def _blob_plan(self):
+        self.publish("a", capabilities=["cap.a"])
+        plan = self._live_plan(capabilities=["cap.a"])
+        # The pre-fix raise needs an eligible candidate: only the ordering
+        # re-check parses the plan's request document per candidate.
+        self.assertEqual(plan.eligible_count, 1)
+        self.conn.execute(
+            "UPDATE routing_plans SET request_document=? WHERE id=?",
+            (sqlite3.Binary(b"\x00\xffnot a document"), plan.id),
+        )
+        self.conn.commit()
+        return plan
+
+    def test_blob_request_document_reports_plan_level_malformed(self):
+        plan = self._blob_plan()
+        result = routing.verify_plan(self.conn, plan.id)  # must not raise
+        rp = ids.render_id("routing_plan", plan.id)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["problems"], [f"{rp}: malformed"])
+        self.assertFalse(result["stale"])
+        self.assertFalse(result["superseded"])
+
+    def test_blob_request_document_result_is_json_and_value_free(self):
+        plan = self._blob_plan()
+        result = routing.verify_plan(self.conn, plan.id)
+        encoded = json.dumps(result)  # JSON-compatible throughout
+        for leaked in ("\\x00", "\\xff", "not a document", "AttributeError",
+                       "Traceback", "SELECT", "encode"):
+            self.assertNotIn(leaked, encoded)
+        self.assertNotRegex(encoded, r"[0-9a-f]{64}")
+
+    def test_blob_request_document_verify_is_deterministic_and_read_only(self):
+        plan = self._blob_plan()
+        before_row = tuple(self.conn.execute(
+            "SELECT * FROM routing_plans WHERE id=?", (plan.id,)
+        ).fetchone())
+        changes_before = self.conn.total_changes
+        first = routing.verify_plan(self.conn, plan.id)
+        second = routing.verify_plan(self.conn, plan.id)
+        self.assertEqual(first, second)
+        self.assertEqual(self.conn.total_changes, changes_before)
+        after_row = tuple(self.conn.execute(
+            "SELECT * FROM routing_plans WHERE id=?", (plan.id,)
+        ).fetchone())
+        self.assertEqual(before_row, after_row)
+
+    def test_valid_and_string_tampered_plans_keep_existing_verdicts(self):
+        self.publish("a", capabilities=["cap.a"])
+        intact = self._live_plan(capabilities=["cap.a"])
+        result = routing.verify_plan(self.conn, intact.id)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["problems"], [])
+        # A re-spaced STRING document keeps the existing request_mismatch
+        # verdict: the new malformed boundary is type-level only.
+        respaced = self._live_plan(capabilities=["cap.a"])
+        self.conn.execute(
+            "UPDATE routing_plans SET request_document=? WHERE id=?",
+            (respaced.request_document.replace(",", ", "), respaced.id),
+        )
+        self.conn.commit()
+        rp = ids.render_id("routing_plan", respaced.id)
+        self.assertIn(
+            f"{rp}: request_mismatch",
+            routing.verify_plan(self.conn, respaced.id)["problems"],
+        )
+        # A tampered plan column keeps the existing mismatch verdict.
+        tampered = self._live_plan(capabilities=["cap.a"])
+        self.conn.execute(
+            "UPDATE routing_plans SET actor='intruder' WHERE id=?",
+            (tampered.id,),
+        )
+        self.conn.commit()
+        rp_tampered = ids.render_id("routing_plan", tampered.id)
+        self.assertIn(
+            f"{rp_tampered}: mismatch",
+            routing.verify_plan(self.conn, tampered.id)["problems"],
+        )
+
+
+class MaintenancePlanStalenessTotalityTests(_LiveCase):
+    """Defect C: `plan_staleness` is total on malformed mixed-type candidate
+    ranks — the existing closed `integrity_broken` verdict, detected BEFORE
+    any unsafe sort; never a TypeError, never a stored value."""
+
+    def _live_plan(self, **over):
+        plan = self.plan(**over)
+        assert plan is not None
+        return plan
+
+    def _reread(self, plan_id):
+        plan = routing.get_plan(self.conn, plan_id)
+        assert plan is not None
+        return plan
+
+    def _two_candidate_plan(self):
+        self.publish("a", capabilities=["cap.a"])
+        self.publish("b", capabilities=["cap.a"])
+        plan = self._live_plan(capabilities=["cap.a"])
+        self.assertEqual(plan.eligible_count, 2)
+        return plan
+
+    def _plant_rank(self, plan, value, *, expected_type):
+        self.conn.execute(
+            "UPDATE routing_plan_candidates SET rank=? "
+            "WHERE plan_id=? AND rank=1",
+            (value, plan.id),
+        )
+        self.conn.commit()
+        stored = [
+            tuple(row)
+            for row in self.conn.execute(
+                "SELECT typeof(rank) FROM routing_plan_candidates "
+                "WHERE plan_id=? ORDER BY id",
+                (plan.id,),
+            ).fetchall()
+        ]
+        # SQLite really kept the planted type (INTEGER affinity would
+        # otherwise quietly convert a numeric string).
+        self.assertIn((expected_type,), stored)
+
+    def test_mixed_int_and_blob_ranks_read_integrity_broken(self):
+        plan = self._two_candidate_plan()
+        self._plant_rank(plan, sqlite3.Binary(b"\x01"), expected_type="blob")
+        st = routing.plan_staleness(self.conn, plan)  # must not raise
+        self.assertTrue(st.stale)
+        self.assertEqual(st.reasons, ("integrity_broken",))
+        self.assertIsNone(st.agent)
+        self.assertFalse(st.superseded)
+        self.assertIsNone(st.successor)
+
+    def test_mixed_int_and_text_ranks_read_integrity_broken(self):
+        plan = self._two_candidate_plan()
+        self._plant_rank(plan, "not-a-rank", expected_type="text")
+        st = routing.plan_staleness(self.conn, plan)
+        self.assertTrue(st.stale)
+        self.assertEqual(st.reasons, ("integrity_broken",))
+
+    def test_float_rank_reads_integrity_broken(self):
+        plan = self._two_candidate_plan()
+        self._plant_rank(plan, 1.5, expected_type="real")
+        st = routing.plan_staleness(self.conn, plan)
+        self.assertTrue(st.stale)
+        self.assertEqual(st.reasons, ("integrity_broken",))
+
+    def test_superseded_flag_remains_correct_with_malformed_ranks(self):
+        plan = self._two_candidate_plan()
+        successor = routing.create_plan(
+            self.conn, self.request(capabilities=["cap.a"]),
+            supersedes_id=plan.id,
+        )
+        self._plant_rank(plan, sqlite3.Binary(b"\x01"), expected_type="blob")
+        st = routing.plan_staleness(self.conn, self._reread(plan.id))
+        self.assertTrue(st.stale)
+        self.assertEqual(st.reasons, ("integrity_broken",))
+        self.assertTrue(st.superseded)
+        self.assertEqual(st.successor, ids.render_id("routing_plan", successor))
+
+    def test_malformed_rank_result_value_free_deterministic_read_only(self):
+        plan = self._two_candidate_plan()
+        self._plant_rank(plan, sqlite3.Binary(b"\x01"), expected_type="blob")
+        candidate_rows = "SELECT * FROM routing_plan_candidates " \
+            "WHERE plan_id=? ORDER BY id"
+        before_rows = [
+            tuple(row)
+            for row in self.conn.execute(candidate_rows, (plan.id,)).fetchall()
+        ]
+        changes_before = self.conn.total_changes
+        first = routing.plan_staleness(self.conn, plan)
+        second = routing.plan_staleness(self.conn, plan)
+        self.assertEqual(first, second)
+        self.assertEqual(self.conn.total_changes, changes_before)
+        rendered = repr(first)
+        for leaked in ("\\x01", "TypeError", "bytes", "Traceback",
+                       "not supported between instances"):
+            self.assertNotIn(leaked, rendered)
+        after_rows = [
+            tuple(row)
+            for row in self.conn.execute(candidate_rows, (plan.id,)).fetchall()
+        ]
+        self.assertEqual(before_rows, after_rows)
+
+    def test_valid_plans_keep_existing_staleness_vocabulary(self):
+        self.publish("a", capabilities=["cap.a"])
+        fresh = self._live_plan(capabilities=["cap.a"])
+        st = routing.plan_staleness(self.conn, fresh)
+        self.assertFalse(st.stale)
+        self.assertEqual(st.reasons, ())
+        self.assertIsNone(st.agent)
+        # The existing closed reasons still fire exactly as before.
+        self.publish_v2("a", capabilities=["cap.a"])
+        st = routing.plan_staleness(self.conn, self._reread(fresh.id))
+        self.assertTrue(st.stale)
+        self.assertIn("passport_version_changed", st.reasons)
+        self.assertEqual(st.agent, "a")
+        second = self._live_plan(capabilities=["cap.a"])
+        passports.transition_lifecycle(self.conn, name="a", verb="suspend")
+        st_suspended = routing.plan_staleness(self.conn, self._reread(second.id))
+        self.assertIn("lifecycle_not_active", st_suspended.reasons)
+        self.assertIn("identity_changed", st_suspended.reasons)
+
+    def test_verify_plan_on_malformed_ranks_is_total_with_closed_verdicts(self):
+        # With staleness total, `verify_plan`'s final staleness call no longer
+        # raises either: the plan reads by the frozen matrix's non-integer-rank
+        # shape (an unhashable candidate plus a rank gap, plus the unhashable
+        # plan chain) AND stale through integrity_broken — "both
+        # verification-failed and stale", never an exception.
+        plan = self._two_candidate_plan()
+        self._plant_rank(plan, sqlite3.Binary(b"\x01"), expected_type="blob")
+        result = routing.verify_plan(self.conn, plan.id)  # must not raise
+        rp = ids.render_id("routing_plan", plan.id)
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any(p.endswith("unhashable") for p in result["problems"]),
+            result["problems"],
+        )
+        self.assertIn(f"{rp}: rank_gap", result["problems"])
+        self.assertTrue(result["stale"])
+        self.assertIn("integrity_broken", result["staleness_reasons"])
 
 
 if __name__ == "__main__":
