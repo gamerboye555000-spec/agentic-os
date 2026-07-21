@@ -971,16 +971,17 @@ class DoctorIntegrationTests(PowerCase):
         self.assertNotIn('{"version"', line)
         self.assertNotIn(str(self.aos_dir), line)
 
-    def test_doctor_check_count_is_thirty_seven(self):
-        """(25) 20 → 21 → 25 → 30 → 31 → 34 → 37: the mandated power check
-        joined the set at U-E2, then U-M2's four memory-claim checks, then
-        U-M3's five memory-graph checks, then U-M5's one retrieval-benchmark
-        registry check, then U-A1's three agent-registry checks, then
-        U-A2's three built-in catalog checks (the D-W8.1 pattern — the pin
-        moves UP with a mandated new check; fixture never installs the
-        catalog, so all three stay [PASS])."""
+    def test_doctor_check_count_is_forty_one(self):
+        """(25) 20 → 21 → 25 → 30 → 31 → 34 → 37 → 41: the mandated power
+        check joined the set at U-E2, then U-M2's four memory-claim checks,
+        then U-M3's five memory-graph checks, then U-M5's one
+        retrieval-benchmark registry check, then U-A1's three agent-registry
+        checks, then U-A2's three built-in catalog checks, then U-A3's four
+        routing/handoff checks (the D-W8.1 pattern — the pin moves UP with a
+        mandated new check; fixture never installs the catalog, so all three
+        stay [PASS])."""
         out = self.aos("doctor")
-        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 37)
+        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 41)
 
     def test_doctor_still_passes_cleanly_on_the_baseline_fixture(self):
         """(25) The new checks do not disturb the ones already there."""

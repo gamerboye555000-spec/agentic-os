@@ -2215,11 +2215,13 @@ class DoctorCatalogTests(V4WorkspaceTestCase):
                 return check
         raise AssertionError(f"no doctor check named {name!r}")
 
-    def test_doctor_emits_exactly_37_checks_with_the_three_catalog_checks_last(self):
+    def test_doctor_emits_exactly_41_checks_with_the_catalog_checks_at_35_37(self):
+        # U-A3 Wave 6 appends four routing/handoff checks (38-41) after the
+        # three catalog checks, moving them off the tail; 37 → 41.
         checks = self._checks()
-        self.assertEqual(len(checks), 37)
+        self.assertEqual(len(checks), 41)
         self.assertEqual(
-            [c.name for c in checks[-3:]],
+            [c.name for c in checks[34:37]],
             [
                 "built-in catalog verified",
                 "installed catalog identities verified",
@@ -2230,10 +2232,10 @@ class DoctorCatalogTests(V4WorkspaceTestCase):
     def test_doctor_check_count_matches_the_cli(self):
         out = self.ok("doctor")
         lines = [l for l in out.strip().splitlines() if l]
-        self.assertEqual(len(lines), 37)
-        self.assertTrue(lines[-3].startswith("[PASS] built-in catalog verified"))
-        self.assertTrue(lines[-2].startswith("[PASS] installed catalog identities verified"))
-        self.assertTrue(lines[-1].startswith("[PASS] catalog entries available to install"))
+        self.assertEqual(len(lines), 41)
+        self.assertTrue(lines[-7].startswith("[PASS] built-in catalog verified"))
+        self.assertTrue(lines[-6].startswith("[PASS] installed catalog identities verified"))
+        self.assertTrue(lines[-5].startswith("[PASS] catalog entries available to install"))
 
     # -- 35: built-in catalog verified -------------------------------------
 
@@ -2610,12 +2612,12 @@ class EntrypointParityTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn('"agent":"aos.architect"', out)
 
-    def test_doctor_is_byte_identical_with_37_lines_across_all_four_entrypoints(self):
+    def test_doctor_is_byte_identical_with_41_lines_across_all_four_entrypoints(self):
         root = self._fresh_root()
         code, out, _err = self._assert_four_way(["doctor"], root)
         self.assertEqual(code, 0)
         lines = [l for l in out.strip().splitlines() if l]
-        self.assertEqual(len(lines), 37)
+        self.assertEqual(len(lines), 41)
         self.assertNotIn("[FAIL]", out)
 
     def test_packaged_zipapp_install_smoke_creates_one_valid_catalog_identity(self):

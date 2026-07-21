@@ -62,6 +62,20 @@ All three reuse `catalog.verify()`/`catalog.status()` rather than reading
 count plus closed reason codes drawn from `catalog._REASON_HINTS` — never
 the message text itself, an artifact value, a path, or a full hash. Doctor
 never installs, upgrades, or otherwise mutates the catalog.
+
+U-A3 adds four routing/handoff lines (checks 38-41; total 37 → 41): every
+stored routing plan verifies by recomputation through `routing.verify_plan`
+and every governed handoff through `agent_handoffs.verify_handoff` (both
+FAIL — one verifier per record family, never a second implementation here),
+plus two WARN-ONLY facts scoped to OPEN handoffs only — a participant that
+is suspended, archived, revoked or integrity-broken, and a pinned routing
+plan that is stale or superseded (`routing.plan_staleness`). Staleness of
+an unreferenced historical plan is history happening, not damage, and is
+deliberately not a check. The secret sweep extends over the governed
+handoff prose (objective, constraints, transition notes). Same rule as
+every line above: RP-/AH-XXXX ids, closed verdicts, safe participant
+labels and counts only. Never an objective, a constraint, a note, a reason
+prose, a request document, or a hash value.
 """
 
 from __future__ import annotations
@@ -187,6 +201,17 @@ _SWEEP_DOMAIN_FIELDS = (
         ("locator", "locator"),
         ("provenance", "provenance"),
     )),
+    # U-A3 governed handoff prose. Objective and constraints are the bounded
+    # delegation descriptions an operator types — exactly the prose a
+    # credential gets pasted into — and both reach exports and the mirror.
+    # The warn-on-write scan flags them at the boundary; this raw stored-row
+    # scan is the half that finds text edited in by SQL, where no write-time
+    # metadata exists. Transition notes need a bespoke loop below: their
+    # table's row id is not a handoff id.
+    ("agent_handoff", "agent_handoffs", (
+        ("objective", "objective_md"),
+        ("constraint", "constraints_md"),
+    )),
 )
 
 
@@ -294,6 +319,22 @@ def _secret_sweep_findings(conn: sqlite3.Connection) -> list[str]:
                 f"{entity} {hid}",
                 [(field, row[column]) for field, column in columns],
             )
+    # U-A3 transition notes (§20's bespoke loop): `agent_handoff_transitions`
+    # rows have no PREFIXES entry of their own, so the label joins to the
+    # parent handoff — `agent handoff AH-000N transition #<seq> note`. Raw
+    # stored-row scan, like every field above: a note edited in by SQL
+    # carries no write-time metadata, and this is what finds it. A tampered
+    # non-integer seq is never echoed (check 39 reports that row).
+    for row in conn.execute(
+        "SELECT handoff_id, seq, note_md FROM agent_handoff_transitions "
+        "ORDER BY handoff_id, seq"
+    ).fetchall():
+        seq = row["seq"] if isinstance(row["seq"], int) else "?"
+        note(
+            f"agent handoff {ids.render_id('agent_handoff', row['handoff_id'])} "
+            f"transition #{seq}",
+            [("note", row["note_md"])],
+        )
     for row in conn.execute(
         "SELECT id, name, invoke_hint, notes, capabilities_json FROM agents "
         "ORDER BY id"
@@ -882,6 +923,7 @@ def run_checks(conn: sqlite3.Connection, aos_dir: Path) -> list[Check]:
     checks.append(_retrieval_benchmark_check())
     checks.extend(_agent_registry_checks(conn))
     checks.extend(_catalog_checks(conn))
+    checks.extend(_routing_handoff_checks(conn))
 
     return checks
 
@@ -1140,6 +1182,212 @@ def _catalog_checks(conn: sqlite3.Connection) -> list[Check]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# U-A3 governed routing plans and agent handoffs (checks 38-41)
+#
+# All four reuse the accepted domain reads — routing.verify_plan,
+# routing.plan_staleness and agent_handoffs.verify_handoff — rather than
+# re-deriving a hash, a replay, a rank rule or a staleness predicate here.
+# SELECT + recompute + compare only: doctor never creates a request, routes,
+# selects, transitions, supersedes, repairs, rehashes or executes anything.
+
+#: The participant lifecycles check 40 warns on (§20). `draft` is absent on
+#: purpose: no lifecycle path leads back to draft, so a draft participant is
+#: only reachable by raw SQL — which rehashes nothing and therefore reports
+#: as integrity-broken, not as a lifecycle word.
+_INELIGIBLE_PARTICIPANT_LIFECYCLES = ("suspended", "archived", "revoked")
+
+#: The frozen OPEN-handoff populations (§20). Checks 40/41 are deliberately
+#: scoped to handoffs whose next verb would refuse; a closed record with an
+#: invalidated participant or a stale plan is history, not damage
+#: (D-v0.3.44's rule, applied to U-A3).
+_OPEN_PARTICIPANT_STATES = ("proposed", "clarification_required", "accepted")
+_OPEN_PLAN_STATES = ("proposed", "clarification_required")
+
+
+def _routing_plans_verify_check(conn: sqlite3.Connection) -> Check:
+    """38 (FAIL). Every stored routing plan verifies by recomputation:
+    row/candidate hashes, canonical request document and digest, coherent
+    counts and status, contiguous eligible ranks, passport pins and
+    supersession references — all via `routing.verify_plan`, which never
+    raises on a damaged row.
+
+    The detail echoes the verifier's closed problem lines (RP ids plus a
+    closed verdict, never a stored value), bounded by the contract's
+    `ROUTING_REASON_DISPLAY_LIMIT` rather than the doctor default. A stale
+    plan is NOT a problem here: staleness is current-ledger drift, and this
+    check owns stored integrity only.
+    """
+    from . import routing
+
+    problems: list[str] = []
+    for row in conn.execute(
+        "SELECT id FROM routing_plans ORDER BY id"
+    ).fetchall():
+        try:
+            problems.extend(routing.verify_plan(conn, row["id"])["problems"])
+        except Exception:
+            # The verifier is total on every damage shape its contract names,
+            # but doctor must stay total on ALL of them (a BLOB planted in
+            # request_document can break verification itself before it can
+            # answer). A row holding something no honest write could produce
+            # is exactly what the closed verdict `malformed` names — the
+            # catalog-check backstop shape, never the exception text.
+            problems.append(
+                f"{ids.render_id('routing_plan', row['id'])}: malformed"
+            )
+    return Check(
+        "routing plans verify",
+        not problems,
+        _bounded_problems(problems, models.ROUTING_REASON_DISPLAY_LIMIT),
+    )
+
+
+def _agent_handoffs_verify_check(conn: sqlite3.Connection) -> Check:
+    """39 (FAIL). Every governed handoff verifies by recomputation: row hash
+    over the recomputed transition chain (no laundering), contiguous
+    sequence, legal replay from `proposed`, stored-state agreement, required
+    reasons, passport pins and supersession coherence — all via
+    `agent_handoffs.verify_handoff`, which never raises on damaged storage.
+
+    The detail echoes the verifier's closed problem lines: AH ids plus a
+    verdict from `HANDOFF_VERIFY_CODES`. Never an objective, a constraint,
+    a note, a participant document, or a hash value.
+    """
+    from . import agent_handoffs
+
+    problems: list[str] = []
+    for row in conn.execute(
+        "SELECT id FROM agent_handoffs ORDER BY id"
+    ).fetchall():
+        try:
+            problems.extend(
+                agent_handoffs.verify_handoff(conn, row["id"])["problems"]
+            )
+        except Exception:
+            # Same backstop as check 38: doctor stays total even where a
+            # stored value breaks verification itself.
+            problems.append(
+                f"{ids.render_id('agent_handoff', row['id'])}: malformed"
+            )
+    return Check(
+        "agent handoffs verify",
+        not problems,
+        _bounded_problems(problems),
+    )
+
+
+def _handoff_participants_check(conn: sqlite3.Connection) -> Check:
+    """40 (WARN, never fatal). An OPEN handoff whose participant is no longer
+    eligible: suspended, archived, revoked, or integrity-broken (identity
+    hash or passport history). Sender and recipient are assessed
+    independently, sender first, so one handoff can produce two findings.
+
+    Participants are labeled through `_agent_doctor_label` — a well-formed,
+    non-secret-shaped name, else `agent #id`. Broader rules are deliberately
+    NOT invented here: task capability, route requirements, plan staleness
+    and preference drift are not participant problems.
+    """
+    from . import passports
+
+    marks = ",".join("?" * len(_OPEN_PARTICIPANT_STATES))
+    findings: list[str] = []
+    for handoff in conn.execute(
+        "SELECT id, from_agent_id, to_agent_id FROM agent_handoffs "
+        f"WHERE state IN ({marks}) ORDER BY id",
+        _OPEN_PARTICIPANT_STATES,
+    ).fetchall():
+        ah = ids.render_id("agent_handoff", handoff["id"])
+        for agent_id in (handoff["from_agent_id"], handoff["to_agent_id"]):
+            row = conn.execute(
+                "SELECT * FROM agents WHERE id = ?", (agent_id,)
+            ).fetchone()
+            if row is None:
+                # Unreachable while the FK stands; an identity that cannot
+                # be resolved cannot have its integrity verified.
+                findings.append(f"{ah}: agent #{agent_id} integrity-broken")
+                continue
+            label = _agent_doctor_label(row)
+            try:
+                agent = Agent.from_row(row)
+            except (TypeError, KeyError):
+                findings.append(f"{ah}: {label} integrity-broken")
+                continue
+            if agent.lifecycle in _INELIGIBLE_PARTICIPANT_LIFECYCLES:
+                # A closed vocabulary word, never an arbitrary stored value:
+                # an unknown lifecycle is not echoed (check 13 reports it,
+                # and the moved identity hash reports here as broken).
+                findings.append(f"{ah}: {label} {agent.lifecycle}")
+            if passports.agent_integrity(agent) != "ok" or (
+                passports.history_problems(conn, agent)
+            ):
+                findings.append(f"{ah}: {label} integrity-broken")
+    return Check(
+        "open agent handoffs with ineligible participants",
+        not findings,
+        _bounded_problems(findings),
+        warn_only=True,
+    )
+
+
+def _handoff_stale_plans_check(conn: sqlite3.Connection) -> Check:
+    """41 (WARN, never fatal). An OPEN, undecided handoff pinned to a plan
+    that is stale (`routing.plan_staleness`) or superseded (a successor
+    exists). Advisory only — it says a re-plan is appropriate; it repairs
+    nothing. Handoffs without a plan, closed handoffs and unreferenced
+    stale plans never warn; a damaged plan row is check 38's finding, not
+    this one's.
+    """
+    from . import routing
+
+    marks = ",".join("?" * len(_OPEN_PLAN_STATES))
+    findings: list[str] = []
+    for handoff in conn.execute(
+        "SELECT id, plan_id FROM agent_handoffs "
+        f"WHERE state IN ({marks}) AND plan_id IS NOT NULL ORDER BY id",
+        _OPEN_PLAN_STATES,
+    ).fetchall():
+        try:
+            plan = routing.get_plan(conn, handoff["plan_id"])
+        except (TypeError, ValueError):
+            continue  # unreadable plan row — check 38 reports it as malformed
+        if plan is None:
+            continue  # unreachable while the FK stands; nothing to derive
+        try:
+            staleness = routing.plan_staleness(conn, plan)
+        except Exception:
+            # Check 38 owns integrity damage and reports the plan as malformed.
+            # Check 41 is advisory and must not crash or guess staleness.
+            continue
+        if staleness.stale or staleness.superseded:
+            findings.append(
+                f"{ids.render_id('agent_handoff', handoff['id'])}: "
+                f"plan {ids.render_id('routing_plan', plan.id)} stale"
+            )
+    return Check(
+        "open agent handoffs pinned to stale plans",
+        not findings,
+        _bounded_problems(findings),
+        warn_only=True,
+    )
+
+
+def _routing_handoff_checks(conn: sqlite3.Connection) -> list[Check]:
+    """The four U-A3 lines (checks 38-41).
+
+    Every diagnostic is an RP-/AH-XXXX id, a closed verdict, a safe
+    participant label, the closed word `stale`, or a count. Never a request
+    document, an objective, a constraint, a note, a reason prose, an
+    ordering tuple, or a hash value.
+    """
+    return [
+        _routing_plans_verify_check(conn),
+        _agent_handoffs_verify_check(conn),
+        _handoff_participants_check(conn),
+        _handoff_stale_plans_check(conn),
+    ]
+
+
 def _retrieval_benchmark_check() -> Check:
     """31. U-M5's one line: the retrieval benchmark registry is intact
     (M5.14).
@@ -1329,14 +1577,15 @@ def _memory_claim_checks(conn: sqlite3.Connection) -> list[Check]:
 # U-M3 memory graph integrity (checks 26-30; contract M3.14)
 
 
-def _bounded_problems(problems: list[str]) -> str:
-    """The shared detail renderer for the graph checks: at most
-    UH2_DISPLAY_LIMIT findings, then a count. Output derived from ledger rows
-    stays bounded, however damaged the ledger is."""
+def _bounded_problems(problems: list[str], limit: int = UH2_DISPLAY_LIMIT) -> str:
+    """The shared detail renderer for the graph checks: at most `limit`
+    findings (UH2_DISPLAY_LIMIT unless a contract pins another bound), then a
+    count. Output derived from ledger rows stays bounded, however damaged the
+    ledger is."""
     if not problems:
         return ""
-    extra = len(problems) - UH2_DISPLAY_LIMIT
-    return "; ".join(problems[:UH2_DISPLAY_LIMIT]) + (
+    extra = len(problems) - limit
+    return "; ".join(problems[:limit]) + (
         f" (+{extra} more)" if extra > 0 else ""
     )
 

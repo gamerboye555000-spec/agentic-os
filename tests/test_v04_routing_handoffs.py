@@ -51,6 +51,7 @@ from agentic_os import (
     agent_handoffs,
     cli,
     db,
+    doctor,
     events,
     ids,
     migrations,
@@ -5862,13 +5863,1106 @@ class Wave5RecoveryDeepEcoTests(Wave5CliCase):
         self.assertEqual(code, 0)
         self.assertEqual(self.table_counts()[0], 3)
 
-    def test_doctor_remains_thirty_seven_with_governed_handoffs_present(self):
+    def test_doctor_emits_forty_one_with_governed_handoffs_present(self):
+        # Wave 6: the four U-A3 checks (38-41) joined the set; 37 → 41.
         self.create()
         self.run_cli("agent", "handoff", "accept", "AH-0001")
         self.run_cli("sync")
         code, out, err = self.run_cli("doctor")
         self.assertEqual(code, 0, out + err)
-        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 37)
+        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 41)
+
+
+# ---------------------------------------------------------------------------
+# Wave 6 (39)(40) — doctor checks 38-41, the stored-secret sweep extension and
+# the final event-payload privacy gate. Doctor is proven read-only against the
+# four U-A3 tables and events; every diagnostic asserted below is an RP-/AH-
+# id, a closed verdict, a safe participant label or a count — never a stored
+# value.
+
+#: A github-token shape (the same fixture Wave 3 uses): matches the shared
+#: detector, survives prose validation, and must never be echoed by doctor.
+WAVE6_SECRET = "ghp_" + "a" * 24
+
+#: The doctor check names frozen by the contract (§20), in appended order.
+CHECK_38 = "routing plans verify"
+CHECK_39 = "agent handoffs verify"
+CHECK_40 = "open agent handoffs with ineligible participants"
+CHECK_41 = "open agent handoffs pinned to stale plans"
+SWEEP_CHECK = "secret-shaped text in ledger rows or event payloads"
+
+
+class _DoctorCase(_HandoffCase):
+    """Wave 6 base: run doctor's checks against the live in-memory workspace
+    and select single checks by their exact frozen names.
+
+    The base helpers return Optionals (a read may honestly find nothing);
+    every record these tests build must exist, so the overrides assert that
+    once and hand the Wave 6 tests non-optional values."""
+
+    def setUp(self):
+        super().setUp()
+        assert self.alice is not None and self.bob is not None
+        self.alice_id = self.alice.id
+        self.bob_id = self.bob.id
+
+    def make_handoff(self, **over):
+        handoff = super().make_handoff(**over)
+        assert handoff is not None
+        return handoff
+
+    def transition(self, handoff, verb, **kw):
+        result = super().transition(handoff, verb, **kw)
+        assert result is not None
+        return result
+
+    def checks(self):
+        return doctor.run_checks(self.conn, self.tmp)
+
+    def named(self, name):
+        for check in self.checks():
+            if check.name == name:
+                return check
+        raise AssertionError(f"no doctor check named {name!r}")
+
+    def cap_plan(self):
+        plan = self.plan(capabilities=["cap.a"])
+        assert plan is not None
+        return plan
+
+    def clarified(self, handoff):
+        return self.transition(
+            handoff, "clarify", reason_code="objective_unclear"
+        )
+
+    def table_snapshot(self):
+        return {
+            table: [
+                tuple(row)
+                for row in self.conn.execute(
+                    f"SELECT * FROM {table} ORDER BY id"
+                ).fetchall()
+            ]
+            for table in (
+                "routing_plans",
+                "routing_plan_candidates",
+                "agent_handoffs",
+                "agent_handoff_transitions",
+                "events",
+            )
+        }
+
+
+class Doctor38RoutingPlansVerifyTests(_DoctorCase):
+    def test_clean_plan_passes(self):
+        self.cap_plan()
+        check = self.named(CHECK_38)
+        self.assertTrue(check.ok)
+        self.assertFalse(check.warn_only)
+        self.assertEqual(check.detail, "")
+
+    def test_no_plans_passes(self):
+        check = self.named(CHECK_38)
+        self.assertTrue(check.ok)
+        self.assertEqual(check.detail, "")
+
+    def test_row_hash_mismatch_fails(self):
+        plan = self.cap_plan()
+        self.conn.execute(
+            "UPDATE routing_plans SET actor='intruder' WHERE id=?", (plan.id,)
+        )
+        self.conn.commit()
+        check = self.named(CHECK_38)
+        self.assertFalse(check.ok)
+        self.assertIn("RP-0001: mismatch", check.detail)
+
+    def test_candidate_stored_hash_cannot_launder(self):
+        # Stored candidate hash tampered, columns intact: the plan hash is
+        # rebuilt from RECOMPUTED child digests so it still matches — the
+        # candidate-level check is what refuses the laundering.
+        plan = self.cap_plan()
+        self.conn.execute(
+            "UPDATE routing_plan_candidates SET content_sha256=? "
+            "WHERE plan_id=? AND verdict='eligible'",
+            ("c" * 64, plan.id),
+        )
+        self.conn.commit()
+        check = self.named(CHECK_38)
+        self.assertFalse(check.ok)
+        self.assertIn("mismatch", check.detail)
+
+    def test_request_mismatch_fails(self):
+        plan = self.cap_plan()
+        self.conn.execute(
+            "UPDATE routing_plans SET request_sha256=? WHERE id=?",
+            ("d" * 64, plan.id),
+        )
+        self.conn.commit()
+        check = self.named(CHECK_38)
+        self.assertFalse(check.ok)
+        self.assertIn("RP-0001: request_mismatch", check.detail)
+
+    def test_rank_gap_fails(self):
+        plan = self.cap_plan()  # alice + bob eligible: ranks 1, 2
+        self.conn.execute(
+            "UPDATE routing_plan_candidates SET rank=3 "
+            "WHERE plan_id=? AND rank=2",
+            (plan.id,),
+        )
+        self.conn.commit()
+        check = self.named(CHECK_38)
+        self.assertFalse(check.ok)
+        self.assertIn("RP-0001: rank_gap", check.detail)
+
+    def test_counts_incoherence_fails(self):
+        plan = self.cap_plan()
+        self.conn.execute(
+            "UPDATE routing_plans SET eligible_count=eligible_count+1 "
+            "WHERE id=?",
+            (plan.id,),
+        )
+        self.conn.commit()
+        check = self.named(CHECK_38)
+        self.assertFalse(check.ok)
+        self.assertIn("RP-0001: counts_incoherent", check.detail)
+
+    def test_pin_failure_fails(self):
+        plan = self.cap_plan()
+        self.conn.execute(
+            "UPDATE agent_passports SET document=replace(document, 'do', 'xx') "
+            "WHERE agent_id=?",
+            (self.bob_id,),
+        )
+        self.conn.commit()
+        check = self.named(CHECK_38)
+        self.assertFalse(check.ok)
+        self.assertIn("pin_mismatch", check.detail)
+        self.assertIn(f"RP-{plan.id:04d}", check.detail)
+
+    def test_dangling_pin_reference_fails(self):
+        plan = self.cap_plan()
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        self.conn.execute(
+            "DELETE FROM agent_passports WHERE agent_id=?", (self.bob_id,)
+        )
+        self.conn.commit()
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        check = self.named(CHECK_38)
+        self.assertFalse(check.ok)
+        self.assertIn("reference_invalid", check.detail)
+        self.assertIn(f"RP-{plan.id:04d}", check.detail)
+
+    def test_supersession_reference_failure_fails(self):
+        first = self.cap_plan()
+        routing.create_plan(
+            self.conn, self.request(capabilities=["cap.a"]),
+            supersedes_id=first.id,
+        )
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        self.conn.execute("DELETE FROM routing_plans WHERE id=?", (first.id,))
+        self.conn.commit()
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        check = self.named(CHECK_38)
+        self.assertFalse(check.ok)
+        self.assertIn("RP-0002: reference_invalid", check.detail)
+
+    def test_multiple_findings_deterministic_and_bounded(self):
+        for _ in range(10):
+            self.cap_plan()
+        self.conn.execute("UPDATE routing_plans SET actor='intruder'")
+        self.conn.commit()
+        first = self.named(CHECK_38)
+        second = self.named(CHECK_38)
+        self.assertEqual(first.detail, second.detail)
+        expected = "; ".join(
+            f"RP-{n:04d}: mismatch"
+            for n in range(1, models.ROUTING_REASON_DISPLAY_LIMIT + 1)
+        ) + " (+2 more)"
+        self.assertEqual(first.detail, expected)
+
+    def test_non_integer_rank_reports_closed_verdicts(self):
+        # The frozen matrix's 18-19 shape: a non-integer rank reads as an
+        # unhashable candidate plus a rank gap — closed verdicts, no raise.
+        plan = self.cap_plan()
+        self.conn.execute(
+            "UPDATE routing_plan_candidates SET rank=1.5 "
+            "WHERE plan_id=? AND rank=1",
+            (plan.id,),
+        )
+        self.conn.commit()
+        check = self.named(CHECK_38)  # must not raise
+        self.assertFalse(check.ok)
+        self.assertIn("unhashable", check.detail)
+        self.assertIn("rank_gap", check.detail)
+
+    def test_malformed_stored_value_does_not_crash(self):
+        # Damage the frozen verifier cannot survive on its own — a BLOB
+        # request_document breaks the ordering re-check's parse, a BLOB rank
+        # breaks the staleness sort — must still produce a bounded closed
+        # verdict, never a doctor crash and never the stored bytes.
+        first = self.cap_plan()
+        second = self.cap_plan()
+        self.conn.execute(
+            "UPDATE routing_plans SET request_document=? WHERE id=?",
+            (b"\x00\xffblob", first.id),
+        )
+        self.conn.execute(
+            "UPDATE routing_plan_candidates SET rank=? "
+            "WHERE plan_id=? AND rank=1",
+            (b"\x01", second.id),
+        )
+        self.conn.commit()
+        check = self.named(CHECK_38)  # must not raise
+        self.assertFalse(check.ok)
+        self.assertIn("RP-0001: malformed", check.detail)
+        self.assertIn("RP-0002: malformed", check.detail)
+        self.assertNotIn("blob", check.detail)
+
+    def test_detail_is_only_rp_ids_and_closed_verdicts(self):
+        self.cap_plan()
+        self.conn.execute("UPDATE routing_plans SET actor='intruder'")
+        self.conn.execute(
+            "UPDATE routing_plan_candidates SET reasons_json='[\"suspended\"]' "
+            "WHERE verdict='eligible'"
+        )
+        self.conn.commit()
+        check = self.named(CHECK_38)
+        self.assertFalse(check.ok)
+        verdicts = (
+            "malformed|mismatch|unhashable|request_mismatch|rank_gap|"
+            "pin_mismatch|counts_incoherent|reference_invalid"
+        )
+        for segment in check.detail.split("; "):
+            self.assertRegex(
+                segment, rf"^RP-\d{{4}}(?: candidate #\d+)?: (?:{verdicts})$"
+            )
+        for leaked in ("alice", "bob", "cap.a", "intruder"):
+            self.assertNotIn(leaked, check.detail)
+
+
+class Doctor39AgentHandoffsVerifyTests(_DoctorCase):
+    def test_clean_handoff_passes(self):
+        handoff = self.make_handoff()
+        self.transition(handoff, "accept")
+        check = self.named(CHECK_39)
+        self.assertTrue(check.ok)
+        self.assertFalse(check.warn_only)
+        self.assertEqual(check.detail, "")
+
+    def test_no_handoffs_passes(self):
+        check = self.named(CHECK_39)
+        self.assertTrue(check.ok)
+        self.assertEqual(check.detail, "")
+
+    def test_row_hash_mismatch_fails(self):
+        self.make_handoff()
+        self.conn.execute(
+            "UPDATE agent_handoffs SET objective_md='changed offline'"
+        )
+        self.conn.commit()
+        check = self.named(CHECK_39)
+        self.assertFalse(check.ok)
+        self.assertIn("AH-0001: mismatch", check.detail)
+
+    def test_child_hash_laundering_fails(self):
+        handoff = self.make_handoff()
+        self.transition(handoff, "accept")
+        self.conn.execute(
+            "UPDATE agent_handoff_transitions SET content_sha256=? "
+            "WHERE handoff_id=?",
+            ("c" * 64, handoff.id),
+        )
+        self.conn.commit()
+        check = self.named(CHECK_39)
+        self.assertFalse(check.ok)
+        self.assertIn("AH-0001: mismatch", check.detail)
+
+    def test_chain_gap_fails(self):
+        handoff = self.make_handoff()
+        self.transition(handoff, "accept")
+        self.conn.execute(
+            "UPDATE agent_handoff_transitions SET seq=3 WHERE handoff_id=?",
+            (handoff.id,),
+        )
+        self.conn.commit()
+        check = self.named(CHECK_39)
+        self.assertFalse(check.ok)
+        self.assertIn("chain_gap", check.detail)
+
+    def test_illegal_edge_fails(self):
+        handoff = self.make_handoff()
+        self.transition(handoff, "accept")
+        # A second transition claiming proposed→accepted after the chain
+        # already reached accepted: legal edge vocabulary, illegal continuity.
+        self.conn.execute(
+            "INSERT INTO agent_handoff_transitions "
+            "(handoff_id, seq, from_state, to_state, actor, reason_code, "
+            "note_md, created_at, content_sha256) "
+            "VALUES (?, 2, 'proposed', 'accepted', 'human', NULL, NULL, ?, ?)",
+            (handoff.id, NOW, "e" * 64),
+        )
+        self.conn.commit()
+        check = self.named(CHECK_39)
+        self.assertFalse(check.ok)
+        self.assertIn("chain_illegal", check.detail)
+
+    def test_state_divergence_fails(self):
+        handoff = self.make_handoff()
+        accepted = self.transition(handoff, "accept")
+        chain = [
+            agent_handoffs.transition_digest(t)
+            for t in agent_handoffs.get_transitions(self.conn, handoff.id)
+        ]
+        diverged = dataclasses.replace(accepted, state="proposed")
+        laundered = agent_handoffs.handoff_digest(diverged, chain)
+        self.conn.execute(
+            "UPDATE agent_handoffs SET state='proposed', content_sha256=? "
+            "WHERE id=?",
+            (laundered, handoff.id),
+        )
+        self.conn.commit()
+        check = self.named(CHECK_39)
+        self.assertFalse(check.ok)
+        self.assertEqual(check.detail, "AH-0001: state_divergent")
+
+    def test_pin_mismatch_fails(self):
+        self.make_handoff()
+        self.conn.execute(
+            "UPDATE agent_passports SET document=replace(document, 'do', 'xx') "
+            "WHERE agent_id=?",
+            (self.bob_id,),
+        )
+        self.conn.commit()
+        check = self.named(CHECK_39)
+        self.assertFalse(check.ok)
+        self.assertIn("AH-0001: pin_mismatch", check.detail)
+
+    def test_missing_reason_fails(self):
+        handoff = self.make_handoff()
+        refused = self.transition(
+            handoff, "refuse", reason_code="out_of_scope"
+        )
+        # Launder the reason away completely: NULL the column (CHECK ignored),
+        # then recompute both stored hashes so ONLY the missing reason remains.
+        self.conn.execute("PRAGMA ignore_check_constraints=ON")
+        self.conn.execute(
+            "UPDATE agent_handoff_transitions SET reason_code=NULL "
+            "WHERE handoff_id=?",
+            (handoff.id,),
+        )
+        self.conn.execute("PRAGMA ignore_check_constraints=OFF")
+        stripped = agent_handoffs.get_transitions(self.conn, handoff.id)[0]
+        self.conn.execute(
+            "UPDATE agent_handoff_transitions SET content_sha256=? "
+            "WHERE handoff_id=?",
+            (agent_handoffs.transition_digest(stripped), handoff.id),
+        )
+        chain = [
+            agent_handoffs.transition_digest(t)
+            for t in agent_handoffs.get_transitions(self.conn, handoff.id)
+        ]
+        self.conn.execute(
+            "UPDATE agent_handoffs SET content_sha256=? WHERE id=?",
+            (agent_handoffs.handoff_digest(refused, chain), handoff.id),
+        )
+        self.conn.commit()
+        check = self.named(CHECK_39)
+        self.assertFalse(check.ok)
+        self.assertEqual(check.detail, "AH-0001: reason_missing")
+
+    def test_supersession_incoherence_fails(self):
+        predecessor = self.make_handoff()
+        self.make_handoff(supersedes_id=predecessor.id)
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        self.conn.execute(
+            "DELETE FROM agent_handoffs WHERE supersedes_id=?",
+            (predecessor.id,),
+        )
+        self.conn.commit()
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        check = self.named(CHECK_39)
+        self.assertFalse(check.ok)
+        self.assertEqual(
+            check.detail, "AH-0001: supersession_incoherent"
+        )
+
+    def test_malformed_stored_value_does_not_crash(self):
+        handoff = self.make_handoff()
+        self.conn.execute(
+            "UPDATE agent_handoffs SET objective_md=? WHERE id=?",
+            (b"\x00\xffblob", handoff.id),
+        )
+        self.conn.commit()
+        check = self.named(CHECK_39)  # must not raise
+        self.assertFalse(check.ok)
+        self.assertIn("unhashable", check.detail)
+        self.assertNotIn("blob", check.detail)
+
+    def test_pending_hash_reports_malformed(self):
+        handoff = self.make_handoff()
+        self.conn.execute(
+            "UPDATE agent_handoffs SET content_sha256='' WHERE id=?",
+            (handoff.id,),
+        )
+        self.conn.commit()
+        check = self.named(CHECK_39)
+        self.assertFalse(check.ok)
+        self.assertIn("AH-0001: malformed", check.detail)
+
+    def test_multiple_findings_deterministic_and_bounded(self):
+        for _ in range(12):
+            self.make_handoff()
+        self.conn.execute("UPDATE agent_handoffs SET objective_md='x'")
+        self.conn.commit()
+        first = self.named(CHECK_39)
+        second = self.named(CHECK_39)
+        self.assertEqual(first.detail, second.detail)
+        expected = "; ".join(
+            f"AH-{n:04d}: mismatch"
+            for n in range(1, doctor.UH2_DISPLAY_LIMIT + 1)
+        ) + " (+2 more)"
+        self.assertEqual(first.detail, expected)
+
+    def test_detail_is_only_ah_ids_and_closed_verdicts(self):
+        self.make_handoff(constraints_md="stay in scope")
+        self.conn.execute(
+            "UPDATE agent_handoffs SET objective_md='changed offline'"
+        )
+        self.conn.commit()
+        check = self.named(CHECK_39)
+        self.assertFalse(check.ok)
+        verdicts = "|".join(agent_handoffs.HANDOFF_VERIFY_CODES)
+        for segment in check.detail.split("; "):
+            self.assertRegex(segment, rf"^AH-\d{{4}}: (?:{verdicts})$")
+        for leaked in ("alice", "bob", "changed offline", "stay in scope",
+                       "ship the widget"):
+            self.assertNotIn(leaked, check.detail)
+
+
+class Doctor40OpenHandoffParticipantsTests(_DoctorCase):
+    def test_proposed_clean_participants_pass(self):
+        self.make_handoff()
+        check = self.named(CHECK_40)
+        self.assertTrue(check.ok)
+        self.assertTrue(check.warn_only)
+        self.assertEqual(check.detail, "")
+
+    def test_clarification_required_clean_participants_pass(self):
+        self.clarified(self.make_handoff())
+        check = self.named(CHECK_40)
+        self.assertTrue(check.ok)
+        self.assertEqual(check.detail, "")
+
+    def test_accepted_clean_participants_pass(self):
+        self.transition(self.make_handoff(), "accept")
+        check = self.named(CHECK_40)
+        self.assertTrue(check.ok)
+        self.assertEqual(check.detail, "")
+
+    def test_sender_suspended_warns(self):
+        self.make_handoff()
+        passports.transition_lifecycle(self.conn, name="alice", verb="suspend")
+        check = self.named(CHECK_40)
+        self.assertFalse(check.ok)
+        self.assertTrue(check.warn_only)
+        self.assertEqual(check.detail, "AH-0001: alice suspended")
+
+    def test_recipient_archived_warns(self):
+        self.make_handoff()
+        passports.transition_lifecycle(self.conn, name="bob", verb="archive")
+        check = self.named(CHECK_40)
+        self.assertFalse(check.ok)
+        self.assertEqual(check.detail, "AH-0001: bob archived")
+
+    def test_participant_revoked_warns(self):
+        self.clarified(self.make_handoff())
+        passports.transition_lifecycle(self.conn, name="bob", verb="revoke")
+        check = self.named(CHECK_40)
+        self.assertFalse(check.ok)
+        self.assertEqual(check.detail, "AH-0001: bob revoked")
+
+    def test_identity_integrity_failure_warns(self):
+        self.make_handoff()
+        self.conn.execute(
+            "UPDATE agents SET content_sha256=? WHERE id=?",
+            ("0" * 64, self.alice_id),
+        )
+        self.conn.commit()
+        check = self.named(CHECK_40)
+        self.assertFalse(check.ok)
+        self.assertEqual(check.detail, "AH-0001: alice integrity-broken")
+
+    def test_passport_history_integrity_failure_warns(self):
+        self.transition(self.make_handoff(), "accept")
+        self.conn.execute(
+            "UPDATE agent_passports SET document=replace(document, 'do', 'xx') "
+            "WHERE agent_id=?",
+            (self.bob_id,),
+        )
+        self.conn.commit()
+        check = self.named(CHECK_40)
+        self.assertFalse(check.ok)
+        self.assertIn("AH-0001: bob integrity-broken", check.detail)
+
+    def test_both_participants_deterministic_bounded_findings(self):
+        self.make_handoff()
+        passports.transition_lifecycle(self.conn, name="alice", verb="suspend")
+        passports.transition_lifecycle(self.conn, name="bob", verb="archive")
+        first = self.named(CHECK_40)
+        second = self.named(CHECK_40)
+        self.assertEqual(first.detail, second.detail)
+        self.assertEqual(
+            first.detail, "AH-0001: alice suspended; AH-0001: bob archived"
+        )
+
+    def test_terminal_states_outside_population_do_not_warn(self):
+        refused = self.make_handoff()
+        self.transition(refused, "refuse", reason_code="out_of_scope")
+        cancelled = self.make_handoff()
+        self.transition(cancelled, "cancel")
+        superseded = self.make_handoff()
+        successor = self.make_handoff(supersedes_id=superseded.id)
+        self.transition(successor, "cancel")
+        passports.transition_lifecycle(self.conn, name="alice", verb="suspend")
+        check = self.named(CHECK_40)
+        self.assertTrue(check.ok)
+        self.assertEqual(check.detail, "")
+
+    def test_safe_label_and_no_prose_or_hash_leakage(self):
+        self.make_handoff()
+        self.conn.execute(
+            "UPDATE agents SET name=? WHERE id=?",
+            (WAVE6_SECRET, self.alice_id),
+        )
+        self.conn.commit()
+        check = self.named(CHECK_40)
+        self.assertFalse(check.ok)
+        self.assertEqual(
+            check.detail,
+            f"AH-0001: agent #{self.alice_id} integrity-broken",
+        )
+        self.assertNotIn(WAVE6_SECRET, check.detail)
+        self.assertNotRegex(check.detail, r"[0-9a-f]{64}")
+        self.assertNotIn("ship the widget", check.detail)
+
+
+class Doctor41StaleReferencedPlansTests(_DoctorCase):
+    def pinned_handoff(self):
+        plan = self.cap_plan()
+        return plan, self.make_handoff(plan_id=plan.id)
+
+    def go_stale(self):
+        self.publish_v2(
+            "bob", capabilities=["cap.a"], data_classifications=ALL_CLASSES
+        )
+
+    def test_proposed_with_fresh_plan_passes(self):
+        self.pinned_handoff()
+        check = self.named(CHECK_41)
+        self.assertTrue(check.ok)
+        self.assertTrue(check.warn_only)
+        self.assertEqual(check.detail, "")
+
+    def test_clarification_required_with_fresh_plan_passes(self):
+        _, handoff = self.pinned_handoff()
+        self.clarified(handoff)
+        check = self.named(CHECK_41)
+        self.assertTrue(check.ok)
+        self.assertEqual(check.detail, "")
+
+    def test_stale_referenced_plan_warns(self):
+        self.pinned_handoff()
+        self.go_stale()
+        check = self.named(CHECK_41)
+        self.assertFalse(check.ok)
+        self.assertTrue(check.warn_only)
+        self.assertEqual(check.detail, "AH-0001: plan RP-0001 stale")
+
+    def test_stale_plan_under_clarification_warns(self):
+        _, handoff = self.pinned_handoff()
+        self.clarified(handoff)
+        self.go_stale()
+        check = self.named(CHECK_41)
+        self.assertFalse(check.ok)
+        self.assertEqual(check.detail, "AH-0001: plan RP-0001 stale")
+
+    def test_superseded_referenced_plan_warns(self):
+        plan, _ = self.pinned_handoff()
+        routing.create_plan(
+            self.conn, self.request(capabilities=["cap.a"]),
+            supersedes_id=plan.id,
+        )
+        check = self.named(CHECK_41)
+        self.assertFalse(check.ok)
+        self.assertEqual(check.detail, "AH-0001: plan RP-0001 stale")
+
+    def test_handoff_without_plan_passes(self):
+        self.cap_plan()
+        self.make_handoff()
+        self.go_stale()
+        check = self.named(CHECK_41)
+        self.assertTrue(check.ok)
+        self.assertEqual(check.detail, "")
+
+    def test_unreferenced_stale_plan_does_not_warn(self):
+        self.cap_plan()
+        self.go_stale()
+        check = self.named(CHECK_41)
+        self.assertTrue(check.ok)
+        self.assertEqual(check.detail, "")
+
+    def test_accepted_handoffs_leave_the_population(self):
+        # The frozen check-41 population is (proposed, clarification_required)
+        # exactly — an accepted handoff pinned to a stale plan must not warn.
+        _, handoff = self.pinned_handoff()
+        self.transition(handoff, "accept")
+        self.go_stale()
+        check = self.named(CHECK_41)
+        self.assertTrue(check.ok, check.detail)
+        self.assertEqual(check.detail, "")
+
+    def test_terminal_states_do_not_warn(self):
+        _, handoff = self.pinned_handoff()
+        self.transition(handoff, "refuse", reason_code="out_of_scope")
+        self.go_stale()
+        check = self.named(CHECK_41)
+        self.assertTrue(check.ok)
+        self.assertEqual(check.detail, "")
+
+    def test_warning_mutates_nothing(self):
+        self.pinned_handoff()
+        self.go_stale()
+        before = self.table_snapshot()
+        check = self.named(CHECK_41)
+        self.assertFalse(check.ok)
+        self.assertEqual(self.table_snapshot(), before)
+
+    def test_detail_is_exactly_ids_plus_stale(self):
+        self.pinned_handoff()
+        self.go_stale()
+        check = self.named(CHECK_41)
+        self.assertRegex(check.detail, r"^AH-\d{4}: plan RP-\d{4} stale$")
+
+    def test_malformed_candidate_ranks_do_not_crash_check_41(self):
+        # Mixed-type eligible ranks (int + BLOB) make routing.plan_staleness
+        # raise TypeError while sorting. Check 41 must contain that per
+        # handoff rather than crash doctor.run_checks; check 38 owns the
+        # damaged plan as malformed through its own, separate boundary.
+        plan, _ = self.pinned_handoff()
+        self.conn.execute(
+            "UPDATE routing_plan_candidates SET rank=? "
+            "WHERE plan_id=? AND rank=1",
+            (b"\x01", plan.id),
+        )
+        self.conn.commit()
+        before = self.table_snapshot()
+        changes_before = self.conn.total_changes
+        checks = self.checks()  # must not raise
+        self.assertEqual(self.conn.total_changes, changes_before)
+        self.assertEqual(self.table_snapshot(), before)
+        by_name = {c.name: c for c in checks}
+        check38, check41 = by_name[CHECK_38], by_name[CHECK_41]
+        self.assertFalse(check38.ok)
+        self.assertEqual(check38.detail, "RP-0001: malformed")
+        self.assertTrue(check41.ok)
+        self.assertTrue(check41.warn_only)
+        self.assertEqual(check41.detail, "")
+        for detail in (check38.detail, check41.detail):
+            self.assertNotIn("TypeError", detail)
+            self.assertNotIn("bytes", detail)
+            self.assertNotIn("not supported between instances", detail)
+            self.assertNotIn("\x01", detail)
+            self.assertNotIn("ship the widget", detail)
+            self.assertNotIn("alice", detail)
+            self.assertNotIn("bob", detail)
+            self.assertNotRegex(detail, r"[0-9a-f]{64}")
+
+
+class Wave6SecretSweepTests(_DoctorCase):
+    def findings(self):
+        return doctor.secret_sweep_findings(self.conn)
+
+    def test_objective_stored_secret_is_found(self):
+        self.make_handoff(objective_md=f"use {WAVE6_SECRET} to log in")
+        self.assertIn(
+            "agent_handoff AH-0001 objective: github-token", self.findings()
+        )
+
+    def test_constraints_stored_secret_is_found(self):
+        self.make_handoff(constraints_md=f"never share {WAVE6_SECRET}")
+        self.assertIn(
+            "agent_handoff AH-0001 constraint: github-token", self.findings()
+        )
+
+    def test_transition_note_stored_secret_is_found(self):
+        handoff = self.make_handoff()
+        self.transition(handoff, "accept", note_md=f"rotate {WAVE6_SECRET}")
+        self.assertIn(
+            "agent handoff AH-0001 transition #1 note: github-token",
+            self.findings(),
+        )
+
+    def test_direct_sql_tampering_without_metadata_is_found(self):
+        handoff = self.make_handoff()
+        self.transition(handoff, "accept", note_md="benign note")
+        self.conn.execute(
+            "UPDATE agent_handoffs SET objective_md=? WHERE id=?",
+            (f"use {WAVE6_SECRET}", handoff.id),
+        )
+        self.conn.execute(
+            "UPDATE agent_handoff_transitions SET note_md=? WHERE handoff_id=?",
+            (f"use {WAVE6_SECRET}", handoff.id),
+        )
+        self.conn.commit()
+        rows = self.conn.execute(
+            "SELECT payload_json FROM events WHERE payload_json "
+            "LIKE '%secret_warning%'"
+        ).fetchall()
+        self.assertEqual(rows, [])  # no write-time metadata exists
+        findings = self.findings()
+        self.assertIn(
+            "agent_handoff AH-0001 objective: github-token", findings
+        )
+        self.assertIn(
+            "agent handoff AH-0001 transition #1 note: github-token", findings
+        )
+
+    def test_benign_values_are_not_findings(self):
+        handoff = self.make_handoff(constraints_md="stay in scope")
+        self.transition(handoff, "accept", note_md="looks fine")
+        for finding in self.findings():
+            self.assertNotIn("agent_handoff", finding)
+            self.assertNotIn("agent handoff", finding)
+
+    def test_output_is_value_free(self):
+        handoff = self.make_handoff(objective_md=f"use {WAVE6_SECRET}")
+        self.transition(handoff, "accept", note_md=f"rotate {WAVE6_SECRET}")
+        blob = "; ".join(self.findings())
+        self.assertNotIn(WAVE6_SECRET, blob)
+        check = self.named(SWEEP_CHECK)
+        self.assertNotIn(WAVE6_SECRET, check.detail)
+
+    def test_duplicates_deterministic_and_deduplicated(self):
+        handoff = self.make_handoff(
+            objective_md=f"use {WAVE6_SECRET}",
+            constraints_md=f"keep {WAVE6_SECRET}",
+        )
+        self.transition(handoff, "accept", note_md=f"rotate {WAVE6_SECRET}")
+        first = self.findings()
+        second = self.findings()
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), len(set(first)))
+
+    def test_display_bound_retained(self):
+        for _ in range(6):
+            self.make_handoff(
+                objective_md=f"use {WAVE6_SECRET}",
+                constraints_md=f"keep {WAVE6_SECRET}",
+            )
+        findings = self.findings()
+        self.assertGreater(len(findings), doctor.SECRET_SWEEP_DISPLAY_LIMIT)
+        shown = findings[: doctor.SECRET_SWEEP_DISPLAY_LIMIT]
+        hidden = len(findings) - len(shown)
+        check = self.named(SWEEP_CHECK)
+        self.assertEqual(
+            check.detail, "; ".join(shown) + f" (+{hidden} more)"
+        )
+
+    def test_sweep_remains_one_warn_only_check(self):
+        self.make_handoff(objective_md=f"use {WAVE6_SECRET}")
+        checks = self.checks()
+        named = [c for c in checks if c.name == SWEEP_CHECK]
+        self.assertEqual(len(named), 1)
+        self.assertTrue(named[0].warn_only)
+        secretish = [c for c in checks if "secret" in c.name]
+        self.assertEqual(secretish, named)
+
+    def test_total_doctor_count_remains_41_not_42(self):
+        self.make_handoff(objective_md=f"use {WAVE6_SECRET}")
+        self.assertEqual(len(self.checks()), 41)
+
+
+class Wave6EventPrivacyGateTests(_DoctorCase):
+    PROSE = (
+        "ship the widget", "stay in scope", "looks fine", "nope",
+        "withdrawn", "changed offline", "approval",
+    )
+
+    def drive_all_actions(self):
+        plan = self.cap_plan()
+        accepted = self.make_handoff(
+            plan_id=plan.id, constraints_md="stay in scope"
+        )
+        self.transition(accepted, "accept", note_md="looks fine")
+        refused = self.make_handoff()
+        self.transition(
+            refused, "refuse", reason_code="out_of_scope", note_md="nope"
+        )
+        self.clarified(self.make_handoff())
+        cancelled = self.make_handoff()
+        self.transition(cancelled, "cancel", note_md="withdrawn")
+        predecessor = self.make_handoff()
+        self.make_handoff(supersedes_id=predecessor.id)
+
+    def routing_payloads(self):
+        return [
+            (row["action"], json.loads(row["payload_json"]))
+            for row in self.conn.execute(
+                "SELECT action, payload_json FROM events "
+                "WHERE entity='routing_plan' ORDER BY id"
+            ).fetchall()
+        ]
+
+    def assert_subset(self, payload, allowlist):
+        allowed = set(allowlist) | {
+            "schema_version", "secret_warning", "secret_fields",
+            "secret_patterns",
+        }
+        self.assertLessEqual(set(payload), allowed, set(payload) - allowed)
+
+    def test_frozen_allowlist_constants(self):
+        self.assertEqual(
+            routing.ROUTING_PLAN_EVENT_KEYS,
+            ("plan", "task", "scope", "algorithm_version",
+             "request_sha256_prefix", "result_status", "eligible_count",
+             "excluded_count", "unresolved_count", "supersedes"),
+        )
+        self.assertEqual(
+            agent_handoffs.PROPOSE_EVENT_KEYS,
+            ("handoff", "task", "plan", "from_agent", "to_agent",
+             "from_version", "to_version", "from_passport_sha256_prefix",
+             "to_passport_sha256_prefix", "data_classification", "supersedes"),
+        )
+        self.assertEqual(
+            agent_handoffs.TRANSITION_EVENT_KEYS,
+            ("handoff", "task", "seq", "from_state", "to_state",
+             "reason_code"),
+        )
+
+    def test_routing_plan_create_allowlist(self):
+        self.drive_all_actions()
+        payloads = self.routing_payloads()
+        self.assertTrue(payloads)
+        for action, payload in payloads:
+            self.assertEqual(action, "create")
+            self.assert_subset(payload, routing.ROUTING_PLAN_EVENT_KEYS)
+
+    def test_every_handoff_action_satisfies_its_allowlist(self):
+        self.drive_all_actions()
+        payloads = self.payloads()
+        observed = {action for action, _ in payloads}
+        self.assertEqual(
+            observed,
+            {"propose", "accept", "refuse", "clarify", "cancel", "supersede"},
+        )
+        for action, payload in payloads:
+            with self.subTest(action=action):
+                allowlist = (
+                    agent_handoffs.PROPOSE_EVENT_KEYS
+                    if action == "propose"
+                    else agent_handoffs.TRANSITION_EVENT_KEYS
+                )
+                self.assert_subset(payload, allowlist)
+
+    def test_no_prose_in_any_u_a3_event(self):
+        self.drive_all_actions()
+        rows = self.conn.execute(
+            "SELECT payload_json FROM events "
+            "WHERE entity IN ('routing_plan','agent_handoff') ORDER BY id"
+        ).fetchall()
+        self.assertTrue(rows)
+        for row in rows:
+            for prose in self.PROSE:
+                self.assertNotIn(prose, row["payload_json"])
+
+    def test_no_full_hash_in_any_u_a3_event(self):
+        self.drive_all_actions()
+        for row in self.conn.execute(
+            "SELECT payload_json FROM events "
+            "WHERE entity IN ('routing_plan','agent_handoff') ORDER BY id"
+        ).fetchall():
+            self.assertNotRegex(row["payload_json"], r"[0-9a-f]{64}")
+
+    def test_only_safe_secret_metadata_extends_the_allowlists(self):
+        self.make_handoff(objective_md=f"use {WAVE6_SECRET} now")
+        _, payload = self.payloads("propose")[-1]
+        self.assert_subset(payload, agent_handoffs.PROPOSE_EVENT_KEYS)
+        extras = set(payload) - set(agent_handoffs.PROPOSE_EVENT_KEYS) - {
+            "schema_version"
+        }
+        self.assertLessEqual(
+            extras, {"secret_warning", "secret_fields", "secret_patterns"}
+        )
+        self.assertTrue(payload["secret_warning"])
+        self.assertNotIn(WAVE6_SECRET, json.dumps(payload))
+
+
+class Wave6DoctorMutationFreeTests(_DoctorCase):
+    def build_damaged_ledger(self):
+        plan = self.cap_plan()
+        handoff = self.make_handoff(plan_id=plan.id)
+        self.transition(handoff, "accept", note_md="looks fine")
+        second = self.make_handoff(objective_md=f"use {WAVE6_SECRET}")
+        self.clarified(second)
+        self.conn.execute(
+            "UPDATE routing_plans SET actor='intruder' WHERE id=?", (plan.id,)
+        )
+        self.conn.execute(
+            "UPDATE agent_handoffs SET objective_md=? WHERE id=?",
+            (b"\x00blob", second.id),
+        )
+        self.conn.commit()
+
+    def test_run_checks_leaves_every_row_byte_identical(self):
+        self.build_damaged_ledger()
+        before = self.table_snapshot()
+        self.checks()
+        self.checks()
+        self.assertEqual(self.table_snapshot(), before)
+
+    def test_total_changes_does_not_increase_during_doctor(self):
+        self.build_damaged_ledger()
+        baseline = self.conn.total_changes
+        self.checks()
+        self.assertEqual(self.conn.total_changes, baseline)
+
+    def test_doctor_calls_no_write_or_event_api(self):
+        self.build_damaged_ledger()
+        forbidden = AssertionError("doctor must never call a write API")
+        with mock.patch.object(
+            routing, "create_plan", side_effect=forbidden
+        ), mock.patch.object(
+            agent_handoffs, "create_handoff", side_effect=forbidden
+        ), mock.patch.object(
+            agent_handoffs, "transition", side_effect=forbidden
+        ), mock.patch.object(
+            events, "emit", side_effect=forbidden
+        ), mock.patch.object(
+            db, "transaction", side_effect=forbidden
+        ):
+            checks = self.checks()
+        self.assertEqual(len(checks), 41)
+
+    def test_doctor_reuses_the_domain_verifiers(self):
+        self.cap_plan()
+        self.cap_plan()
+        handoff = self.make_handoff()
+        self.transition(handoff, "accept")
+        self.make_handoff()
+        with mock.patch.object(
+            routing, "verify_plan", wraps=routing.verify_plan
+        ) as verify_plan, mock.patch.object(
+            agent_handoffs, "verify_handoff",
+            wraps=agent_handoffs.verify_handoff,
+        ) as verify_handoff:
+            self.checks()
+        self.assertEqual(verify_plan.call_count, 2)
+        self.assertEqual(verify_handoff.call_count, 2)
+
+
+class Wave6DoctorOrderTests(_DoctorCase):
+    def test_clean_workspace_emits_exactly_41_checks(self):
+        checks = self.checks()
+        self.assertEqual(len(checks), 41)
+
+    def test_new_checks_append_last_in_contract_order(self):
+        checks = self.checks()
+        self.assertEqual(
+            [c.name for c in checks[-4:]],
+            [CHECK_38, CHECK_39, CHECK_40, CHECK_41],
+        )
+        self.assertEqual(
+            [c.warn_only for c in checks[-4:]], [False, False, True, True]
+        )
+
+    def test_legacy_checks_retain_names_order_and_severity(self):
+        checks = self.checks()
+        self.assertEqual(checks[0].name, "database exists")
+        self.assertEqual(
+            checks[17].name,
+            "secret-shaped text in ledger rows or event payloads",
+        )
+        self.assertEqual(checks[31].name, "agent identity hashes verify")
+        self.assertEqual(
+            [c.name for c in checks[34:37]],
+            [
+                "built-in catalog verified",
+                "installed catalog identities verified",
+                "catalog entries available to install",
+            ],
+        )
+        # Check 30 (index 29) is warn-only ONLY when restricted claims exist
+        # (its clean-fixture early return carries no warn flag) — so on this
+        # fixture the warn set is the four U-C3/U-H2 lines, the two U-M2
+        # lines, the U-A1 and U-A2 lines, and Wave 6's checks 40 and 41.
+        self.assertEqual(
+            [index for index, c in enumerate(checks) if c.warn_only],
+            [16, 17, 18, 19, 23, 24, 33, 36, 39, 40],
+        )
+
+
+class Wave6DoctorStaticTests(unittest.TestCase):
+    SOURCE = (REPO_ROOT / "agentic_os" / "doctor.py").read_text(
+        encoding="utf-8"
+    )
+
+    def test_doctor_module_contains_no_mutation_or_event_emission(self):
+        for token in (
+            "INSERT INTO", "UPDATE ", "DELETE FROM", "BEGIN IMMEDIATE",
+            "events.emit", "db.transaction(", "executescript",
+        ):
+            self.assertNotIn(token, self.SOURCE)
+
+    def test_doctor_does_not_reimplement_the_domain_verifiers(self):
+        for token in (
+            "handoff_digest(", "transition_digest(", "plan_digest(",
+            "candidate_digest(", "_replay(", "_structural_problems(",
+        ):
+            self.assertNotIn(token, self.SOURCE)
+        self.assertIn("verify_plan", self.SOURCE)
+        self.assertIn("verify_handoff", self.SOURCE)
+        self.assertIn("plan_staleness", self.SOURCE)
+
+
+class Wave6CliDoctorTests(Wave5CliCase):
+    def test_fail_check_exits_1_and_stays_value_free(self):
+        self.create()
+        self.execute(
+            "UPDATE agent_handoffs SET objective_md='changed offline'"
+        )
+        code, out, err = self.run_cli("doctor")
+        self.assertEqual(code, 1)
+        self.assertIn("[FAIL] agent handoffs verify — AH-0001: mismatch", out)
+        self.assertIn("check(s) failed", err)
+        self.assertNotIn("changed offline", out)
+        self.assertNotIn("ship the widget", out)
+
+    def test_participant_warning_keeps_exit_zero(self):
+        self.create()
+        self.run_cli("agent", "suspend", "alice")
+        code, out, err = self.run_cli("doctor")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(
+            "[WARN] open agent handoffs with ineligible participants — "
+            "AH-0001: alice suspended",
+            out,
+        )
+
+    def test_stale_plan_warning_keeps_exit_zero(self):
+        code, out, err = self.run_cli(
+            "agent", "route", "plan", "--capability", "cap.a"
+        )
+        self.assertEqual(code, 0, out + err)
+        code, out, err = self.create("--plan", "RP-0001")
+        self.assertEqual(code, 0, out + err)
+        self.run_cli("agent", "suspend", "bob")
+        code, out, err = self.run_cli("doctor")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(
+            "[WARN] open agent handoffs pinned to stale plans — "
+            "AH-0001: plan RP-0001 stale",
+            out,
+        )
 
 
 class Wave5EntrypointTests(Wave5CliCase):
