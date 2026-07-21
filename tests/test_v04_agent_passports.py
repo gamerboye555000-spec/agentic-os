@@ -119,9 +119,12 @@ class V3FixtureTestCase(unittest.TestCase):
         )[0][0]
 
     def migrate(self) -> None:
+        # Brings the v3 fixture fully up to date. U-A3 made the current
+        # version 5, so a to-current apply now runs 3→4 then 4→5; the assertion
+        # follows the one schema declaration rather than a frozen literal.
         code, _, err = self.aos("migrate", "apply")
         self.assertEqual(code, 0, err)
-        self.assertEqual(self.version(), "4")
+        self.assertEqual(self.version(), db.SCHEMA_VERSION)
 
 
 class V4WorkspaceTestCase(unittest.TestCase):
@@ -199,10 +202,10 @@ class V4WorkspaceTestCase(unittest.TestCase):
 # (1) Schema and registry shape
 
 class SchemaTests(V4WorkspaceTestCase):
-    def test_fresh_init_is_version_four_with_both_agent_tables(self):
+    def test_fresh_init_is_version_five_with_both_agent_tables(self):
         self.assertEqual(
             self.query("SELECT value FROM meta WHERE key='schema_version'")[0][0],
-            "4",
+            "5",
         )
         names = {
             r[0]
@@ -213,7 +216,7 @@ class SchemaTests(V4WorkspaceTestCase):
         self.assertIn("agents", names)
         self.assertIn("agent_passports", names)
 
-    def test_registry_is_exactly_the_three_steps_in_order(self):
+    def test_registry_is_exactly_the_four_steps_in_order(self):
         self.assertEqual(
             [
                 (m.from_version, m.to_version, m.migration_id)
@@ -223,6 +226,7 @@ class SchemaTests(V4WorkspaceTestCase):
                 (1, 2, "u-m2-memory-claims-v2"),
                 (2, 3, "u-m3-memory-graph-v3"),
                 (3, 4, "u-a1-agent-passports-v4"),
+                (4, 5, "u-a3-routing-handoffs-v5"),
             ],
         )
 
@@ -248,12 +252,14 @@ def _normalize_table_sql(sql: str) -> str:
 
 
 class MigrationTests(V3FixtureTestCase):
-    def test_status_shows_exactly_one_pending_step(self):
+    def test_status_shows_the_pending_steps(self):
+        # A v3 fixture had exactly one pending step at U-A1; U-A3 appended the
+        # 4→5 step, so a to-current plan from v3 now lists both.
         report = migrations.status(self.db_path)
         self.assertEqual(report["current_version"], 3)
         self.assertEqual(
             [s["migration_id"] for s in report["plan"]],
-            ["u-a1-agent-passports-v4"],
+            ["u-a1-agent-passports-v4", "u-a3-routing-handoffs-v5"],
         )
 
     def test_migration_preserves_everything_and_governs_nothing(self):
@@ -422,14 +428,16 @@ class MigrationTests(V3FixtureTestCase):
         # The verified pre-migration snapshot is intact and adoptable.
         self.assertTrue(caught.exception.snapshot.is_file())
 
-        # Corrected retry applies exactly once.
+        # Corrected retry applies every remaining step exactly once — the
+        # rolled-back 3→4 is not double-applied. To-current now spans two steps
+        # (3→4 then the additive 4→5), so exactly two migrate events exist.
         self.migrate()
         self.assertEqual(
             self.query(
                 "SELECT COUNT(*) FROM events WHERE entity='system' "
                 "AND action='migrate'"
             )[0][0],
-            1,
+            2,
         )
 
     def test_damaged_legacy_row_refuses_safely_and_rolls_back(self):
@@ -1124,17 +1132,18 @@ class EventPayloadTests(V4WorkspaceTestCase):
 # (9) Doctor
 
 class DoctorTests(V4WorkspaceTestCase):
-    def test_doctor_emits_exactly_37_checks(self):
+    def test_doctor_emits_exactly_41_checks(self):
         # U-A2 adds three built-in catalog checks (35-37) after the
         # existing 34; this fixture never installs the catalog, so all
-        # three stay [PASS].
+        # three stay [PASS]. U-A3 Wave 6 appends the four routing/handoff
+        # checks (38-41); with no plans or governed handoffs they all PASS.
         code, out, err = self.aos("doctor")
         self.assertEqual(code, 0, err)
         lines = [
             line for line in out.splitlines()
             if line.startswith(("[PASS]", "[FAIL]", "[WARN]"))
         ]
-        self.assertEqual(len(lines), 37)
+        self.assertEqual(len(lines), 41)
         self.assertIn("agent identity hashes verify", lines[31])
         self.assertIn("agent passport history intact", lines[32])
         self.assertIn("active agents without a published passport", lines[33])

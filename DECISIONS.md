@@ -1,3 +1,320 @@
+# DECISIONS — Agentic OS v0.4 U-A3 governed agent routing and handoff contracts
+
+This section begins the continuation of the `D-v0.4.*` series for the U-A3
+Wave 0 contract-freeze pass: reconciling the approved design
+(`U-A3-routing-handoffs-design.md`) with the independent audit
+(`U-A3-routing-handoffs-audit.md`, verdict ADOPT WITH REQUIRED CORRECTIONS —
+3 blockers, 6 majors, 9 minors) into
+`agentic-os-v0.4-u-a3-routing-handoffs-contract.md`, on branch
+`v0.4-u-a3-routing-handoffs` (2026-07-17). Prepended per the established
+precedent (D-W0.4, reaffirmed in D-v0.2.7, D-v0.4.4); everything below stays
+byte-identical.
+
+## D-v0.4 decisions (U-A3, Wave 0 contract freeze)
+
+- **D-v0.4.21 — Distinct governed agent-handoff tables, separate from
+  legacy `handoffs`.** `agent_handoffs` + `agent_handoff_transitions` are
+  new tables, not an extension of the existing free-text `handoffs` table.
+  The legacy table's `from_agent`/`to_agent` are unvalidated free text,
+  carry no CHECK, no hash, and a mutable `accepted_at` — none of which its
+  historical rows could satisfy under governed rules without the migration
+  fabricating identities and pins for names that were never validated,
+  which D-v0.4.4 already forbids. Rejected: extending the legacy table
+  (fabrication); canonical artifacts with no relational state (loses FK
+  integrity, SQLite's compare-and-swap concurrency, and the backup/snapshot
+  perimeter). The legacy table, its two CLI leaves, its events, its mirror
+  notes and its `H` id prefix stay byte-identical — D-v0.4.20 reserved this
+  ground for U-A3 explicitly, and this decision is how that reservation is
+  spent. **Deferred**: any future unification of the two handoff concepts.
+  **Non-goal**: no migration path from a legacy handoff row to a governed
+  one is provided or implied.
+
+- **D-v0.4.22 — Schema v5: four additive tables, zero new protocols, DDL
+  hardened past the original design.** `routing_plans`,
+  `routing_plan_candidates`, `agent_handoffs`, `agent_handoff_transitions`
+  are added under migration `u-a3-routing-handoffs-v5` (4→5), built from
+  the same `{table}`-parameterized DDL constants a fresh `init` composes
+  (D-v0.3.42), so fresh and migrated schemas are byte-identical for these
+  four tables. Every table carries constraints no existing table could
+  express: `routing_plan_candidates` gains a composite
+  `FOREIGN KEY(agent_id, passport_version) REFERENCES
+  agent_passports(agent_id, version)` — without it, an eligible candidate
+  could pin a passport version that does not exist or belongs to another
+  agent, and nothing would refuse it until doctor caught it after the fact;
+  `routing_plans` gains two additional `result_status` CHECKs so
+  `resolved`/`unresolved`/`no_eligible_candidates` are all biconditional in
+  `(eligible_count, unresolved_count)`, closing a hole where a plan could
+  claim `no_eligible_candidates` while genuinely unresolved candidates
+  existed; both `routing_plans` and `agent_handoffs` gain
+  `CHECK (supersedes_id IS NULL OR supersedes_id < id)`, making every self-
+  and n-cycle structurally impossible, since rowids only increase and
+  neither table has a DELETE path; `agent_handoff_transitions` gains
+  `CHECK (from_state <> 'accepted' OR to_state IN ('cancelled','superseded'))`,
+  closing the two illegal edges (`accepted→refused`,
+  `accepted→clarification_required`) the enum CHECKs alone left
+  representable. Precedent for all four: `MEMORY_EDGES_DDL` and
+  `MEMORY_SOURCES_DDL` already establish that a domain rule the application
+  enforces should also be unstorable by raw SQL wherever a CHECK can
+  express it; doctor remains the backstop only for what SQLite genuinely
+  cannot express (sequence contiguity, chain replay, cross-row
+  equivalence). No new U-X1 protocol identity is introduced: routing
+  requests, plans, handoffs and transitions are workspace-local records
+  pinned to local ids and digests that cannot travel between workspaces, so
+  there is no interoperability surface to justify one — `protocols.py` and
+  every protocol artifact stay byte-identical. **Deferred**: a
+  cross-workspace handoff-exchange protocol (`beast.agent-handoff/vN`) if a
+  future unit ever needs one. **Non-goal**: no index is added in this pass
+  (D-v0.4.28).
+
+- **D-v0.4.23 — Autonomy is unordered membership, never a ladder.**
+  `AGENT_AUTONOMY_LEVELS = ("declare_only","suggest","supervised","scoped")`
+  is a closed, **unordered** vocabulary; the routing request's
+  `required_autonomy` field is an array of 1..4 unique values matched
+  against the agent's declared passport `autonomy` by set membership only,
+  producing `autonomy_mismatch` on a miss. No `autonomy_rank` function is
+  written, and none may be. This reverses an `autonomy_ceiling` (a single
+  value compared by rank ≤) considered during Wave 0 review and rejected:
+  U-A1 published `autonomy` as an inert declaration ("nothing in U-A1 reads
+  it"), so ranking it now would retroactively redefine every value already
+  stored in every published passport; `supervised` and `scoped` name
+  orthogonal properties (supervision presence vs. scope boundedness) with
+  no forced order, so a ceiling would have to guess an answer for the one
+  comparison that matters most; and a rank is rank inference over a
+  declaration — exactly what this same request schema refuses one field
+  over, for `data_classification` (D-v0.4.32). Precedent for the
+  unordered-and-say-so shape: `MEMORY_SENSITIVITIES` carries an explicit
+  authoritative-order warrant because its order is load-bearing;
+  `AGENT_AUTONOMY_LEVELS` carries the deliberate inverse comment because
+  its order is not. **Deferred**: an autonomy ladder remains possible in a
+  future unit, but only with its own decision record and its own evidence
+  that the levels are genuinely comparable — evidence that does not exist
+  today. **Non-goal**: U-A3 does not read, write, or reinterpret any
+  previously published passport's `autonomy` value; existing declarations
+  are unaffected.
+
+- **D-v0.4.24 — `decision_id` is a rationale reference, not an approval.**
+  `agent_handoffs.decision_id` is an optional FK to `decisions(id)`, read
+  only as a pointer to the architecture-decision record that explains *why*
+  a delegation was declared. It is not an approval, not authorization, not
+  consent, not a grant, not a policy decision, and not an execution
+  permission, and no U-A3 code reads it as a condition for allowing any
+  operation — a handoff with `decision_id` NULL and one with `decision_id`
+  set behave identically on every verb. This is forced by what `decisions`
+  actually is: an ADR table (`title`, `decision_md`, `alternatives_md`,
+  `status`, `decided_at`) with no approver column, no subject, no grant, no
+  scope, and no foreign keys at all; `status` carries no CHECK constraint
+  and is hardcoded to `'accepted'` by its one writer (`ops.add_decision`),
+  and no CLI verb ever changes it. Describing a pointer into that table as
+  an "approval reference" — language considered during Wave 0 review and
+  rejected — would have manufactured an authorization primitive the system
+  does not have, inviting a future orchestration unit to gate execution on
+  `decision_id IS NOT NULL` over a column that is, in truth, unconstrained
+  free text defaulted to `accepted`. **Agentic OS currently has no governed
+  approval primitive for these handoffs**, and this decision records that
+  fact rather than papering over it. **Deferred**: any future unit that
+  wants real approval semantics must build a dedicated approval primitive
+  and must not repurpose `decision_id` to mean one. **Non-goal**: this
+  decision does not change the `decisions` table, `ops.add_decision`, or
+  any existing consumer of a `decisions` row.
+
+- **D-v0.4.25 — Routing-plan post-commit immutability, built on the
+  `_PENDING_HASH` precedent.** `routing_plans` and `routing_plan_candidates`
+  rows are immutable after commit — no command reaches them with an UPDATE
+  or DELETE once their creating transaction has closed. Within that one
+  creating transaction only, the parent plan row is inserted with
+  `content_sha256=_PENDING_HASH` (the empty string), each candidate row is
+  inserted the same way, each candidate's hash is finalized by an UPDATE
+  immediately after its insert (needed because a record hash binds its own
+  row id, which SQLite only assigns at INSERT), the ordered chain of
+  recomputed candidate digests is built by `routing_plan_candidates.id`
+  ascending, and the plan's own hash is finalized last, over that chain.
+  This is the exact `_PENDING_HASH` two-step already established for
+  memory claims (`ops.py`: "the id is only known after the INSERT — so the
+  two-step is unavoidable … invisible: no other connection can observe an
+  open transaction"), applied to routing for the first time. No digest
+  input ever includes a `content_sha256` column, so the construction is
+  acyclic: plan-id → candidate rows → candidate digests → plan hash. A
+  `_PENDING_HASH` value that survived a crash does not have the 64-hex-
+  character shape a real hash has, and is reported as `malformed` by
+  doctor and by `route verify`, never mistaken for a real one.
+  **Deferred**: nothing — this is the complete, permanent hash-construction
+  rule for both tables. **Non-goal**: this decision does not create any
+  UPDATE path reachable from a normal command after commit; the
+  hash-finalization UPDATEs are internal to `routing.create_plan` alone.
+
+- **D-v0.4.26 — A handoff is an append-only transition history plus a
+  mutable, hash-coupled current-state projection.**
+  `agent_handoff_transitions` rows are immutable and append-only; on
+  `agent_handoffs`, every column is likewise immutable except `state`,
+  `updated_at` and `content_sha256`, which move together — always in the
+  same transaction as the transition row that justifies them, always with
+  exactly one event — and never otherwise. A freshly created handoff has
+  zero transition rows, `state='proposed'`, and a hash bound over an empty
+  chain; every subsequent verb appends exactly one transition row
+  (chain-ordered by `seq`, not by row id) and recomputes the projection
+  over the intended new state in one UPDATE, so no intermediate "state
+  moved but hash didn't" row can exist even inside the transaction. The
+  projection is fully derivable by replaying the chain from `proposed`; it
+  is stored because it is what compare-and-swap reads and what `list`
+  filters on, and doctor 39 is what proves the stored projection and the
+  replayed history agree. This is chosen over deriving `state` purely from
+  the event log (events are audit projections, deliberately not
+  authoritative) and over one immutable successor row per transition
+  (which reintroduces a moving-pointer integrity problem at higher cost
+  than the composite-FK pattern already solves for passports).
+  **Deferred**: nothing about the shape; a future unit may add a
+  `completed` state to this same machine once it has execution-outcome
+  facts to bind it to. **Non-goal**: this decision does not make any
+  `agent_handoffs` column other than the three named ones mutable.
+
+- **D-v0.4.27 — Supersession is expressed only at successor creation;
+  plans derive it, handoffs also store it.** `supersedes_id` on both
+  `routing_plans` and `agent_handoffs` is written only when a successor is
+  created and is never updated afterward; `UNIQUE(supersedes_id)` permits
+  at most one successor per row, making every chain linear;
+  `CHECK (supersedes_id IS NULL OR supersedes_id < id)` makes every
+  self-supersession and every longer cycle structurally impossible, because
+  rowids only increase and neither table has a DELETE path, so an honest
+  successor always has the larger id. There is no standalone supersede
+  mutation on either table. The two tables are asymmetric on purpose: a
+  routing plan has no lifecycle, so "superseded" is purely a derived fact
+  about it (a successor exists), and deriving it is both cheaper and
+  strictly stronger than storing a fact that could drift; a handoff has a
+  lifecycle, and `superseded` must be a terminal state the same `state`
+  column and compare-and-swap logic already read, reached through the same
+  append-only transition history as every other terminal state — so it is
+  both derived (a successor names it) and stored (the state column says
+  so), and doctor 39 is what keeps the two readings honest via a
+  `supersession_incoherent` verdict on divergence. **Deferred**: nothing;
+  the asymmetry is permanent, not a placeholder. **Non-goal**: no
+  `agent handoff supersede` or `agent route select`-style standalone leaf
+  exists; supersession is reachable only through `create --supersedes`.
+
+- **D-v0.4.28 — No indexes on the four U-A3 tables; three scan paths
+  accepted by measurement, not by imitation.** `routing_plans`,
+  `routing_plan_candidates`, `agent_handoffs` and
+  `agent_handoff_transitions` carry no `CREATE INDEX`, continuing
+  D-v0.3.45's rule. The UNIQUE constraints already supply the implicit
+  indexes for every plan-scoped and handoff-scoped lookup: candidates by
+  plan, candidates by plan and rank, transitions by handoff and sequence,
+  and successor lookup by `supersedes_id` on both tables. Three paths are
+  left as full scans, each accepted on its own evidence:
+  `routing_plan_candidates` by `agent_id`, reached only by the `agent
+  discard` guard, a rare interactive command on a draft identity whose
+  parent DELETE forces the same child-table scan for foreign-key
+  enforcement regardless of whether an index exists; `agent_handoffs` by
+  task/state/plan, a human-authored table bounded by operator effort at
+  hundreds of rows; and doctor checks 38 through 41, which walk every plan
+  and handoff by design regardless of any index. Should the first path
+  ever measurably matter, `CREATE INDEX routing_plan_candidates(agent_id)`
+  is named as the answer and is additive — it is **not** added in this
+  pass. **Deferred**: that one index, pending measured evidence.
+  **Non-goal**: this decision does not claim the three scans are free at
+  unbounded scale, only that they are bounded by realistic ledger sizes
+  today.
+
+- **D-v0.4.29 — The 3→4 migration step keeps building from the live agent
+  DDL at v5; the freeze obligation transfers, guarded by a test.**
+  `migrations.py`'s `_agent_passports_v4` step docstring records that a
+  frozen copy of the v4 agent DDL "becomes v5's obligation" once v4 stops
+  being current — and U-A3 is the unit that makes v4 historical. This
+  obligation is deferred, deliberately and once, rather than discharged
+  now: U-A3 changes neither `AGENTS_DDL`, `AGENT_PASSPORTS_DDL`, nor
+  `agent_identity_payload`, so the live constants the 3→4 step builds from
+  are still the genuine v4 constants, and no drift materializes. The
+  precedent for deferring is the 2→3 step, which still builds from the
+  live memory-claim DDL today, at v4 — this codebase has historically
+  frozen a migration step's DDL only when a later change would actually
+  cause it to drift (U-M3's DDL change forced 1→2 to freeze; U-A1's
+  agents-table change forced the v3 step to freeze), not mechanically at
+  every version bump. The obligation therefore transfers unchanged to the
+  first future unit that edits `AGENTS_DDL`, `AGENT_PASSPORTS_DDL`, or
+  `agent_identity_payload`, which must freeze the v4-named copies of those
+  symbols before it edits any of them. A guard test — byte-comparing
+  `db.AGENTS_DDL` and `db.AGENT_PASSPORTS_DDL` against literals frozen at
+  this baseline (`80b7e82577cbed19aa1823934df44ae09a644ac5`), and pinning
+  the sorted key list of `passports.agent_identity_payload` for a fixed
+  agent — converts the silent trap the bare deferral would otherwise be
+  into a loud one: its failure is the signal that this decision's
+  obligation has come due. **Deferred**: the freeze itself, to whichever
+  future unit trips the guard test. **Non-goal**: this decision does not
+  touch any historical migration step body; U-A3's own migration step is
+  purely additive and reads no existing table.
+
+- **D-v0.4.30 — No `route select` leaf; no `completed` handoff state.**
+  U-A3 ships no `agent route select` command and no `completed` value in
+  the handoff state vocabulary. A selection that grants nothing and
+  executes nothing is, in substance, already a delegation declaration —
+  and U-A3 has that record: the handoff, which references a plan and names
+  a recipient. A second record for the same fact would be duplicate state
+  with its own divergence risk, and the plan is honestly finished doing its
+  job — presenting an ordered, explainable, pinned candidate list — the
+  moment a human reads it; "which one did the human pick" belongs to
+  whatever declares the delegation. Completion is refused for a different
+  reason: `completed` asserts that work was executed and verified, which is
+  an execution-outcome fact, and U-A3 ships no runs or evidence binding
+  that could make such a claim honestly. Both rejections keep the unit's
+  advisory boundary exact: nothing in the schema can be read as "and then
+  this happened." **Deferred**: a `completed` state, with its own evidence
+  binding, is explicitly left to a future orchestration unit that has runs
+  and evidence to point at; that unit may also revisit whether a
+  lightweight selection record is still unnecessary once real orchestration
+  exists. **Non-goal**: `agent handoff accept` is not, and must never be
+  read as, a stand-in for completion — it executes nothing.
+
+- **D-v0.4.31 — `agent_absent` and `catalog_not_installed` are
+  request-level refusal codes, never candidate reasons.**
+  `ROUTING_REQUEST_REFUSAL_CODES = ("agent_absent", "catalog_not_installed")`
+  is a vocabulary disjoint from `ROUTING_REASON_CODES`. Both codes describe
+  `preferred_agent` naming something that has no `agents` row — an
+  unregistered name, or an uninstalled catalog entry — and
+  `routing_plan_candidates.agent_id` is `NOT NULL` with a foreign key into
+  `agents(id)`, so no candidate row can ever carry either code: the schema
+  itself proves the vocabulary split is not stylistic. A request that
+  trips either refusal creates zero rows and zero events; `agent route
+  plan` exits 1 and prints a message naming the resolution path (`agent
+  catalog install` for the uninstalled-catalog case), and nothing is
+  installed as a side effect of the refusal. Filing the two codes alongside
+  genuine candidate reasons, as considered during Wave 0 review and
+  rejected, would let doctor 38 and `route verify` accept a stored
+  `reasons_json` value that no honest write could ever produce, silently
+  widening the set of "valid-looking" damage those checks would fail to
+  catch. **Deferred**: nothing; the split is permanent and the two
+  vocabularies must remain disjoint by test. **Non-goal**: this decision
+  does not change how `preferred_agent` resolution behaves, only how its
+  two failure codes are classified and validated.
+
+- **D-v0.4.32 — `required_data_classification` is exact-set membership
+  against a passport's declared classifications, never a ceiling.** The
+  routing request's classification field is named `required_data_classification`
+  and is evaluated as membership only: the requested level must be an
+  element of the agent's declared `data_classifications` set, including
+  the case where the agent declared no set at all, else
+  `data_classification_mismatch`; the diagnostic's `declared: false` flag
+  distinguishes the two failure shapes. The name avoids a byte-identical
+  collision with the passport's own, unrelated envelope-level
+  `data_classification` field (the classification of the passport document
+  itself, not of anything the agent handles), and the word "ceiling" names
+  nothing in this contract: a ceiling implies a rank comparison, and this
+  gate's own justification is "membership, not rank inference: declarations
+  are not extrapolated" — the identical principle D-v0.4.23 applies to
+  autonomy. The vocabulary itself is not new: it is `models.MEMORY_SENSITIVITIES`,
+  reused by value and pinned equal as a set, by test, to both
+  `protocols.DATA_CLASSIFICATIONS` and the passport schema's own
+  `data_classifications` item enum, since `models.py` cannot import
+  `protocols` and no single-definition fix exists across that boundary.
+  The handoff's own `data_classification` column (on `agent_handoffs`,
+  distinct from the request field) keeps its name and its meaning
+  unchanged: the declared classification of the data involved in a
+  delegation, enforced only as vocabulary, an advisory unstored warning at
+  creation, and `RESTRICTED_PLACEHOLDER` privacy in list output — never a
+  clearance and never an authority grant. **Deferred**: nothing;
+  membership is the permanent semantics for this dimension. **Non-goal**:
+  this decision does not add a `missing_data_classification` code — the
+  existing `data_classification_mismatch` code already covers both the
+  "declared without this value" and "declared nothing" cases via the
+  `declared` diagnostic flag.
+
 # DECISIONS — Agentic OS v0.4 U-A1 agent passports
 
 This section begins the `D-v0.4.*` series for the U-A1 pass executed per

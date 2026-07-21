@@ -352,6 +352,155 @@ The derived identity is `owner=human`, `origin=create`, from the moment it
 is created, and is never touched by a later catalog upgrade — it shares no
 row, name, or code path with the catalog entry it was derived from.
 
+## Governed agent routing and handoffs (U-A3)
+
+Records and declarations only — U-A3 adds the smallest governed substrate that
+can *declare* routing and delegation without *performing* either. It routes
+nothing, selects nothing, launches nothing, and grants nothing: a routing plan
+is an advisory record a human reads, and a governed handoff is a human-authored
+declaration a human decides on. The schema moves to version 5 — four additive
+tables, no new protocol, and no change to any existing table.
+
+### Advisory routing plans
+
+`agent route plan` evaluates the installed agent identities against a described
+task and stores a deterministic, fully explainable **routing plan**:
+
+- a routing plan is an immutable-after-commit advisory record. Routing does not
+  select, launch, invoke, or execute an agent, and no code path reads a plan to
+  authorize anything;
+- each plan captures the evaluated candidates, the closed eligibility reason
+  code for every excluded or unresolved one, the deterministic ordering, the
+  pinned passport version / document digest / identity digest of each eligible
+  candidate, the record's integrity hashes, and a derived staleness state;
+- eligibility and ordering are pure functions of the request and the current
+  ledger — never of row ids, insertion order, wall clock, usage, price, or
+  randomness;
+- committed plan and candidate rows are never updated or deleted. `--supersedes
+  RP-0001` records a successor at creation and leaves the old plan
+  byte-identical;
+- routing derives the project from the referenced task when `--project` is
+  omitted (task-derived project routing);
+- staleness is a read-time predicate, not a stored flag. A stale or superseded
+  plan stays inspectable history, but it must not be used to create a governed
+  handoff.
+
+### Governed handoffs
+
+`agent handoff create` declares a **governed handoff** — an explicit
+human-authored delegation between two pinned participant identities:
+
+- a governed handoff is a declaration, not an action. `accepted` means the
+  human recorded acceptance for the recipient identity — never that work ran or
+  completed;
+- every handoff pins both participants' passport version and recomputed
+  document digest at creation, and keeps an append-only transition history plus
+  a hash-coupled current-state projection that integrity verification replays;
+- the lifecycle verbs are `accept`, `refuse`, `clarify`, and `cancel`. A
+  successor is created with `--supersedes AH-0001`, which is the only way a
+  handoff reaches the `superseded` state — there is no standalone supersede
+  command;
+- there is no `completed` state. Completion asserts that work was executed and
+  verified, and U-A3 binds no runs or evidence that could claim it honestly;
+- `--decision D-0001` is an optional pointer to a decision record explaining
+  *why* a delegation was declared — descriptive only, never an approval,
+  authorization, or grant.
+
+### Schema, doctor, and recovery
+
+Schema **version 5** adds four governed tables — `routing_plans`,
+`routing_plan_candidates`, `agent_handoffs`, and `agent_handoff_transitions` —
+and no new protocol. Doctor gains four read-only checks (total **41 checks**):
+
+- **routing plans verify** — plan and candidate hashes, chain, request digest,
+  counts, ranks, pins, and references;
+- **agent handoffs verify** — handoff hash, transition chain replay, state
+  coherence, pins, and references;
+- **open agent handoffs with ineligible participants** — a WARN when an open
+  handoff names a suspended, archived, revoked, or integrity-broken participant;
+- **open agent handoffs pinned to stale plans** — a WARN when an open handoff
+  references a stale or superseded plan.
+
+In **recovery mode** the six U-A3 write leaves (`route plan`, `handoff create`,
+`accept`, `refuse`, `clarify`, `cancel`) are blocked before dispatch, while the
+five read leaves (`route list` / `show` / `verify`, `handoff list` / `show`)
+stay available so a damaged, stale, or superseded record can still be
+inspected. Reads never repair or mutate anything.
+
+### The eleven commands
+
+```bash
+# Routing — one authoritative write, three reads:
+python aos.py agent route plan [--task T-…] [--project SLUG] [--family F]… \
+    [--capability C]… [--evidence-kind K]… [--require-classification LVL] \
+    [--require-autonomy LVL]… [--require-scope global|project] [--require-class CLASS] \
+    [--skill S]… [--tool T]… [--min-context-tokens N] [--modality M]… [--prefer NAME] \
+    [--scope-preference specific_first|none] [--surplus-policy minimal|ignore] \
+    [--max-candidates N] [--supersedes RP-…] [--json]
+python aos.py agent route list [--task T-…] [--json]
+python aos.py agent route show RP-0001 [--request] [--json]
+python aos.py agent route verify RP-0001 [--json]
+
+# Handoffs — five authoritative writes, two reads:
+python aos.py agent handoff create --task T-0001 --from NAME --to NAME \
+    --objective TEXT [--plan RP-0001] [--expect-evidence KIND]… [--min-evidence N] \
+    [--constraints TEXT] [--classification LVL] [--decision D-0001] \
+    [--supersedes AH-0001] [--json]
+python aos.py agent handoff list [--task T-0001] [--state STATE] [--json]
+python aos.py agent handoff show AH-0001 [--json]
+python aos.py agent handoff accept AH-0001 [--note TEXT] [--json]
+python aos.py agent handoff refuse AH-0001 --reason CODE [--note TEXT]
+python aos.py agent handoff clarify AH-0001 --reason CODE [--note TEXT]
+python aos.py agent handoff cancel AH-0001 [--note TEXT]
+```
+
+### A small governed flow
+
+```bash
+# 1. Evaluate installed agents for a task and store the ranked advisory plan (RP-0001):
+python aos.py agent route plan --task T-0001
+
+# 2. Read and verify the plan — both are read-only, and neither selects nor
+#    launches anyone:
+python aos.py agent route show RP-0001
+python aos.py agent route verify RP-0001
+
+# 3. You, the human, read the ranked candidates and decide who receives the
+#    work. Nothing was chosen or launched for you.
+
+# 4. Declare a governed handoff to the recipient you chose, optionally citing
+#    the plan as an advisory reference (AH-0001):
+python aos.py agent handoff create --task T-0001 --from aos.planner --to aos.builder \
+    --objective "Implement the parser fix" --plan RP-0001
+
+# 5. Inspect the declaration and its (initially empty) transition history:
+python aos.py agent handoff show AH-0001
+
+# 6. Record one human decision. `accepted` means the declaration was accepted —
+#    it executes nothing and completes nothing:
+python aos.py agent handoff accept AH-0001
+```
+
+### Not added by U-A3
+
+U-A3 is advisory and carries no authority. It adds none of the following, and
+none may be inferred from a plan or a handoff:
+
+- `agent route select` — explicit human selection *is* handoff creation, not a
+  second record;
+- `agent handoff complete`, any `completed` state, or completion-evidence
+  binding;
+- autonomous delegation, agent execution, or provider access;
+- tool, skill, or MCP invocation;
+- credential grants or spend;
+- workflow scheduling or an orchestration engine;
+- economic negotiation;
+- AICompany integration.
+
+`decision_id` is a rationale pointer, not an approval — Agentic OS currently
+has no governed approval primitive for these handoffs. The full frozen contract
+is `agentic-os-v0.4-u-a3-routing-handoffs-contract.md`.
+
 ## Weekend commands
 
 Decisions, handoffs, and memory are first-class ledger rows (each mutation

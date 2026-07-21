@@ -111,6 +111,14 @@ def _install_v3_agents_schema(db_path: Path) -> None:
                     "v3 fixture: agents must be empty when the v3 schema is "
                     f"installed (found {rows} rows)"
                 )
+            # U-A3: a "v3" workspace with the four routing/handoff tables would
+            # not be one, and the 4→5 step would fail on its CREATE when this
+            # fixture was migrated forward. Dropped children-first via the
+            # iterated db.ROUTING_HANDOFF_TABLES (before the agent tables they
+            # reference), so a fifth cannot be added without this fixture
+            # dropping it too.
+            for table, _ddl in reversed(db.ROUTING_HANDOFF_TABLES):
+                conn.execute(f"DROP TABLE {table}")
             conn.execute("DROP TABLE agent_passports")
             conn.execute("DROP TABLE agents")
             conn.execute(migrations._V3_AGENTS_DDL.format(table="agents"))

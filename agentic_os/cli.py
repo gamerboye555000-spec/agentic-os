@@ -17,6 +17,7 @@ from pathlib import Path
 from . import db, ids, obsidian, ops, power, utils
 from .models import (
     AGENT_CLASSES,
+    AGENT_HANDOFF_STATES,
     MEMORY_EDGE_RELATIONS,
     MEMORY_SENSITIVITIES,
     MEMORY_SENSITIVITY_DEFAULT,
@@ -781,6 +782,358 @@ def cmd_agent_catalog_install(args) -> int:
             f"(catalog v{result['catalog_version']})."
         )
     return 0
+
+
+# ---------------------------------------------------------------------------
+# U-A3 governed routing — four leaves under `agent route`. `plan` is the only
+# write (an authoritative ledger write: plan row + candidate rows + one audit
+# event, one transaction, recovery-blocked, deep-verified). `list`/`show`/
+# `verify` are read-only and usable in recovery: inspecting a stale or tampered
+# plan is exactly what recovery is for. Routing is advisory — a plan orders and
+# explains candidate declarations; it grants, executes, schedules and installs
+# nothing.
+
+def _route_request_from_args(args) -> dict:
+    """The canonical request document a `route plan` invocation authors, from
+    CLI flags only — no DB access. `validate_request` (called next) is the one
+    place vocabulary, bounds, duplicates and sorting are enforced."""
+    from . import routing
+
+    raw: dict = {
+        "request_schema": routing.REQUEST_SCHEMA,
+        "algorithm_version": routing.ALGORITHM_VERSION,
+    }
+    if args.task is not None:
+        raw["task"] = ids.parse_id(args.task, "task")
+    if args.project is not None:
+        raw["project"] = args.project
+    for flag, key in (
+        (args.family, "task_families"),
+        (args.capability, "capabilities"),
+        (args.evidence_kind, "evidence_kinds"),
+        (args.require_autonomy, "required_autonomy"),
+        (args.skill, "skills"),
+        (args.tool, "tools"),
+    ):
+        if flag:
+            raw[key] = list(flag)
+    if args.require_classification is not None:
+        raw["required_data_classification"] = args.require_classification
+    if args.require_scope is not None:
+        raw["required_scope"] = args.require_scope
+    if args.require_class is not None:
+        raw["required_agent_class"] = args.require_class
+    model_capabilities: dict = {}
+    if args.min_context_tokens is not None:
+        model_capabilities["min_context_tokens"] = args.min_context_tokens
+    if args.modality:
+        model_capabilities["modalities"] = list(args.modality)
+    if model_capabilities:
+        raw["model_capabilities"] = model_capabilities
+    if args.prefer is not None:
+        raw["preferred_agent"] = args.prefer
+    raw["scope_preference"] = args.scope_preference
+    raw["surplus_policy"] = args.surplus_policy
+    raw["max_candidates"] = args.max_candidates
+    return routing.validate_request(raw)
+
+
+def cmd_agent_route_plan(args) -> int:
+    from . import routing
+
+    request = _route_request_from_args(args)
+    supersedes_id = (
+        ids.parse_id(args.supersedes, "routing_plan")
+        if args.supersedes is not None
+        else None
+    )
+    with _ledger(args) as (aos_dir, conn):
+        plan_id = routing.create_plan(conn, request, supersedes_id=supersedes_id)
+        plan = routing.get_plan(conn, plan_id)
+        if args.json:
+            _print_json({"plan": routing.plan_public(conn, plan)})
+            return 0
+        for line in routing.render_plan_lines(conn, plan):
+            print(line)
+    return 0
+
+
+def cmd_agent_route_list(args) -> int:
+    from . import routing
+
+    task_id = ids.parse_id(args.task, "task") if args.task is not None else None
+    with _ledger(args) as (aos_dir, conn):
+        plans = routing.list_plans(conn, task_id=task_id)
+        if args.json:
+            _print_json({"plans": plans})
+            return 0
+        if not plans:
+            print("(no routing plans)")
+            return 0
+        for row in plans:
+            flags = []
+            if row["stale"]:
+                flags.append("stale")
+            if row["superseded"]:
+                flags.append("superseded")
+            suffix = f"  [{', '.join(flags)}]" if flags else ""
+            print(
+                f"{row['plan']}  {row['created_at']}  {row['result_status']:<22} "
+                f"eligible {row['eligible_count']} · unresolved "
+                f"{row['unresolved_count']} · excluded {row['excluded_count']}"
+                f"{suffix}"
+            )
+    return 0
+
+
+def cmd_agent_route_show(args) -> int:
+    from . import routing
+
+    plan_id = ids.parse_id(args.id, "routing_plan")
+    with _ledger(args) as (aos_dir, conn):
+        plan = routing.get_plan(conn, plan_id)
+        if plan is None:
+            raise AosError(
+                f"No routing plan {ids.render_id('routing_plan', plan_id)}. "
+                "Run: python aos.py agent route list"
+            )
+        if args.request:
+            sys.stdout.write(plan.request_document + "\n")
+            return 0
+        if args.json:
+            _print_json({"plan": routing.plan_public(conn, plan)})
+            return 0
+        public = routing.plan_public(conn, plan)
+        for line in routing.render_plan_lines(conn, plan):
+            print(line)
+        print(f"task:         {_dash(public['task'])}")
+        print(f"project:      {_dash(public['project'])}")
+        print(f"scope:        {plan.scope}")
+        print(f"created:      {plan.created_at}")
+        print(f"algorithm:    {plan.algorithm_version}")
+        print(f"request:      {plan.request_sha256}")
+        print(f"content:      {plan.content_sha256}")
+        if public["supersedes"]:
+            print(f"supersedes:   {public['supersedes']}")
+        if public["superseded_by"]:
+            print(f"superseded by {public['superseded_by']}")
+    return 0
+
+
+def cmd_agent_route_verify(args) -> int:
+    from . import routing
+
+    plan_id = ids.parse_id(args.id, "routing_plan")
+    with _ledger(args) as (aos_dir, conn):
+        result = routing.verify_plan(conn, plan_id)
+        if args.json:
+            _print_json(result)
+            return 0 if result["ok"] else 1
+        if result["ok"]:
+            labels = []
+            if result["stale"]:
+                labels.append("stale")
+            if result["superseded"]:
+                labels.append("superseded")
+            note = f" ({', '.join(labels)})" if labels else ""
+            print(f"{result['plan']}: OK{note}")
+            return 0
+        for problem in result["problems"]:
+            print(problem, file=sys.stderr)
+        print(f"{len(result['problems'])} problem(s) found", file=sys.stderr)
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# U-A3 governed handoffs — seven leaves under `agent handoff`. `create` and
+# the four lifecycle verbs record explicit human decisions through the Wave 4
+# domain owners (`agent_handoffs.create_handoff` / `.transition`), which own
+# all validation, the write boundary, the hashes and the audit trail; these
+# handlers parse arguments, make exactly one domain call each and print a
+# bounded result. `list`/`show` are read-only and usable in recovery. A
+# governed handoff is a human-authored declaration: nothing here executes,
+# schedules or completes work, and `accept` records the human's decision for
+# the recipient identity — it is never completion. The legacy top-level
+# handoff command is untouched.
+
+def cmd_agent_handoff_create(args) -> int:
+    from . import agent_handoffs
+
+    task_id = ids.parse_id(args.task, "task")
+    plan_id = (
+        ids.parse_id(args.plan, "routing_plan")
+        if args.plan is not None
+        else None
+    )
+    decision_id = (
+        ids.parse_id(args.decision, "decision")
+        if args.decision is not None
+        else None
+    )
+    supersedes_id = (
+        ids.parse_id(args.supersedes, "agent_handoff")
+        if args.supersedes is not None
+        else None
+    )
+    with _ledger(args) as (aos_dir, conn):
+        handoff_id = agent_handoffs.create_handoff(
+            conn,
+            task_id=task_id,
+            from_agent=args.from_agent,
+            to_agent=args.to,
+            objective_md=args.objective,
+            plan_id=plan_id,
+            expected_evidence=tuple(args.expect_evidence or ()),
+            min_evidence_count=args.min_evidence,
+            constraints_md=args.constraints,
+            data_classification=args.classification,
+            decision_id=decision_id,
+            supersedes_id=supersedes_id,
+        )
+        ah = ids.render_id("agent_handoff", handoff_id)
+        if args.json:
+            handoff = agent_handoffs.get_handoff(conn, handoff_id)
+            if handoff is None:
+                raise AosError(
+                    f"No handoff {ah}. Run: python aos.py agent handoff list"
+                )
+            _print_json(
+                {"handoff": agent_handoffs.handoff_public(conn, handoff)}
+            )
+            return 0
+        print(f"{ah} proposed")
+    return 0
+
+
+def cmd_agent_handoff_list(args) -> int:
+    from . import agent_handoffs
+
+    task_id = ids.parse_id(args.task, "task") if args.task is not None else None
+    with _ledger(args) as (aos_dir, conn):
+        listing = agent_handoffs.list_handoffs(
+            conn, task_id=task_id, state=args.state
+        )
+        if args.json:
+            _print_json({"handoffs": listing})
+            return 0
+        if not listing:
+            print("(no agent handoffs)")
+            return 0
+        for row in listing:
+            # The objective preview arrives restricted-safe from the domain
+            # projection; one-line it, never widen it.
+            objective = " ".join(row["objective"].split())
+            print(
+                f"{row['handoff']:<8} {row['created_at']}  "
+                f"{row['state']:<22} {row['task']:<8} "
+                f"{row['from_agent']} → {row['to_agent']}  {objective}"
+            )
+    return 0
+
+
+def cmd_agent_handoff_show(args) -> int:
+    from . import agent_handoffs
+
+    handoff_id = ids.parse_id(args.id, "agent_handoff")
+    with _ledger(args) as (aos_dir, conn):
+        handoff = agent_handoffs.get_handoff(conn, handoff_id)
+        if handoff is None:
+            raise AosError(
+                f"No handoff {ids.render_id('agent_handoff', handoff_id)}. "
+                "Run: python aos.py agent handoff list"
+            )
+        public = agent_handoffs.handoff_public(conn, handoff)
+        if args.json:
+            _print_json({"handoff": public})
+            return 0
+        print(f"{public['handoff']}  {public['state']}")
+        print(f"task:            {public['task']}")
+        print(f"plan:            {_dash(public['plan'])}")
+        print(
+            f"from:            {public['from_agent']} "
+            f"(passport v{public['from_passport_version']})"
+        )
+        print(
+            f"to:              {public['to_agent']} "
+            f"(passport v{public['to_passport_version']})"
+        )
+        print(f"actor:           {public['actor']}")
+        print(f"objective:       {public['objective']}")
+        evidence = ", ".join(public["expected_evidence"]) or "-"
+        print(
+            f"evidence:        {evidence} (min {public['min_evidence_count']})"
+        )
+        print(f"constraints:     {_dash(public['constraints'])}")
+        print(f"classification:  {public['data_classification']}")
+        print(f"decision:        {_dash(public['decision'])}")
+        print(f"from pin:        {public['from_passport_sha256']}")
+        print(f"to pin:          {public['to_passport_sha256']}")
+        print(f"supersedes:      {_dash(public['supersedes'])}")
+        print(f"superseded by:   {_dash(public['superseded_by'])}")
+        print(f"created:         {public['created_at']}")
+        print(f"updated:         {public['updated_at']}")
+        print(f"hash:            {public['content_sha256']}")
+        if public["integrity_ok"]:
+            print("integrity:       ok")
+        else:
+            print("integrity:       " + "; ".join(public["integrity_problems"]))
+        print("transitions:")
+        if not public["transitions"]:
+            print("  (none)")
+        for transition in public["transitions"]:
+            line = (
+                f"  #{transition['seq']}  {transition['from_state']} → "
+                f"{transition['to_state']}  {transition['created_at']}"
+            )
+            if transition["reason_code"]:
+                line += f"  reason={transition['reason_code']}"
+            if transition["note"]:
+                line += f"  note={transition['note']}"
+            print(line)
+    return 0
+
+
+def _agent_handoff_transition(args, verb: str) -> int:
+    """The one shared shape for the four explicit lifecycle verbs: parse the
+    id, make exactly one domain call, report the handoff and its resulting
+    stored state. `refuse`/`clarify` parsers define --reason; `accept`/
+    `cancel` parsers do not, so getattr passes None — never a synthesized
+    code."""
+    from . import agent_handoffs
+
+    handoff_id = ids.parse_id(args.id, "agent_handoff")
+    with _ledger(args) as (aos_dir, conn):
+        agent_handoffs.transition(
+            conn,
+            handoff_id,
+            verb,
+            reason_code=getattr(args, "reason", None),
+            note_md=args.note,
+        )
+        after = agent_handoffs.get_handoff(conn, handoff_id)
+        state = after.state if after else "?"
+        ah = ids.render_id("agent_handoff", handoff_id)
+        if getattr(args, "json", False):
+            _print_json({"handoff": ah, "state": state})
+            return 0
+        print(f"{ah} {state}")
+    return 0
+
+
+def cmd_agent_handoff_accept(args) -> int:
+    return _agent_handoff_transition(args, "accept")
+
+
+def cmd_agent_handoff_refuse(args) -> int:
+    return _agent_handoff_transition(args, "refuse")
+
+
+def cmd_agent_handoff_clarify(args) -> int:
+    return _agent_handoff_transition(args, "clarify")
+
+
+def cmd_agent_handoff_cancel(args) -> int:
+    return _agent_handoff_transition(args, "cancel")
 
 
 def cmd_evidence_git(args) -> int:
@@ -2661,6 +3014,231 @@ def build_parser() -> _Parser:
     p_catalog_install.add_argument("--all", action="store_true")
     p_catalog_install.add_argument("--json", action="store_true")
     p_catalog_install.set_defaults(func=cmd_agent_catalog_install)
+
+    # U-A3 governed routing. Four leaves: `plan` writes an advisory,
+    # deterministically ordered plan (the only write); `list`/`show`/`verify`
+    # are read-only. No `route select` leaf exists — explicit selection is a
+    # handoff referencing a plan, not a second record.
+    p_agent_route = agent_sub.add_parser(
+        "route", help="governed advisory routing (orders and explains "
+        "candidate declarations; never executes, schedules or installs)"
+    )
+    route_sub = p_agent_route.add_subparsers(
+        dest="subsubcommand", metavar="SUBCOMMAND", required=True
+    )
+
+    p_route_plan = route_sub.add_parser(
+        "plan", help="evaluate installed agents against a described task and "
+        "store the ranked advisory plan"
+    )
+    p_route_plan.add_argument("--task", default=None, metavar="T-…")
+    p_route_plan.add_argument("--project", default=None, metavar="SLUG")
+    p_route_plan.add_argument(
+        "--family", action="append", metavar="FAMILY",
+        help="required task family (repeatable)",
+    )
+    p_route_plan.add_argument(
+        "--capability", action="append", metavar="CAP",
+        help="required capability (repeatable)",
+    )
+    p_route_plan.add_argument(
+        "--evidence-kind", action="append", metavar="KIND",
+        help="required evidence kind (repeatable)",
+    )
+    p_route_plan.add_argument(
+        "--require-classification", default=None, metavar="LVL",
+        help="required data classification (set membership, never a ceiling)",
+    )
+    p_route_plan.add_argument(
+        "--require-autonomy", action="append", metavar="LVL",
+        help="an allowed autonomy value (repeatable; set membership, never a "
+        "rank or ceiling)",
+    )
+    p_route_plan.add_argument(
+        "--require-scope", default=None, choices=("global", "project"),
+    )
+    p_route_plan.add_argument(
+        "--require-class", default=None, metavar="CLASS",
+    )
+    p_route_plan.add_argument(
+        "--skill", action="append", metavar="SKILL",
+        help="required skill declaration (repeatable)",
+    )
+    p_route_plan.add_argument(
+        "--tool", action="append", metavar="TOOL",
+        help="required tool declaration (repeatable)",
+    )
+    p_route_plan.add_argument(
+        "--min-context-tokens", type=int, default=None, metavar="N",
+    )
+    p_route_plan.add_argument(
+        "--modality", action="append", metavar="MODALITY",
+        help="required model modality (repeatable)",
+    )
+    p_route_plan.add_argument(
+        "--prefer", default=None, metavar="NAME",
+        help="preferred agent (ordering only; never changes a verdict)",
+    )
+    p_route_plan.add_argument(
+        "--scope-preference", default="specific_first",
+        choices=("specific_first", "none"),
+    )
+    p_route_plan.add_argument(
+        "--surplus-policy", default="minimal", choices=("minimal", "ignore"),
+    )
+    p_route_plan.add_argument(
+        "--max-candidates", type=int, default=5, metavar="N",
+        help="display cap on printed eligible rows (storage keeps them all)",
+    )
+    p_route_plan.add_argument("--supersedes", default=None, metavar="RP-…")
+    p_route_plan.add_argument("--json", action="store_true")
+    p_route_plan.set_defaults(func=cmd_agent_route_plan)
+
+    p_route_list = route_sub.add_parser(
+        "list", help="routing plans, newest first"
+    )
+    p_route_list.add_argument("--task", default=None, metavar="T-…")
+    p_route_list.add_argument("--json", action="store_true")
+    p_route_list.set_defaults(func=cmd_agent_route_list)
+
+    p_route_show = route_sub.add_parser(
+        "show", help="one routing plan in full, with its staleness verdict"
+    )
+    p_route_show.add_argument("id", metavar="RP-0001")
+    p_route_show.add_argument(
+        "--request", action="store_true",
+        help="print the stored canonical request document instead",
+    )
+    p_route_show.add_argument("--json", action="store_true")
+    p_route_show.set_defaults(func=cmd_agent_route_show)
+
+    p_route_verify = route_sub.add_parser(
+        "verify", help="recompute a plan's hashes, chain, pins and staleness"
+    )
+    p_route_verify.add_argument("id", metavar="RP-0001")
+    p_route_verify.add_argument("--json", action="store_true")
+    p_route_verify.set_defaults(func=cmd_agent_route_verify)
+
+    # U-A3 governed handoffs. Seven leaves, distinct from the legacy
+    # top-level handoff command (different path tuples; the legacy parser
+    # below stays byte-identical). `create` and the four lifecycle verbs are
+    # authoritative human declarations; `list`/`show` are read-only. No
+    # `supersede`, `complete` or `verify` leaf exists: supersession is
+    # expressed only as `create --supersedes`, `show` carries the integrity
+    # verdict, and nothing here executes, schedules or completes work.
+    p_agent_handoff = agent_sub.add_parser(
+        "handoff", help="governed delegation declarations between agent "
+        "identities (records human decisions; never executes or completes "
+        "a task)"
+    )
+    agent_handoff_sub = p_agent_handoff.add_subparsers(
+        dest="subsubcommand", metavar="SUBCOMMAND", required=True
+    )
+
+    p_agent_handoff_create = agent_handoff_sub.add_parser(
+        "create", help="declare a governed handoff (created as proposed; "
+        "supersession only via --supersedes)"
+    )
+    p_agent_handoff_create.add_argument(
+        "--task", required=True, metavar="T-0001"
+    )
+    p_agent_handoff_create.add_argument(
+        "--from", dest="from_agent", required=True, metavar="NAME"
+    )
+    p_agent_handoff_create.add_argument("--to", required=True, metavar="NAME")
+    p_agent_handoff_create.add_argument(
+        "--objective", required=True, metavar="TEXT"
+    )
+    p_agent_handoff_create.add_argument(
+        "--plan", default=None, metavar="RP-0001",
+        help="advisory routing plan reference (recipient must be one of its "
+        "eligible candidates)",
+    )
+    p_agent_handoff_create.add_argument(
+        "--expect-evidence", dest="expect_evidence", action="append",
+        metavar="KIND", help="expected evidence kind (repeatable)",
+    )
+    p_agent_handoff_create.add_argument(
+        "--min-evidence", dest="min_evidence", type=int, default=0,
+        metavar="N",
+    )
+    p_agent_handoff_create.add_argument(
+        "--constraints", default=None, metavar="TEXT"
+    )
+    p_agent_handoff_create.add_argument(
+        "--classification", default="internal", metavar="LVL",
+        help="declared classification of the data involved (default: "
+        "internal; a declaration, never a clearance)",
+    )
+    p_agent_handoff_create.add_argument(
+        "--decision", default=None, metavar="D-0001",
+        help="rationale reference to a decision record (descriptive only)",
+    )
+    p_agent_handoff_create.add_argument(
+        "--supersedes", default=None, metavar="AH-0001"
+    )
+    p_agent_handoff_create.add_argument("--json", action="store_true")
+    p_agent_handoff_create.set_defaults(func=cmd_agent_handoff_create)
+
+    p_agent_handoff_list = agent_handoff_sub.add_parser(
+        "list", help="governed handoffs, newest first (restricted rows show "
+        "placeholder prose)"
+    )
+    p_agent_handoff_list.add_argument("--task", default=None, metavar="T-0001")
+    p_agent_handoff_list.add_argument(
+        "--state", default=None, choices=list(AGENT_HANDOFF_STATES)
+    )
+    p_agent_handoff_list.add_argument("--json", action="store_true")
+    p_agent_handoff_list.set_defaults(func=cmd_agent_handoff_list)
+
+    p_agent_handoff_show = agent_handoff_sub.add_parser(
+        "show", help="one governed handoff in full: record, transition "
+        "history and integrity verdict"
+    )
+    p_agent_handoff_show.add_argument("id", metavar="AH-0001")
+    p_agent_handoff_show.add_argument("--json", action="store_true")
+    p_agent_handoff_show.set_defaults(func=cmd_agent_handoff_show)
+
+    p_agent_handoff_accept = agent_handoff_sub.add_parser(
+        "accept", help="record the human's acceptance decision for the "
+        "recipient identity (executes nothing; not completion)"
+    )
+    p_agent_handoff_accept.add_argument("id", metavar="AH-0001")
+    p_agent_handoff_accept.add_argument("--note", default=None, metavar="TEXT")
+    p_agent_handoff_accept.add_argument("--json", action="store_true")
+    p_agent_handoff_accept.set_defaults(func=cmd_agent_handoff_accept)
+
+    p_agent_handoff_refuse = agent_handoff_sub.add_parser(
+        "refuse", help="record a refusal with a closed reason code"
+    )
+    p_agent_handoff_refuse.add_argument("id", metavar="AH-0001")
+    p_agent_handoff_refuse.add_argument(
+        "--reason", required=True, metavar="CODE"
+    )
+    p_agent_handoff_refuse.add_argument("--note", default=None, metavar="TEXT")
+    p_agent_handoff_refuse.set_defaults(func=cmd_agent_handoff_refuse)
+
+    p_agent_handoff_clarify = agent_handoff_sub.add_parser(
+        "clarify", help="record that the proposal needs operator "
+        "clarification, with a closed reason code"
+    )
+    p_agent_handoff_clarify.add_argument("id", metavar="AH-0001")
+    p_agent_handoff_clarify.add_argument(
+        "--reason", required=True, metavar="CODE"
+    )
+    p_agent_handoff_clarify.add_argument(
+        "--note", default=None, metavar="TEXT"
+    )
+    p_agent_handoff_clarify.set_defaults(func=cmd_agent_handoff_clarify)
+
+    p_agent_handoff_cancel = agent_handoff_sub.add_parser(
+        "cancel", help="record that the human withdrew the delegation"
+    )
+    p_agent_handoff_cancel.add_argument("id", metavar="AH-0001")
+    p_agent_handoff_cancel.add_argument(
+        "--note", default=None, metavar="TEXT"
+    )
+    p_agent_handoff_cancel.set_defaults(func=cmd_agent_handoff_cancel)
 
     p_ingest = sub.add_parser("ingest", help="ingest agent write-back artifacts")
     ingest_sub = p_ingest.add_subparsers(

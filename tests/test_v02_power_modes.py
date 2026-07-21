@@ -719,6 +719,26 @@ class RecoveryTests(PowerCase):
         # U-A2's only catalog writer: identity + passport rows, pointers,
         # hashes and an event in one transaction.
         (("agent", "catalog", "install"), ("agent", "catalog", "install", "--all")),
+        # U-A3's only routing writer: a plan row, its candidate rows, their
+        # hashes and one audit event in one transaction. The three read-only
+        # route leaves stay available in recovery and are NOT listed here.
+        (("agent", "route", "plan"), ("agent", "route", "plan")),
+        # U-A3's five governed-handoff writers: each writes a handoff and/or
+        # transition row, its hashes and one audit event in one transaction.
+        # The two read-only handoff leaves (list/show) stay available in
+        # recovery and are NOT listed here.
+        (("agent", "handoff", "create"),
+         ("agent", "handoff", "create", "--task", "T-0002", "--from", "a",
+          "--to", "b", "--objective", "o")),
+        (("agent", "handoff", "accept"),
+         ("agent", "handoff", "accept", "AH-0001")),
+        (("agent", "handoff", "refuse"),
+         ("agent", "handoff", "refuse", "AH-0001", "--reason", "out_of_scope")),
+        (("agent", "handoff", "clarify"),
+         ("agent", "handoff", "clarify", "AH-0001", "--reason",
+          "objective_unclear")),
+        (("agent", "handoff", "cancel"),
+         ("agent", "handoff", "cancel", "AH-0001")),
         (("ingest", "dropfile"), ("ingest", "dropfile", "SELF")),
         (("done",), ("done", "T-0002", "--no-evidence", "--reason", "because")),
         (("pack", "build"), ("pack", "build", "T-0002")),
@@ -951,16 +971,17 @@ class DoctorIntegrationTests(PowerCase):
         self.assertNotIn('{"version"', line)
         self.assertNotIn(str(self.aos_dir), line)
 
-    def test_doctor_check_count_is_thirty_seven(self):
-        """(25) 20 → 21 → 25 → 30 → 31 → 34 → 37: the mandated power check
-        joined the set at U-E2, then U-M2's four memory-claim checks, then
-        U-M3's five memory-graph checks, then U-M5's one retrieval-benchmark
-        registry check, then U-A1's three agent-registry checks, then
-        U-A2's three built-in catalog checks (the D-W8.1 pattern — the pin
-        moves UP with a mandated new check; fixture never installs the
-        catalog, so all three stay [PASS])."""
+    def test_doctor_check_count_is_forty_one(self):
+        """(25) 20 → 21 → 25 → 30 → 31 → 34 → 37 → 41: the mandated power
+        check joined the set at U-E2, then U-M2's four memory-claim checks,
+        then U-M3's five memory-graph checks, then U-M5's one
+        retrieval-benchmark registry check, then U-A1's three agent-registry
+        checks, then U-A2's three built-in catalog checks, then U-A3's four
+        routing/handoff checks (the D-W8.1 pattern — the pin moves UP with a
+        mandated new check; fixture never installs the catalog, so all three
+        stay [PASS])."""
         out = self.aos("doctor")
-        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 37)
+        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 41)
 
     def test_doctor_still_passes_cleanly_on_the_baseline_fixture(self):
         """(25) The new checks do not disturb the ones already there."""
@@ -1356,7 +1377,7 @@ class ExclusionTests(PowerCase):
         """(25) U-E2 changed no schema, and must not. U-M2 owns the version:
         this pins that power modes follow it rather than declaring their own.
         """
-        self.assertEqual(db.SCHEMA_VERSION, "4")
+        self.assertEqual(db.SCHEMA_VERSION, "5")
         self.assertEqual(migrations.LATEST_VERSION, int(db.SCHEMA_VERSION))
 
     def test_power_state_lives_beside_the_ledger_not_inside_it(self):

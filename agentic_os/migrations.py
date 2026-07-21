@@ -9,7 +9,10 @@ U-M2 (agentic-os-v0.3-u-m2-memory-claims-contract.md) added the first
 production migration: 1 → 2, `u-m2-memory-claims-v2`. U-M3
 (agentic-os-v0.3-u-m3-memory-graph-contract.md) added the second: 2 → 3,
 `u-m3-memory-graph-v3`. U-A1 adds the third: 3 → 4,
-`u-a1-agent-passports-v4`. Each supplies a step body and nothing else; every
+`u-a1-agent-passports-v4`. U-A3
+(agentic-os-v0.4-u-a3-routing-handoffs-contract.md) adds the fourth: 4 → 5,
+`u-a3-routing-handoffs-v5`, purely additive — four empty tables, no existing
+row read or touched. Each supplies a step body and nothing else; every
 guarantee around them (validate, lock, re-read, snapshot, verify at the
 starting version, then mutate) is U-M1's, unchanged.
 
@@ -508,7 +511,47 @@ AGENT_PASSPORTS_V4 = Migration(
     apply=_agent_passports_v4,
 )
 
-#: The canonical production registry: exactly three steps, 1 → 2 → 3 → 4, in
+
+# ---------------------------------------------------------------------------
+# Production migration 4 → 5: governed routing and handoffs (U-A3)
+
+def _routing_handoffs_v5(conn: sqlite3.Connection) -> None:
+    """Create the four U-A3 tables EMPTY. Purely additive.
+
+    No existing table is read, rebuilt, renamed or re-stamped; no row is
+    carried, parsed or invented (there are no legacy routing facts, so there
+    is nothing to fabricate); NO CLOCK IS READ, because no row is stamped.
+    Built from the same db.py constants a fresh v5 init uses (the D-v0.3.42
+    shared-DDL rule, applied a fourth time), created in FK-parent-first order
+    (plans → candidates → handoffs → transitions) under their real names — so
+    there is no temp-table rename, and a migrated schema is BYTE-identical to a
+    fresh one, not merely structurally identical.
+
+    This step does NOT freeze the historical 3→4 agent DDL: U-A3 changes
+    neither db.AGENTS_DDL, db.AGENT_PASSPORTS_DDL, nor
+    passports.agent_identity_payload, so the live constants the 3→4 step builds
+    from are still the genuine v4 constants and no drift materializes. The
+    freeze obligation transfers, guarded by a test, to the first future unit
+    that edits any of the three (D-v0.4.29).
+
+    Runs inside U-M1's already-open transaction: no COMMIT, no ROLLBACK, no
+    touching meta.schema_version — all three belong to apply_migrations. The
+    framework's foreign_keys=OFF + whole-database foreign_key_check is what
+    makes the four tables' mutual and outward foreign keys legal inside one
+    step; four empty tables contribute zero violations.
+    """
+    for table, ddl in db.ROUTING_HANDOFF_TABLES:
+        conn.execute(ddl.format(table=table))
+
+
+ROUTING_HANDOFFS_V5 = Migration(
+    from_version=4,
+    to_version=5,
+    migration_id="u-a3-routing-handoffs-v5",
+    apply=_routing_handoffs_v5,
+)
+
+#: The canonical production registry: exactly four steps, 1 → 2 → 3 → 4 → 5, in
 #: order. Never populated by importing arbitrary files or by evaluating names
 #: read from the database — a literal tuple in source is the whole discovery
 #: mechanism.
@@ -516,6 +559,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     MEMORY_CLAIMS_V2,
     MEMORY_GRAPH_V3,
     AGENT_PASSPORTS_V4,
+    ROUTING_HANDOFFS_V5,
 )
 
 

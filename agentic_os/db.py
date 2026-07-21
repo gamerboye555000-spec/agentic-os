@@ -4,7 +4,7 @@ transaction helper that carries the domain-row + event-row invariant.
 Rules honored here:
 - WAL journal mode set at init.
 - PRAGMA foreign_keys=ON on EVERY connection; busy_timeout >= 3000ms.
-- meta.schema_version = "4" at init; a different version is a hard stop.
+- meta.schema_version = "5" at init; a different version is a hard stop.
   Normal commands NEVER auto-migrate: an older database is refused here and
   the human is pointed at `migrate status/plan/apply` (U-M2 M2.5; U-M3 M3.1).
 """
@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .utils import DB_FILENAME, AosError
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 
 #: The v3 memory claim (U-M2 M2.2; U-M3 M3.2). The table name is parameterized
 #: for exactly one reason: the 1→2 and 2→3 migrations build the new table
@@ -230,6 +230,182 @@ AGENT_PASSPORTS_DDL = """CREATE TABLE {table}(
   FOREIGN KEY(agent_id) REFERENCES agents(id)
 )"""
 
+#: The v5 governed routing plan (U-A3). Post-commit immutable: the only UPDATE
+#: it ever receives is the hash finalization inside its own creating
+#: transaction, between INSERT and COMMIT. The table name is parameterized like
+#: every other DDL here — but the 4→5 migration creates it DIRECTLY under its
+#: real name (no temp-table rename), so a migrated schema is BYTE-identical to
+#: a fresh one, not merely structurally identical (D-v0.4.22).
+#:
+#: `content_sha256` has NO default, like every hashed record in this schema: a
+#: plan row without its integrity hash must be impossible to insert.
+#:
+#: The three result_status biconditional CHECKs pin the whole `(status,
+#: eligible_count, unresolved_count)` truth table (any two imply the third
+#: given the enum CHECK; all three are written independently, the
+#: MEMORY_EDGES_DDL precedent). `CHECK (supersedes_id IS NULL OR supersedes_id
+#: < id)` makes every supersession cycle unrepresentable, not merely
+#: self-supersession — a cycle needs a forward edge, and rowids strictly
+#: increase with no DELETE path (D-v0.4.27).
+ROUTING_PLANS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  task_id INTEGER,
+  project_id INTEGER,
+  scope TEXT NOT NULL CHECK (scope IN ('global','project')),
+  actor TEXT NOT NULL,
+  request_schema TEXT NOT NULL,
+  algorithm_version TEXT NOT NULL,
+  request_document TEXT NOT NULL,
+  request_sha256 TEXT NOT NULL,
+  result_status TEXT NOT NULL
+    CHECK (result_status IN
+      ('resolved','no_eligible_candidates','unresolved')),
+  eligible_count INTEGER NOT NULL CHECK (eligible_count >= 0),
+  unresolved_count INTEGER NOT NULL CHECK (unresolved_count >= 0),
+  excluded_count INTEGER NOT NULL CHECK (excluded_count >= 0),
+  supersedes_id INTEGER UNIQUE,
+  created_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  CHECK ((scope='global' AND project_id IS NULL)
+      OR (scope='project' AND project_id IS NOT NULL)),
+  CHECK ((result_status='resolved') = (eligible_count > 0)),
+  CHECK ((result_status='unresolved')
+       = (eligible_count = 0 AND unresolved_count > 0)),
+  CHECK ((result_status='no_eligible_candidates')
+       = (eligible_count = 0 AND unresolved_count = 0)),
+  CHECK (supersedes_id IS NULL OR supersedes_id < id),
+  FOREIGN KEY(task_id) REFERENCES tasks(id),
+  FOREIGN KEY(project_id) REFERENCES projects(id),
+  FOREIGN KEY(supersedes_id) REFERENCES routing_plans(id)
+)"""
+
+#: One post-commit-immutable candidate row per evaluated agent (U-A3). The five
+#: `= (verdict='eligible')` biconditionals make rank, ordering_json and the
+#: three pins EXACTLY co-extensive with eligibility — a non-eligible row cannot
+#: carry pins, and an eligible one cannot lack them.
+#:
+#: The composite `FOREIGN KEY(agent_id, passport_version) REFERENCES
+#: agent_passports(agent_id, version)` (BLOCKER-1) pins an eligible candidate
+#: to a REAL immutable passport row — SQLite disables the composite FK when
+#: passport_version IS NULL, which is exactly what keeps excluded/unresolved
+#: rows (NULL pin) legal, the same NULL rule AGENTS_DDL relies on.
+#:
+#: `content_sha256` has NO default, like every hashed record here.
+ROUTING_PLAN_CANDIDATES_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  plan_id INTEGER NOT NULL,
+  agent_id INTEGER NOT NULL,
+  verdict TEXT NOT NULL CHECK (verdict IN ('eligible','unresolved','excluded')),
+  rank INTEGER CHECK (rank IS NULL OR rank >= 1),
+  passport_version INTEGER
+    CHECK (passport_version IS NULL OR passport_version >= 1),
+  passport_sha256 TEXT,
+  identity_sha256 TEXT,
+  reasons_json TEXT NOT NULL,
+  warnings_json TEXT NOT NULL,
+  ordering_json TEXT,
+  created_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  UNIQUE(plan_id, agent_id),
+  UNIQUE(plan_id, rank),
+  CHECK ((verdict='eligible') = (rank IS NOT NULL)),
+  CHECK ((verdict='eligible') = (ordering_json IS NOT NULL)),
+  CHECK ((verdict='eligible') = (passport_version IS NOT NULL)),
+  CHECK ((verdict='eligible') = (passport_sha256 IS NOT NULL)),
+  CHECK ((verdict='eligible') = (identity_sha256 IS NOT NULL)),
+  FOREIGN KEY(plan_id) REFERENCES routing_plans(id),
+  FOREIGN KEY(agent_id) REFERENCES agents(id),
+  FOREIGN KEY(agent_id, passport_version)
+    REFERENCES agent_passports(agent_id, version)
+)"""
+
+#: One row per delegation declaration (U-A3). Append-only transition history
+#: plus a mutable, hash-coupled current-state projection: `state`,
+#: `updated_at` and `content_sha256` are the only mutable columns, and they
+#: only ever move together with one transition row and one event, in one
+#: transaction. `decision_id` is a NON-authoritative rationale pointer to an
+#: ADR row — never an approval, never read to permit anything (D-v0.4.24).
+#:
+#: The two composite participant FKs pin each side to a real immutable passport
+#: row; `CHECK (from_agent_id <> to_agent_id)` forbids self-handoff; the
+#: supersession CHECK mirrors routing_plans' cycle guard (D-v0.4.27).
+#:
+#: `content_sha256` has NO default, like every hashed record here.
+AGENT_HANDOFFS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  task_id INTEGER NOT NULL,
+  plan_id INTEGER,
+  from_agent_id INTEGER NOT NULL,
+  to_agent_id INTEGER NOT NULL,
+  actor TEXT NOT NULL,
+  objective_md TEXT NOT NULL,
+  expected_evidence_json TEXT NOT NULL,
+  min_evidence_count INTEGER NOT NULL DEFAULT 0
+    CHECK (min_evidence_count BETWEEN 0 AND 32),
+  constraints_md TEXT,
+  data_classification TEXT NOT NULL DEFAULT 'internal'
+    CHECK (data_classification IN ('public','internal','confidential','restricted')),
+  decision_id INTEGER,
+  from_passport_version INTEGER NOT NULL CHECK (from_passport_version >= 1),
+  from_passport_sha256 TEXT NOT NULL,
+  to_passport_version INTEGER NOT NULL CHECK (to_passport_version >= 1),
+  to_passport_sha256 TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'proposed'
+    CHECK (state IN ('proposed','accepted','refused',
+                     'clarification_required','cancelled','superseded')),
+  supersedes_id INTEGER UNIQUE,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  CHECK (from_agent_id <> to_agent_id),
+  CHECK (supersedes_id IS NULL OR supersedes_id < id),
+  FOREIGN KEY(task_id) REFERENCES tasks(id),
+  FOREIGN KEY(plan_id) REFERENCES routing_plans(id),
+  FOREIGN KEY(from_agent_id) REFERENCES agents(id),
+  FOREIGN KEY(to_agent_id) REFERENCES agents(id),
+  FOREIGN KEY(decision_id) REFERENCES decisions(id),
+  FOREIGN KEY(supersedes_id) REFERENCES agent_handoffs(id),
+  FOREIGN KEY(from_agent_id, from_passport_version)
+    REFERENCES agent_passports(agent_id, version),
+  FOREIGN KEY(to_agent_id, to_passport_version)
+    REFERENCES agent_passports(agent_id, version)
+)"""
+
+#: The immutable, append-only transition rows behind a handoff's mutable
+#: current-state projection (U-A3). `UNIQUE(handoff_id, seq)` makes the
+#: sequence total; the from/to-state enums and the reason enum are closed here
+#: AND in models.py. Three CHECKs pin domain rules storage-side: from_state <>
+#: to_state (no self-edge); accepted may only advance to cancelled/superseded
+#: (D-v0.4.26 MAJOR-3); refused/clarification_required require a reason_code.
+#:
+#: `content_sha256` has NO default, like every hashed record here.
+AGENT_HANDOFF_TRANSITIONS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  handoff_id INTEGER NOT NULL,
+  seq INTEGER NOT NULL CHECK (seq >= 1),
+  from_state TEXT NOT NULL
+    CHECK (from_state IN ('proposed','accepted','clarification_required')),
+  to_state TEXT NOT NULL
+    CHECK (to_state IN ('accepted','refused','clarification_required',
+                        'cancelled','superseded')),
+  actor TEXT NOT NULL,
+  reason_code TEXT
+    CHECK (reason_code IS NULL OR reason_code IN
+      ('out_of_scope','missing_capability','conflicting_work',
+       'data_classification','objective_unclear','constraints_unclear',
+       'evidence_unclear','operator_judgment')),
+  note_md TEXT,
+  created_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  UNIQUE(handoff_id, seq),
+  CHECK (from_state <> to_state),
+  CHECK (from_state <> 'accepted'
+      OR to_state IN ('cancelled','superseded')),
+  CHECK (to_state NOT IN ('refused','clarification_required')
+      OR reason_code IS NOT NULL),
+  FOREIGN KEY(handoff_id) REFERENCES agent_handoffs(id)
+)"""
+
 MEMORY_TABLE = "memory"
 MEMORY_EVIDENCE_TABLE = "memory_evidence"
 MEMORY_SOURCES_TABLE = "memory_sources"
@@ -237,6 +413,10 @@ MEMORY_SOURCE_LINKS_TABLE = "memory_source_links"
 MEMORY_EDGES_TABLE = "memory_edges"
 AGENTS_TABLE = "agents"
 AGENT_PASSPORTS_TABLE = "agent_passports"
+ROUTING_PLANS_TABLE = "routing_plans"
+ROUTING_PLAN_CANDIDATES_TABLE = "routing_plan_candidates"
+AGENT_HANDOFFS_TABLE = "agent_handoffs"
+AGENT_HANDOFF_TRANSITIONS_TABLE = "agent_handoff_transitions"
 
 #: The three tables U-M3 adds, paired with their DDL. The 2→3 migration
 #: iterates this rather than repeating the CREATEs, so a fresh v3 schema and a
@@ -245,6 +425,18 @@ MEMORY_GRAPH_TABLES: tuple[tuple[str, str], ...] = (
     (MEMORY_SOURCES_TABLE, MEMORY_SOURCES_DDL),
     (MEMORY_SOURCE_LINKS_TABLE, MEMORY_SOURCE_LINKS_DDL),
     (MEMORY_EDGES_TABLE, MEMORY_EDGES_DDL),
+)
+
+#: The four tables U-A3 adds, paired with their DDL, in FK-parent-first order:
+#: plans → candidates → handoffs → transitions. The 4→5 migration iterates this
+#: rather than repeating the CREATEs, so a fresh v5 schema and a migrated one
+#: cannot carry different routing tables — the MEMORY_GRAPH_TABLES shape,
+#: applied a second time (D-v0.4.22).
+ROUTING_HANDOFF_TABLES: tuple[tuple[str, str], ...] = (
+    (ROUTING_PLANS_TABLE, ROUTING_PLANS_DDL),
+    (ROUTING_PLAN_CANDIDATES_TABLE, ROUTING_PLAN_CANDIDATES_DDL),
+    (AGENT_HANDOFFS_TABLE, AGENT_HANDOFFS_DDL),
+    (AGENT_HANDOFF_TRANSITIONS_TABLE, AGENT_HANDOFF_TRANSITIONS_DDL),
 )
 
 _SCHEMA_HEAD = """
@@ -361,10 +553,11 @@ CREATE TABLE IF NOT EXISTS packs(
 );
 """
 
-#: The canonical v4 schema. Composed rather than typed as one literal so the
+#: The canonical v5 schema. Composed rather than typed as one literal so the
 #: memory tables have exactly ONE definition in the codebase, shared with the
-#: 1→2 (M2.3) and 2→3 (M3.11) migrations — and so the agent tables have
-#: exactly one, shared with the 3→4 migration (U-A1).
+#: 1→2 (M2.3) and 2→3 (M3.11) migrations; the agent tables have exactly one,
+#: shared with the 3→4 migration (U-A1); and the four routing/handoff tables
+#: have exactly one, shared with the 4→5 migration (U-A3, D-v0.4.22).
 SCHEMA_SQL = (
     _SCHEMA_HEAD
     + MEMORY_CLAIM_DDL.format(table=MEMORY_TABLE)
@@ -380,6 +573,10 @@ SCHEMA_SQL = (
     + AGENTS_DDL.format(table=AGENTS_TABLE)
     + ";\n\n"
     + AGENT_PASSPORTS_DDL.format(table=AGENT_PASSPORTS_TABLE)
+    + ";\n\n"
+    + ";\n\n".join(
+        ddl.format(table=table) for table, ddl in ROUTING_HANDOFF_TABLES
+    )
     + ";\n"
 )
 

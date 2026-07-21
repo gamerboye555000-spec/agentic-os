@@ -171,6 +171,13 @@ def _install_v2_memory_schema(db_path: Path) -> None:
                     "v2 fixture: agents must be empty when the v2 schema is "
                     f"installed (found {agent_rows} rows)"
                 )
+            # U-A3: a "v2" workspace with the four routing/handoff tables would
+            # not be one, and the 4→5 step would fail on its CREATE when this
+            # fixture was migrated forward. Dropped children-first via the
+            # iterated db.ROUTING_HANDOFF_TABLES, so a fifth cannot be added
+            # without this fixture dropping it too.
+            for table, _ddl in reversed(db.ROUTING_HANDOFF_TABLES):
+                conn.execute(f"DROP TABLE {table}")
             # Reverse order: memory_source_links references memory_sources.
             for table, _ddl in reversed(db.MEMORY_GRAPH_TABLES):
                 conn.execute(f"DROP TABLE {table}")

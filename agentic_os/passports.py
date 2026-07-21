@@ -1101,10 +1101,15 @@ def transition_lifecycle(
     return get_agent(conn, name)
 
 
-#: (table label, SQL, param builder) — every place a historical TEXTUAL
-#: reference to an agent name can live. Discard is legal only when all are
+#: (table label, SQL, param builder) — every place a historical reference to
+#: an agent — textual or by id — can live. Discard is legal only when all are
 #: zero: a referenced identity is history, and history is archived or
-#: revoked, never deleted.
+#: revoked, never deleted. The `routing_plan_candidates` entry is name-joined
+#: (U-A3 §21, MINOR-6): that table keys agents by id, but the join makes it
+#: reachable through the existing name-only call signature (`lambda n: (n,)`)
+#: without changing it — so a draft agent that appears as an `excluded`
+#: candidate earns the normal historical-reference refusal instead of a raw
+#: foreign-key IntegrityError.
 _REFERENCE_QUERIES = (
     ("runs", "SELECT COUNT(*) FROM runs WHERE agent = ?", lambda n: (n,)),
     (
@@ -1121,6 +1126,12 @@ _REFERENCE_QUERIES = (
         "memory_sources",
         "SELECT COUNT(*) FROM memory_sources WHERE provenance = ?",
         lambda n: (f"agent:{n}",),
+    ),
+    (
+        "routing_plan_candidates",
+        "SELECT COUNT(*) FROM routing_plan_candidates c "
+        "JOIN agents a ON a.id = c.agent_id WHERE a.name = ?",
+        lambda n: (n,),
     ),
 )
 

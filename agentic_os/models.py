@@ -232,6 +232,124 @@ def validate_catalog_agent_name(name: str) -> str:
     return name
 
 
+# ---------------------------------------------------------------------------
+# U-A3 governed routing and handoff vocabulary. Closed here AND, where a rule
+# fits one, by a CHECK constraint in the schema (the U-M2 rule): neither a
+# careless caller nor a direct SQL writer can invent a status, verdict, reason
+# or state. Evaluation behavior lives in later waves; this is only the closed
+# vocabulary those waves are expressed in.
+
+#: The autonomy a passport DECLARES. This tuple is UNORDERED: its order is
+#: presentation only, matched by set membership, and there is deliberately NO
+#: rank function over it (contrast MEMORY_SENSITIVITIES + sensitivity_rank).
+#: Reading a ladder into it would invent an authority claim the passport never
+#: makes — "autonomy and escalation are declarations a future unit may read"
+#: (beast.agent-passport/v1). Set-equal to protocols.AGENT_AUTONOMY_LEVELS (the
+#: passport schema's own `autonomy` enum) by test; models cannot import
+#: protocols, so the two literals are pinned equal rather than shared
+#: (D-v0.4.23).
+AGENT_AUTONOMY_LEVELS = ("declare_only", "suggest", "supervised", "scoped")
+
+#: A routing plan's overall result. Closed here AND by a CHECK constraint plus
+#: three biconditional CHECKs over the candidate counts (db.ROUTING_PLANS_DDL):
+#: `resolved` iff eligible_count > 0; `unresolved` iff eligible_count = 0 AND
+#: unresolved_count > 0; `no_eligible_candidates` iff eligible_count = 0 AND
+#: unresolved_count = 0. `excluded_count` never participates (D-v0.4.25).
+ROUTING_RESULT_STATUSES = ("resolved", "no_eligible_candidates", "unresolved")
+
+#: A single candidate's verdict. Closed here AND by a CHECK; the five pin
+#: biconditionals in db.ROUTING_PLAN_CANDIDATES_DDL make rank/ordering/pins
+#: exactly co-extensive with `eligible`.
+ROUTING_CANDIDATE_VERDICTS = ("eligible", "unresolved", "excluded")
+
+#: Codes STORABLE in routing_plan_candidates.reasons_json / warnings_json.
+#: This order IS the canonical emission order. 24 codes — exactly the codes an
+#: EXISTING agent row can earn. Kept structurally separate from
+#: ROUTING_REQUEST_REFUSAL_CODES because the DDL makes them semantically
+#: separate: these name conditions a row earns, those name refusals meaning no
+#: row exists (§7). The two sets are disjoint, pinned by test (D-v0.4.31).
+ROUTING_REASON_CODES = (
+    # integrity (hard_ineligible)
+    "identity_tampered", "passport_history_tampered",
+    # lifecycle (hard_ineligible)
+    "draft_only", "suspended", "archived", "revoked",
+    "legacy_without_passport", "no_current_published_passport",
+    # scope / class (hard_ineligible)
+    "project_mismatch", "scope_mismatch", "agent_class_mismatch",
+    # declarations (hard_ineligible)
+    "data_classification_mismatch",          # incl. declaration ABSENT
+    "autonomy_mismatch",                     # membership only, never a rank
+    "missing_task_family", "missing_capability", "missing_evidence_kind",
+    "missing_skill_declaration", "missing_tool_declaration",
+    "missing_model_capability",
+    # malformation (unresolved)
+    "malformed_declaration", "unknown_declaration_value",
+    # preference (preference_only)
+    "preferred_agent_mismatch",
+    # advisory (warning_only)
+    "passport_expired", "catalog_upgrade_available",
+)
+
+#: REQUEST-level refusals. NEVER STORED. An absent agent and an uninstalled
+#: catalog entry have no `agents` row, and routing_plan_candidates.agent_id is
+#: NOT NULL with an FK to it — these are UNSTORABLE BY CONSTRUCTION, which is
+#: why they are not in ROUTING_REASON_CODES. They select which refusal message
+#: is printed and name the refusal under --json; no plan row is created and
+#: nothing is installed (D-v0.4.31).
+ROUTING_REQUEST_REFUSAL_CODES = ("agent_absent", "catalog_not_installed")
+
+#: Named constant — NOT doctor.UH2_DISPLAY_LIMIT (10). Text rendering truncates
+#: a candidate's reason list at this many codes with ` (+N more)`; --json
+#: carries all stored codes.
+ROUTING_REASON_DISPLAY_LIMIT = 8
+
+#: Plan creation refuses when the `agents` table holds more than this many rows
+#: — an actionable message, never a silent truncation of the explanation set.
+MAX_ROUTING_EVALUATED_AGENTS = 256
+
+#: A governed agent handoff's lifecycle. Closed here AND by a CHECK constraint
+#: in agent_handoffs (db.AGENT_HANDOFFS_DDL). There is deliberately NO
+#: `completed` value: completion asserts work was executed and verified, an
+#: execution-outcome fact U-A3 ships nothing to make honestly (D-v0.4.30).
+AGENT_HANDOFF_STATES = (
+    "proposed",
+    "accepted",
+    "refused",
+    "clarification_required",
+    "cancelled",
+    "superseded",
+)
+
+#: Keys are CLI verbs; values are (legal source states, target state) — the
+#: LIFECYCLE_TRANSITIONS idiom (passports.py). `refused`, `cancelled` and
+#: `superseded` appear in NO source set: all three are terminal, and the
+#: from_state CHECK in agent_handoff_transitions is what makes that structural.
+#: The complete legal edge set is 11 pairs; the other four over the two enums
+#: are storage-refused (D-v0.4.26). Ordering is presentation only — this is a
+#: membership map, consulted by key, never by position.
+AGENT_HANDOFF_TRANSITIONS: dict[str, tuple[tuple[str, ...], str]] = {
+    "accept":    (("proposed", "clarification_required"), "accepted"),
+    "refuse":    (("proposed", "clarification_required"), "refused"),
+    "clarify":   (("proposed",), "clarification_required"),
+    "cancel":    (("proposed", "clarification_required", "accepted"), "cancelled"),
+    "supersede": (("proposed", "clarification_required", "accepted"), "superseded"),
+}
+
+#: Why a handoff was refused or needs clarification. Closed here AND by a CHECK
+#: constraint; `refuse`/`clarify` require one, enforced storage-side by the
+#: reason-required CHECK in agent_handoff_transitions (D-v0.4.26).
+HANDOFF_REASON_CODES = (
+    "out_of_scope",
+    "missing_capability",
+    "conflicting_work",
+    "data_classification",
+    "objective_unclear",
+    "constraints_unclear",
+    "evidence_unclear",
+    "operator_judgment",
+)
+
+
 class _Row:
     @classmethod
     def from_row(cls, row: sqlite3.Row):
@@ -479,6 +597,108 @@ class AgentPassport(_Row):
     created_at: str
     published_at: str | None
     document: str
+    content_sha256: str
+
+
+@dataclass
+class RoutingPlan(_Row):
+    """One immutable routing evaluation record (U-A3).
+
+    `request_document` is the exact canonical request text and
+    `request_sha256` its digest; `content_sha256` is the ROW record hash.
+    A committed row is never updated or deleted.
+    """
+
+    id: int
+    task_id: int | None
+    project_id: int | None
+    scope: str
+    actor: str
+    request_schema: str
+    algorithm_version: str
+    request_document: str
+    request_sha256: str
+    result_status: str
+    eligible_count: int
+    unresolved_count: int
+    excluded_count: int
+    supersedes_id: int | None
+    created_at: str
+    content_sha256: str
+
+
+@dataclass
+class RoutingPlanCandidate(_Row):
+    """One immutable per-agent verdict row of a routing plan (U-A3).
+
+    rank, ordering_json and the three passport/identity pins are exactly
+    co-extensive with `verdict == "eligible"` — NULL on every other verdict.
+    """
+
+    id: int
+    plan_id: int
+    agent_id: int
+    verdict: str
+    rank: int | None
+    passport_version: int | None
+    passport_sha256: str | None
+    identity_sha256: str | None
+    reasons_json: str
+    warnings_json: str
+    ordering_json: str | None
+    created_at: str
+    content_sha256: str
+
+
+@dataclass
+class AgentHandoff(_Row):
+    """One delegation declaration (U-A3).
+
+    `state`, `updated_at` and `content_sha256` are the only mutable columns;
+    everything else is fixed at creation. `decision_id` is a non-authoritative
+    rationale pointer (D-v0.4.24).
+    """
+
+    id: int
+    task_id: int
+    plan_id: int | None
+    from_agent_id: int
+    to_agent_id: int
+    actor: str
+    objective_md: str
+    expected_evidence_json: str
+    min_evidence_count: int
+    constraints_md: str | None
+    data_classification: str
+    decision_id: int | None
+    from_passport_version: int
+    from_passport_sha256: str
+    to_passport_version: int
+    to_passport_sha256: str
+    state: str
+    supersedes_id: int | None
+    created_at: str
+    updated_at: str
+    content_sha256: str
+
+
+@dataclass
+class AgentHandoffTransition(_Row):
+    """One immutable, append-only handoff state transition (U-A3).
+
+    `seq` is total per handoff; `reason_code` is required when `to_state`
+    is refused or clarification_required, NULL otherwise permitted.
+    """
+
+    id: int
+    handoff_id: int
+    seq: int
+    from_state: str
+    to_state: str
+    actor: str
+    reason_code: str | None
+    note_md: str | None
+    created_at: str
     content_sha256: str
 
 

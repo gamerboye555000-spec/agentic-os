@@ -1,6 +1,8 @@
 """Human-facing IDs: T-0001 tasks, R-0001 runs, D-0001 decisions,
-E-0001 evidence, H-0001 handoffs, P-0001 packs, M-0001 memory, and the U-M3
-graph records — MS-0001 memory sources, ML-0001 source links, ME-0001 edges.
+E-0001 evidence, H-0001 handoffs, P-0001 packs, M-0001 memory, the U-M3
+graph records — MS-0001 memory sources, ML-0001 source links, ME-0001 edges —
+and the U-A3 governed routing/handoff records — RP-0001 routing plans,
+AH-0001 agent handoffs.
 
 Render: prefix + zero-padded integer, minimum width 4, growing naturally
 past 9999. Parse: strict — correct prefix for the command (case-insensitive),
@@ -28,6 +30,11 @@ PREFIXES = {
     "memory_source": "MS",
     "memory_source_link": "ML",
     "memory_edge": "ME",
+    # U-A3 governed routing/handoff records. Two letters, following the U-M3
+    # precedent; neither RP nor AH collides with any existing prefix, and the
+    # legacy free-text handoff keeps its distinct single-letter H.
+    "routing_plan": "RP",
+    "agent_handoff": "AH",
 }
 
 #: Upper bound for parsed ids (D-v0.2.2): SQLite INTEGER is a signed 64-bit
