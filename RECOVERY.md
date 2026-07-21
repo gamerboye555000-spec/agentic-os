@@ -397,6 +397,120 @@ healthy again. Every one of those fields is bound into the identity or
 passport hash; editing it without going through the governed write path is
 exactly the tamper doctor exists to catch.
 
+## Tampered routing plans or governed handoffs (U-A3)
+
+Routing plans (`routing_plans` + `routing_plan_candidates`) and governed
+handoffs (`agent_handoffs` + `agent_handoff_transitions`) follow the same
+posture as every other governed row here: **restore from a verified backup,
+never rewrite in place.** A committed plan is immutable; a handoff's only
+mutable surface is its current-state projection, and that moves only through an
+append-only transition. Neither has a repair path, on purpose.
+
+This drill applies when `doctor` FAILs on:
+
+```
+[FAIL] routing plans verify — RP-0001: <verdict>
+[FAIL] agent handoffs verify — AH-0001: <verdict>
+```
+
+or when `agent route verify` / `agent handoff show` report a closed integrity
+verdict — `malformed`, `mismatch`, `unhashable`, `pin_mismatch`,
+`request_mismatch`, `rank_gap`, `counts_incoherent`, or `reference_invalid`
+for a plan, or `malformed`, `mismatch`, `unhashable`, `chain_gap`,
+`chain_illegal`, `state_divergent`, `pin_mismatch`, `reason_missing`, or
+`supersession_incoherent` for a handoff. Each names the record and a closed
+verdict from a fixed vocabulary — never row content.
+
+### The drill
+
+```bash
+# 0. From the repo root. Stop running authoritative commands against the
+#    workspace.
+
+# 1. Enter recovery (works even while doctor is failing). The six U-A3 write
+#    leaves are now blocked before dispatch; the five read leaves still work:
+python3 aos.py power set recovery
+
+# 2. Inspect the damage. These reads never repair or mutate anything, so a
+#    tampered, stale, or superseded plan or handoff stays fully inspectable:
+python3 aos.py agent route list
+python3 aos.py agent route show RP-0001
+python3 aos.py agent route verify RP-0001
+python3 aos.py agent handoff list
+python3 aos.py agent handoff show AH-0001
+
+# 3. Write down the affected public RP-/AH- ids and their closed verdicts.
+#    Those ids and verdict names are the whole record of what was lost.
+
+# 4. Compare against a known-good backup or a trusted external record, then
+#    restore the ledger through the "Restore drill" above — move the damaged
+#    db aside, verify the backup, restore to the now-free live path:
+python3 aos.py backup verify .agentic-os/backups/aos-backup-<stamp>.db
+python3 aos.py backup restore .agentic-os/backups/aos-backup-<stamp>.db \
+    --to .agentic-os/aos.db
+
+# 5. Re-prove integrity after restoring:
+python3 aos.py doctor
+python3 aos.py agent route verify RP-0001     # only if that id still exists
+python3 aos.py agent handoff show AH-0001
+
+# 6. Leave recovery only once every hard doctor check passes:
+python3 aos.py power set standard
+```
+
+### There is no repair command — accepting documented loss
+
+There is **no** rehash, repin, or repair command for a plan or a handoff, and
+there is no way to "clear" a stale or superseded flag: staleness is derived at
+read time, never stored, so there is nothing stored to clear. Therefore:
+
+- **Do not** hand-edit `content_sha256`, a candidate rank, a transition `seq`,
+  a handoff `state`, a pinned passport version or digest, or any
+  `supersedes_id` / `plan_id` / task reference to make `doctor` pass. Editing a
+  bound field does not repair the record — it destroys the only evidence the
+  record was altered, and every write against it still refuses (the
+  no-laundering gate).
+- **Do not** delete an individual `routing_plans`, `routing_plan_candidates`,
+  `agent_handoffs`, or `agent_handoff_transitions` row to silence a check. A
+  governed row's history is either intact or it is not; a partial deletion is a
+  guess wearing a fact's clothes.
+
+If no verified backup preserves the record, the only honest option is to
+**accept the documented loss**: use the restore drill above (or a clean
+workspace) to reach a verified-good ledger, record the lost RP-/AH- ids
+externally — a decision note, an issue, a run log — and recreate any future
+routing plan or handoff through the normal governed commands (`agent route
+plan`, `agent handoff create`). Historical integrity cannot be reconstructed by
+guessing: a plan's ranked candidate chain and a handoff's transition chain each
+bind their own hashes, and no after-the-fact input reproduces them.
+
+### What recovery keeps available
+
+- The six U-A3 authoritative writes — `route plan`, `handoff create`, `accept`,
+  `refuse`, `clarify`, `cancel` — are blocked **before dispatch**: stdout stays
+  empty and no mutation is reachable while the ledger is in recovery.
+- `route list` / `route show` / `route verify` and `handoff list` /
+  `handoff show` remain available — inspecting a malformed, stale, or tampered
+  plan or handoff is exactly what recovery is for.
+- Those reads change nothing. A damaged record stays inspectable; nothing
+  recomputes a hash over it, and nothing repairs it.
+
+### Reporting privately
+
+The ids and verdicts are safe to share; the content is not. When you open a
+public issue, **do not paste**:
+
+- objectives, constraints, or transition notes;
+- stored request documents;
+- full hashes;
+- the database file or a backup of it;
+- credentials or any secret-shaped value.
+
+Report only the public **RP-/AH- ids**, the **doctor check name** (`routing
+plans verify` or `agent handoffs verify`), and the **closed verdict code**
+(`malformed`, `pin_mismatch`, `chain_illegal`, and so on). Share anything more
+only through a secure support channel that genuinely needs it.
+
 ## Restoring somewhere else (inspection copy)
 
 `restore` writes to any path that does not exist yet, so you can open a

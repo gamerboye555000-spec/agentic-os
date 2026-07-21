@@ -1713,3 +1713,110 @@ If the build succeeds but an older `.pyz` is the one you are running, that
 the passport paths the manifest's entries reference, so an unreferenced or
 stray file (including a stray `credentials.json`) is excluded by
 construction, never by name.
+
+## Governed agent routing and handoffs (U-A3)
+
+### "Routing plan RP-0001 is stale: agent '…' has changed since the plan was created" / "… has been superseded by RP-0002; a superseded plan cannot back a handoff"
+
+`agent handoff create --plan RP-0001` refuses because the referenced routing
+plan can no longer honestly back a new delegation. The plan itself is an
+**immutable historical record** and nothing about it was changed — what moved
+is the world around it:
+
+- an eligible candidate's participant lifecycle, identity, or pinned passport
+  version/digest no longer matches what the plan pinned at creation, so the plan
+  is **stale**; or
+- a successor plan was created with `--supersedes RP-0001`, so the plan is
+  **superseded**.
+
+Staleness is a **derived, read-time predicate**, not a stored flag — there is
+nothing to "clear". A superseded plan stays inspectable but must never back a
+new handoff. Resolve it by re-planning against the current ledger, using only
+supported commands:
+
+```bash
+# 1. Inspect the plan and confirm why it no longer applies (read-only):
+python aos.py agent route show RP-0001
+python aos.py agent route verify RP-0001
+
+# 2. Inspect the task and the current participant / passport state:
+python aos.py agent show NAME
+python aos.py agent passport history NAME
+
+# 3. Create a fresh plan for the current ledger state. The input is the task,
+#    not the old plan, so a fresh independent plan — with no --supersedes at
+#    all — is always valid:
+python aos.py agent route plan --task T-0001
+
+#    Optionally record the new plan as a stale predecessor's successor. This is
+#    never required, and is only ever legal against a plan that has no successor
+#    yet:
+#      - RP-0001 is stale but NOT already superseded — you may link the chain by
+#        adding --supersedes RP-0001:
+python aos.py agent route plan --task T-0001 --supersedes RP-0001
+#      - RP-0001 is ALREADY superseded — do not target RP-0001 again; a plan
+#        that already has a successor cannot be superseded a second time. The
+#        refusal names the successor that replaced it (such as RP-0002).
+#        Preserve the chain only by pointing --supersedes at that current tip,
+#        and only while the tip itself still has no successor; otherwise omit
+#        --supersedes and let this stand as a fresh independent plan.
+
+# 4. Read the new plan, pick a currently eligible recipient (your decision),
+#    and create the handoff against the NEW plan id:
+python aos.py agent route show RP-0002
+python aos.py agent handoff create --task T-0001 --from NAME --to NAME \
+    --objective "…" --plan RP-0002
+```
+
+Do **not** edit the old plan, clear a stale or superseded state by hand, or try
+to bypass the refusal. The old plan is historical evidence, and a fresh plan is
+the whole remedy — the refusal never means routing "chose" or "launched"
+anything, only that this record is no longer a truthful basis for a new
+declaration.
+
+### "Cannot accept handoff AH-0001: participant '…' changed since the handoff was created (pinned v2, now v3)"
+
+`agent handoff accept` refuses because the **current-pin gate** ran: accept
+requires both participants to still exist, be active, be integrity- and
+history-clean, and carry the exact passport version and recomputed document
+digest that were **pinned when the handoff was proposed**. A passport
+publication, or an identity/integrity change, on either participant since
+creation makes the original proposal stale, and the gate blocks it. (The
+digest-only variant reads `participant '…' pinned passport has changed`.)
+
+This is a protection, not a provider or tool execution error — nothing was
+executed and nothing was changed. It stops you from recording acceptance
+against participant metadata that has since moved. `refuse`, `clarify`, and
+`cancel` deliberately skip this gate, so a moved handoff can always still be
+closed.
+
+The old pins are **immutable historical evidence** — you do not repin them.
+Re-create the delegation against the current passports, using only supported
+commands:
+
+```bash
+# 1. Inspect the handoff and its transition history (read-only):
+python aos.py agent handoff show AH-0001
+
+# 2. Inspect the current participant / passport state to see what moved:
+python aos.py agent show NAME
+python aos.py agent passport history NAME
+
+# 3a. Supersede the old declaration with a fresh one that pins the CURRENT
+#     passports — one governed transaction closes AH-0001 as `superseded` and
+#     opens the successor:
+python aos.py agent handoff create --task T-0001 --from NAME --to NAME \
+    --objective "…" --supersedes AH-0001
+#     — or —
+# 3b. Cancel the old declaration, then create a fresh one:
+python aos.py agent handoff cancel AH-0001
+python aos.py agent handoff create --task T-0001 --from NAME --to NAME --objective "…"
+
+# 4. Accept the fresh handoff only after reviewing it. Acceptance still executes
+#    and completes nothing — it records your decision for the recipient identity:
+python aos.py agent handoff accept AH-0002
+```
+
+Never hand-edit a pinned passport version or digest in storage to make accept
+pass: the pin is a bound field of the handoff hash, so editing it destroys the
+evidence that the record moved while leaving every write against it refusing.
