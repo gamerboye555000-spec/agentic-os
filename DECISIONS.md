@@ -1,3 +1,256 @@
+# DECISIONS — Agentic OS v0.4 U-P2 continuous integration and protected delivery gate
+
+This section continues the `D-v0.4.*` series for the U-P2 Wave 0
+contract-freeze pass: freezing the delivery-gate architecture of
+`agentic-os-v0.4-u-p2-delivery-gate-contract.md` on branch
+`v0.4-u-p2-delivery-gate` (2026-07-22), from baseline
+`ef66fd4297491a5856b6d2602da8e3994e5359bd`. All mutable facts below were
+resolved from primary sources on 2026-07-22 and cross-checked against two
+independent signals; none were frozen from memory. Prepended per the
+established precedent (D-W0.4, reaffirmed in D-v0.2.7, D-v0.4.4); everything
+below stays byte-identical.
+
+## D-v0.4 decisions (U-P2, Wave 0 contract freeze)
+
+- **D-v0.4.33 — U-P2 is a new unit that closes U-P1's explicitly deferred
+  delivery gap.** The U-P1 contract's scope section reads, verbatim: "Out of
+  scope (explicitly not done in this pass): CI, release publishing, branch
+  protection, …". U-P2 closes CI and branch protection; release publishing
+  stays excluded (no PyPI, no GitHub Release, no signing, no SBOM, no
+  containers, no auto-tagging). U-P1 remains a historically correct,
+  unmodified record. Rejected: amending U-P1 (frozen contracts are immutable
+  history); starting U-A4 first — `agentic_os/protocols.py:1005` records
+  that passport skill/tool requirement resolvers are deferred to U-K1/U-T1,
+  so U-A4 would build on contracts that do not exist. The dependency-safe
+  sequence after U-P2 is U-K1/U-T1 (either order) → U-W1 → U-A4.
+  **Non-goal**: no runtime, schema, protocol, CLI, power, or doctor change —
+  the doctor count (41), test count (2,275) and schema version (5) verified
+  at baseline must be identical after U-P2.
+
+- **D-v0.4.34 — Four stable public check identities, with an explicit job
+  id / job name split.** The frozen required-check names are
+  `workflow-integrity`, `tests-python-3.12`, `tests-python-3.14`,
+  `distribution-smoke-python-3.12`. GitHub job ids cannot contain `.`
+  (alphanumerics, `-`, `_` only), so the dotted public names are carried by
+  the jobs' `name:` values — which is what required-status-check rules match
+  — while the ids use hyphens (`tests-python-3-12`, …). Once the ruleset
+  depends on these names, any rename is a governed migration touching
+  ruleset, workflow, verifier and docs in one reviewed change. Rejected: a
+  Python-version job matrix (renders `tests (3.12)`-style names, surrendering
+  the frozen identities); `needs:` chaining (a failed early job leaves later
+  required checks skipped rather than independently reported — four
+  independent jobs report four independent truths on every run).
+
+- **D-v0.4.35 — Least-privilege workflow law.** Exactly one top-level
+  `permissions: contents: read` block; job-level `permissions:` blocks are
+  forbidden entirely (an elevation is a violation, and a "redundant
+  read-only" block is shape noise the verifier would have to special-case —
+  both are refused). No secret contexts, no `pull_request_target` in any
+  form, `persist-credentials: false` on every checkout, no artifact
+  upload/download, no `continue-on-error`, no `curl`/`wget`, no `sudo`, no
+  repository writes, no branch/tag commands. This is least-privilege, not
+  isolation: no repository secrets are exposed to jobs; the workflow
+  receives a read-only `GITHUB_TOKEN`; `persist-credentials: false` keeps
+  that token out of on-disk Git configuration; the token is not explicitly
+  passed to test shell steps; the pinned actions may internally receive the
+  read-only token where they require it. GitHub-hosted runners retain
+  outbound network access and U-P2 provides no egress sandbox, so the
+  `curl`/`wget` ban is canonical workflow-shape hygiene, not a network
+  isolation control — untrusted PR code can transmit anything it can read
+  from the runner, and no artifact-upload action is configured. Stating
+  these limits honestly does not weaken the least-privilege law.
+
+- **D-v0.4.36 — Immutable two-entry action allowlist with frozen full-SHA
+  pins.** Every `uses:` reference must be one of exactly:
+  `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1` (v7.0.1,
+  published 2026-07-20) and
+  `actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97` (v7.0.0,
+  published 2026-07-20). Release names may appear in comments only; `@vN`,
+  `@main`, and release-tag refs are forbidden in the executable field.
+  Provenance: each tag→SHA mapping was resolved on 2026-07-22 via two
+  independent primary-source signals in agreement — `git ls-remote` against
+  the official repository and the GitHub REST `git/ref/tags/…` object —
+  with release identity from the official releases endpoint. Wave 1
+  re-resolves both mappings before writing `ci.yml`; any mismatch is a stop
+  condition (possible tag retarget), never a silent update. checkout v7's
+  headline change (blocking fork-PR checkout under `pull_request_target`) is
+  hardening that cannot affect a workflow where `pull_request_target` is
+  banned outright.
+
+- **D-v0.4.37 — Interpreter matrix: 3.12 floor plus 3.14 current stable
+  line; lines frozen, patches logged.** Resolved 2026-07-22 from two official
+  sources in agreement: python.org/downloads (latest stable 3.14.6,
+  2026-06-10) and devguide.python.org/versions (3.14 status `bugfix`; 3.15
+  `prerelease` due 2026-10-01; 3.12 `security`). `setup-python` receives the
+  feature-line strings `"3.12"` and `"3.14"`; every job prints `python3 -VV`
+  so the exact resolved patch is recorded per run. Rejected: pinning exact
+  patch versions (CI would test a stale patch instead of the line users
+  install, and patch churn would require constant governed edits); adding
+  3.13 (neither the floor nor the current stable line). Python 3.15 adoption
+  after its stable release is a future governed change.
+
+- **D-v0.4.38 — Exact-pinned CI-only build tools, build isolation disabled,
+  yanked release refused.** The distribution-smoke job installs exactly
+  `pip==26.1.2`, `build==1.5.0`, `setuptools==83.0.0`, `packaging==26.2`,
+  `pyproject_hooks==1.2.0`, then logs `pip freeze`, then builds with
+  `python -m build --wheel --no-isolation` so the exact-pinned backend is
+  the one that builds (isolation would re-resolve setuptools from the
+  network at build time — precisely the drift this unit exists to prevent).
+  The cross-check rule earned its keep immediately: pypa/build's newest
+  GitHub release is 1.5.1 (2026-07-09), but 1.5.1 **is yanked on PyPI**, so
+  1.5.0 — the newest non-yanked release — is frozen instead; pinning a
+  yanked release is forbidden. The `wheel` package is deliberately not
+  installed (setuptools ≥ 70.1 provides native `bdist_wheel`; current wheel
+  0.47.0 recorded for reference); if Wave 1's smoke disproves this, adding
+  `wheel==0.47.0` is a recorded amendment. Runtime dependencies remain
+  `[]`. **Deferred**: `--require-hashes` artifact-hash pinning, to a future
+  supply-chain unit.
+
+- **D-v0.4.39 — Runner pinned to the explicit `ubuntu-24.04` label.**
+  `ubuntu-latest` is a mutable alias (it retargets when GitHub promotes a
+  new LTS image) and is forbidden for the same reason mutable action tags
+  are. Verified 2026-07-22 from the official actions/runner-images source:
+  `ubuntu-latest` currently maps to 24.04; `ubuntu-26.04` exists but is
+  preview (no Actions SLA) and is rejected; arm and slim variants rejected
+  (the gate proves the supported x64 environment). Moving to a newer image
+  is a governed change.
+
+- **D-v0.4.40 — No artifact upload; disposable `$RUNNER_TEMP` roots;
+  fail-closed membership law; clean-tree assertion.** CI uploads nothing —
+  no database, vault, workspace, log, coverage, wheel, or zipapp artifact
+  ever leaves the runner. The wheel and zipapp final artifacts and the
+  disposable smoke workspaces live under `$RUNNER_TEMP`, outside the
+  checkout, with `PYTHONPATH` unset and smoke commands run from outside the
+  repository; but `python -m build --wheel --no-isolation` may create
+  `build/` and `agentic_os.egg-info/` inside the checkout — build
+  intermediates, gitignored at baseline (`build/`, `*.egg-info/`), never
+  permitted wheel members except the built wheel's legitimate `.dist-info`
+  metadata. Because ignored residue is invisible to `git status
+  --porcelain`, cleanliness cannot rely on porcelain alone: the smoke job
+  removes exactly those known intermediates in a bounded cleanup step (never
+  `git clean`) and asserts their absence, checking the known paths both
+  before and after cleanup; unexpected ignored residue is still a failure
+  and source files must stay byte-identical. Wheel and zipapp membership are
+  asserted against allowlists (wheel: `agentic_os/**/*.py`,
+  `agentic_os/catalog/*.json`, dist-info; zipapp: root `__main__.py`,
+  `agentic_os/**/*.py`, the individually-validated catalog files per
+  D-v0.4.14) so an unexpected new name fails closed; no ledger, backup,
+  vault, credential, cache, repo-metadata, prompt-pack, or test content can
+  ship. Every job ends by asserting `git diff --exit-code` and an empty
+  `git status --porcelain`, and the smoke job additionally asserts the known
+  build intermediates are absent.
+
+- **D-v0.4.41 — A stdlib-only workflow-integrity verifier enforcing a frozen
+  canonical byte-grammar, with a closed 20-reason vocabulary.**
+  `tools/verify_ci_workflow.py` enforces the one frozen canonical workflow
+  contract by canonical byte-grammar recognition, not substring scanning: it
+  is deliberately not a general YAML parser or Actions linter, and it
+  affirmatively recognizes the full frozen workflow shape rather than
+  searching for banned substrings, so `.github/workflows/ci.yml` is accepted
+  only when every byte and construct belongs to the single frozen canonical
+  grammar and any unrecognized construct fails closed with
+  `unexpected_workflow_shape`. The frozen representation fixes one
+  deterministic form — UTF-8, LF only, no BOM, exact key ordering where the
+  verifier depends on ordering, exact job ids and `name:` values, exact
+  allowed steps and command blocks, and the exact action allowlist with full
+  SHAs — and classifies as non-canonical and refusing every YAML anchor,
+  alias, custom tag, duplicate key, document start/end marker,
+  multiple-document stream, flow-style mapping or sequence, quoted or escaped
+  mapping key, alternate boolean spelling, job-level `permissions:` block,
+  local action, reusable workflow, multiline/folded `uses:`, unexpected block
+  scalar, unknown job/step/key/ordering, and shell indirection that replaces
+  a frozen command. Interface: default target `.github/workflows/ci.yml`,
+  `--workflow PATH` override; exit 0 only with zero findings, 1 with findings,
+  2 on usage error; one finding per line, deterministically ordered by
+  (reason, locus). Diagnostics are value-free and bounded: a reason code from
+  the closed vocabulary (`missing_workflow`, `invalid_utf8`, `crlf_present`,
+  `mutable_action_ref`, `unapproved_action`, `credential_persistence`,
+  `write_permission`, `pull_request_target`, `secret_reference`,
+  `continue_on_error`, `missing_timeout`, `missing_required_job`,
+  `missing_required_trigger`, `missing_python_line`, `missing_full_suite`,
+  `missing_distribution_smoke`, `artifact_upload`, `shell_download`,
+  `unexpected_workflow_shape`, `internal_error`) plus at most a closed-set
+  locus (frozen job id, frozen trigger name, or `line:<n>`); arbitrary
+  workflow content is never echoed, so a hostile workflow cannot use the
+  verifier as an output channel, and malformed bytes yield findings, never
+  tracebacks. `internal_error` is the twentieth code: a top-level exception
+  guard wraps the whole run so any unexpected internal failure exits 1 with
+  one fixed, value-free diagnostic — no traceback, no exception message, and
+  no file content echoed — ordered deterministically with the other findings.
+  Rejected: a third-party linter (violates the zero-dependency law and imports
+  someone else's policy); free-text diagnostics (a leak channel and an
+  unstable test surface). Tests must prove every reason reachable and the
+  output value-free, and Wave 1 must add a mutation test for every bypass
+  class named above.
+
+- **D-v0.4.42 — Bounded timeout ceilings and ref-scoped concurrency with
+  PR-only cancellation.** `timeout-minutes`: 10 for `workflow-integrity`, 30
+  for each remaining job. Timeout basis, recorded with the evidence that does
+  exist: the known local final U-A3 full-suite runtime is 2,275 tests in
+  763.307 seconds (~12.72 minutes). That is local hardware evidence, not
+  GitHub-hosted-runner evidence; the 30-minute test-job ceiling is
+  approximately 2.35 times that local runtime, and the 10-minute integrity
+  ceiling remains separate. No hosted-runner CI duration exists yet (no prior
+  workflow ever ran), so the ceilings are deliberately generous runaway
+  bounds, not performance targets: the first live U-P2 runs must record the
+  actual hosted durations, any timeout change requires a governed amendment,
+  and a timeout must never be increased merely to hide a hang. Tightening from
+  observed data is a normal governed change; raising a ceiling is a red flag
+  requiring investigation first. Concurrency: `group: ci-${{ github.ref }}`
+  with `cancel-in-progress: ${{ github.event_name == 'pull_request' }}`. PR
+  runs for the same PR may be canceled when superseded; `main` runs use
+  `cancel-in-progress: false`. This does not guarantee a completed run for
+  every mainline commit: GitHub may still cancel an older *pending* run in the
+  same concurrency group when a newer `main` run is queued, and only the
+  newest queued `main` run is guaranteed to complete, so an intermediate main
+  commit may lack a completed run. A missing historical run can be re-created
+  with `workflow_dispatch` against the relevant commit or ref where GitHub
+  permits. U-P2 therefore does not claim immutable CI evidence for every
+  `main` commit, and never claims queue preservation GitHub does not provide.
+
+- **D-v0.4.43 — Bootstrap sequence, `main-delivery-gate` ruleset, and the
+  failing-probe enforcement proof.** Order is fixed: workflow merges first
+  (checks must exist before rules can require them), then the operator
+  creates repository ruleset `main-delivery-gate` targeting `main`:
+  enforcement Active; bypass list empty (the administrator is subject to the
+  rules; the accepted escape hatch is editing the ruleset itself, which is
+  documented rather than pre-weakened); restrict deletions; block force
+  pushes; require a pull request (0 required approvals — one active
+  maintainer, no unavailable external approver; conversation resolution
+  required; merge-commit only); require the four frozen checks with
+  branch-up-to-date. Availability was triangulated on 2026-07-22 (public
+  repository; GitHub Free provides the full feature set on public
+  repositories; the live rulesets endpoint answers normally) — but
+  configuration is never trusted on faith: the only accepted enforcement
+  evidence is the probe. Frozen probe: branch `probe/u-p2-required-check`
+  from post-merge `main`; a single new deliberately-failing test file
+  `tests/test_probe_delivery_gate.py`; PR titled
+  `probe(v0.4): U-P2 failing required-check probe — do not merge`; observe
+  both test checks FAILED on the exact probe head and merge blocked; close
+  unmerged; delete the branch; record the evidence. Protection is never
+  weakened to complete a proof, and ABSENT is never reported as GREEN.
+
+- **D-v0.4.44 — Frozen delivery metadata and exact file boundary.** PR
+  title: `ci(v0.4): U-P2 — add protected deterministic delivery gates`;
+  merge mode: normal merge commit (repository convention, API-confirmed
+  enabled); milestone: annotated tag `milestone/v0.4-u-p2-delivery-gate` on
+  the merge commit after post-merge tree-equality verification
+  (`origin/main^{tree}` must equal the feature head's tree); never renamed
+  after push. There are 19 existing `milestone/*` tags at the Wave 0
+  baseline: 13 annotated and 6 lightweight; U-P2 deliberately uses an
+  annotated milestone tag, following the newer annotated convention, and
+  historical tags are not rewritten. File
+  boundary: Wave 0 touches exactly this contract and DECISIONS.md; Wave 1
+  adds exactly `.github/workflows/ci.yml`, `tools/verify_ci_workflow.py`,
+  `tests/test_v04_delivery_gate.py`; Wave 2 refines only those three; Wave 3
+  touches exactly `README.md`, `CONTRIBUTING.md` (new — confirmed absent at
+  baseline), `TROUBLESHOOTING.md`. Every other path — all of `agentic_os/`,
+  `aos.py`, `aos_hooks.py`, `pyproject.toml`, `protocols/`, the existing
+  tools and tests, schema and migrations — is untouchable; a production
+  module entering the diff is a stop condition, and a pre-existing
+  entrypoint defect exposed by CI becomes a separate maintenance unit, never
+  a fix-forward inside U-P2.
+
 # DECISIONS — Agentic OS v0.4 U-A3 governed agent routing and handoff contracts
 
 This section begins the continuation of the `D-v0.4.*` series for the U-A3
