@@ -1,3 +1,154 @@
+# DECISIONS — Agentic OS v0.4 U-P2 trust-boundary amendment (Wave 0.5)
+
+This section continues the `D-v0.4.*` series for the U-P2 Wave 0.5
+trust-boundary replan: adopting the solo-maintainer honest-authority boundary
+in `agentic-os-v0.4-u-p2-trust-boundary-amendment.md` after the independent
+Wave 1 audit found the delivery checks self-modifiable from a pull-request
+head. Branch `v0.4-u-p2-delivery-gate` (2026-07-22), amendment baseline
+`184ec247067c7d05c0eb3d56916450cff66218f9`; the three untracked Wave 1 files
+remain byte-identical and unstaged, and no implementation changed. The
+amendment supersedes only the conflicting security and enforcement claims of
+the frozen Wave 0 contract — §19's enforcement sentence, the §16/§17
+characterizations, D-v0.4.43's unqualified evidence language, and any
+adversarial reading of D-v0.4.34/D-v0.4.41 — and the contract file itself is
+not edited. Prepended per the established precedent (D-W0.4, reaffirmed in
+D-v0.2.7, D-v0.4.4); everything below stays byte-identical.
+
+## D-v0.4 decisions (U-P2, Wave 0.5 trust-boundary amendment)
+
+- **D-v0.4.45 — U-P2 adopts the solo-maintainer honest-authority boundary:
+  honest-maintainer protection, with no adversarial tamper-resistance
+  claim.** The audit finding is accepted as correct: the workflow, the
+  canonical verifier, and the verifier's tests are all sourced from and
+  modifiable on the pull-request head, so a repository writer can modify all
+  three together, preserve the four public check names, and produce four
+  green checks. The response reduces the claim, never the checks — every
+  pin, permission, timeout, membership law, and assertion stands. U-P2
+  guarantees: deterministic CI execution of the checked-in workflow,
+  least-privilege permissions, immutable action pins, full test and
+  distribution-smoke checks, detection of accidental or isolated drift,
+  required checks that block ordinary failures, and a reproducible,
+  auditable delivery process for an honest maintainer. U-P2 does not
+  guarantee: tamper resistance against a writer who co-edits workflow,
+  verifier, and tests; semantic immutability of a same-named check;
+  protection against a repository administrator; an external or
+  base-controlled authority; second-human approval; organization/enterprise
+  required workflows; or a trusted GitHub App / external status provider.
+  Rejected: rewriting the frozen contract in place (amendments supersede;
+  history stays byte-identical — the rule D-v0.4.33 applied to U-P1);
+  discarding or "fixing" the Wave 1 implementation (the checks are correct;
+  the claim was wrong).
+
+- **D-v0.4.46 — Self-modifiable required checks are identities, not
+  independent authority.** Branch rules match check runs by name and enforce
+  the conclusions reported under those names; for `pull_request` events
+  every reporting byte — workflow, verifier, and verifier tests alike —
+  is sourced from the PR head. An unchanged name therefore proves nothing
+  about unchanged semantics, and a green `workflow-integrity` proves only
+  that the head's verifier accepted the head's workflow. Isolated or
+  accidental drift is still detected — each of the three files is caught by
+  the other two when edited alone — while a simultaneous self-consistent
+  edit of all three passes by construction. The chain never leaves the head,
+  so no Wave 2 refinement of the three files can close it; closing it
+  requires an authority the head cannot modify (D-v0.4.48). This supersedes
+  any reading of D-v0.4.34 or D-v0.4.41 under which frozen names or the
+  verifier constitute independent enforcement. Rejected: treating the
+  finding as a Wave 1 defect (self-attestation from modifiable content is
+  structural, not a bug); silently keeping the stronger claim (an overclaim
+  no probe can witness).
+
+- **D-v0.4.47 — Solo topology: zero required approvals stand; code-owner
+  review is deferred, not partially adopted.** The repository is public,
+  owner type User, one active maintainer; pull-request authors cannot
+  approve their own pull requests, so CODEOWNERS + required code-owner
+  review would deadlock every owner-authored PR against a reviewer who does
+  not exist. The `main-delivery-gate` ruleset keeps its frozen shape — pull
+  request required, four required checks, branch up to date, force-push and
+  deletion restrictions, conversation resolution, merge-commit only, zero
+  required approvals — reclassified as ordinary failure enforcement and
+  accidental-change governance, never independent tamper resistance.
+  Rejected: requiring one approval now (permanent self-deadlock, or a
+  rubber-stamp second account — both worse than the honest zero);
+  `pull_request_target` as an improvised base authority (a privileged
+  base-context workflow needs its own threat model and has no proven
+  latest-head required-check semantics; the D-v0.4.35 ban stands).
+
+- **D-v0.4.48 — External or base-controlled authority is trigger-gated
+  future work, never hidden U-P2 scope.** Adversarial tamper resistance
+  becomes a separate follow-on unit — its own contract, decisions, and
+  proofs — when any one trigger is met. Trigger A, second trusted human:
+  collaborator with write access; base-branch `.github/CODEOWNERS`
+  protecting the workflows tree, the verifier, the delivery-gate tests, and
+  the delivery contract/amendments; at least one required approval with
+  code-owner review; stale-approval dismissal; approval by someone other
+  than the most recent pusher; proof the author cannot self-satisfy the
+  rule. Trigger B, organization/enterprise topology: the authority workflow
+  placed outside the modifiable head, required through org/enterprise
+  rulesets, verified to evaluate the latest PR commit, with proof a PR
+  cannot replace or suppress it. Trigger C, trusted GitHub App or external
+  check: a separately administered provider bound as the required-check
+  source, evaluating the latest head, with isolated credentials and hosting;
+  incident, key-rotation, availability, and recovery procedures; and proof a
+  repository writer cannot forge the check. Rejected: building the App
+  inside U-P2 (credentials, hosting, webhook, deployment, incident, and
+  operator scope disproportionate to a delivery-gate unit); pre-implementing
+  fragments of A/B/C now (a half-authority invites exactly the false trust
+  this amendment removes).
+
+- **D-v0.4.49 — Probe evidence is limited to ordinary failure
+  enforcement.** The frozen failing-test probe proves exactly three things:
+  a real failing test creates failed required checks on the exact probe
+  head; the merge is blocked while those checks fail; the probe closes
+  without merging. It does not prove that same-name check semantics are
+  immutable, that a co-edited workflow cannot report green, or that an
+  administrator cannot bypass or change the ruleset. D-v0.4.43's "the only
+  accepted enforcement evidence is the probe" is qualified to: the only
+  accepted evidence of ordinary failure enforcement. Every other D-v0.4.43
+  element — bootstrap order, ruleset shape, probe procedure, close-unmerged
+  discipline, ABSENT never reported as GREEN — stands. No malicious or
+  same-name-neutering probe PR is created or merged in Wave 0.5 or later:
+  the neutering case is analyzed on paper in the amendment (§7) because a
+  live rehearsal against the real repository would prove nothing the
+  analysis does not already establish. Rejected: a live neutering
+  demonstration (an attack rehearsal normalized into repository history,
+  with no governed value).
+
+- **D-v0.4.50 — Wave 0.5 landing sequence, commit-sequence extension, and
+  file/delivery-boundary extension; D-v0.4.44 extended, not rewritten.** The
+  independent audit that produced this amendment also fixes the order in which
+  the remaining U-P2 work lands, and extends the frozen delivery metadata of
+  D-v0.4.44 without touching it. Landing sequence, frozen normative: Wave 0.5
+  lands first as one documentation-only commit containing exactly `DECISIONS.md`
+  and `agentic-os-v0.4-u-p2-trust-boundary-amendment.md`; no Wave 1 file is
+  staged or committed before that Wave 0.5 commit exists; after it, the three
+  Wave 1 files receive a renewed independent technical audit under the
+  honest-maintainer boundary (D-v0.4.45), and only a PASS — or a
+  corrected-and-re-audited PASS — permits Wave 1 staging; Wave 2 and Wave 3
+  remain blocked until Wave 0.5 is committed, the renewed Wave 1 audit passes,
+  and Wave 1 is committed; ruleset activation and the failing-test probe remain
+  post-workflow-bootstrap activities (D-v0.4.43, as qualified by D-v0.4.49);
+  and U-K1, U-T1, U-W1, and U-A4 remain blocked until U-P2 is fully merged and
+  closed. Commit sequence: D-v0.4.44's four-item, one-per-wave sequence is
+  extended — not replaced — by inserting exactly one Wave 0.5 commit, `docs:
+  adopt U-P2 solo-maintainer trust boundary`, at position 2, between Wave 0's
+  `docs: freeze U-P2 protected delivery contract` and Wave 1's `ci: add
+  immutable read-only validation workflow`; the other three original messages
+  are preserved verbatim, giving five ordered commits, and the claim that the
+  complete U-P2 history is four commits no longer holds. File and delivery
+  boundary: D-v0.4.44's "nothing else" boundary applied to its original
+  Wave 0/1/2/3 table; this decision adds exactly one governed wave — Wave 0.5 —
+  authorizing exactly two paths (`DECISIONS.md`,
+  `agentic-os-v0.4-u-p2-trust-boundary-amendment.md`) and one commit, and no
+  production, packaging, protocol, schema, migration, or unrelated
+  documentation file. The amendment (§13, §14, §15) carries the extended
+  sequencing and boundary; D-v0.4.44 and the original contract stay
+  byte-identical history, neither reworded nor erased. Rejected: rewriting
+  D-v0.4.44 in place (frozen Wave 0 history — amendments supersede, history
+  stays byte-identical, per D-v0.4.33/D-v0.4.45); folding Wave 0.5 into the
+  Wave 1 commit (the audit finding is a governed documentation change that must
+  land and be independently visible before any Wave 1 file is staged); staging
+  any Wave 1 file now (the renewed audit gate has not run).
+
 # DECISIONS — Agentic OS v0.4 U-P2 continuous integration and protected delivery gate
 
 This section continues the `D-v0.4.*` series for the U-P2 Wave 0
