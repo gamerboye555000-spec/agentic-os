@@ -1,10 +1,9 @@
 # TROUBLESHOOTING — Agentic OS
 
-Written for a tired human after a bad run. This page currently covers the
-Windows/Obsidian export (U-C4), the Claude Code session hooks (U-H1), the
-success-proof ingest gate (U-H2), and packaging/entrypoints (U-P1, at the
-end); other troubleshooting lives in `RECOVERY.md` (backup/restore/corruption
-drill) until the full docs pass (U-P2) lands.
+Written for a tired human after a bad run. This page covers per-unit
+troubleshooting, from the Windows/Obsidian export (U-C4) at the top to the
+U-P2 protected delivery gate (CI and required checks) at the end;
+backup/restore/corruption drills live in `RECOVERY.md`.
 
 ## Windows / Obsidian export (`sync --export-to PATH`)
 
@@ -1820,3 +1819,229 @@ python aos.py agent handoff accept AH-0002
 Never hand-edit a pinned passport version or digest in storage to make accept
 pass: the pin is a bound field of the handoff hash, so editing it destroys the
 evidence that the record moved while leaving every write against it refusing.
+
+## Protected delivery gate (U-P2)
+
+### The model in one paragraph
+
+One workflow (`.github/workflows/ci.yml`) defines four checks — named
+exactly `workflow-integrity`, `tests-python-3.12`, `tests-python-3.14`, and
+`distribution-smoke-python-3.12` — and runs them on every pull request
+targeting `main`, every push to `main`, and manual dispatch. The workflow,
+its canonical verifier (`tools/verify_ci_workflow.py`), and the verifier's
+tests (`tests/test_v04_delivery_gate.py`) are the three delivery-control
+files; all three are stored in this repository and are therefore
+self-modifiable by a repository writer. That is the solo-maintainer
+honest-authority boundary (summary at the end of this section):
+"protected delivery" means ordinary failure enforcement and
+accidental-change governance, nothing stronger. Everything below assumes
+you are debugging an honest failure.
+
+### `workflow-integrity`
+
+The verifier requires **exact workflow bytes**: it affirmatively recognizes
+one frozen canonical representation, embedded in the verifier itself, and
+accepts `.github/workflows/ci.yml` only when the file is byte-identical to
+it. It is not a YAML linter — a semantically equivalent reordering fails.
+
+Run it locally; it is read-only, standard-library-only, and safe:
+
+```bash
+python3 tools/verify_ci_workflow.py
+```
+
+Exit 0 with no output is a pass. Otherwise it prints one finding per line:
+a reason code from a closed 20-code vocabulary, optionally followed by a
+bounded locus (a frozen job id, a frozen trigger name, or `line:<n>`). The
+reason codes are intentionally value-free — no workflow content is ever
+echoed — and no traceback or hostile content is expected in any outcome: an
+internal failure prints exactly `internal_error` and exits 1. If you ever
+see a traceback or your file's own text in the output, that is itself a
+bug.
+
+Common causes, with their usual codes:
+
+- **An intentional workflow edit without the canonical update.** The frozen
+  representation lives inside `tools/verify_ci_workflow.py`; changing
+  `ci.yml` without regenerating that embedded text byte-for-byte fails,
+  usually as `unexpected_workflow_shape`.
+- **CRLF line endings** (`crlf_present`) — an editor or a Git
+  `autocrlf`-style rewrite converted the file. Restore LF-only endings.
+- **A UTF-8 BOM** (`unexpected_workflow_shape`) — the canonical text has no
+  BOM.
+- **Invalid UTF-8** (`invalid_utf8`) — the file no longer decodes.
+- **Malformed or reshaped YAML** (`unexpected_workflow_shape`) — anchors,
+  aliases, flow-style collections, reordered keys, an added or renamed
+  step, a job matrix: anything the frozen grammar does not name fails
+  closed.
+- **A wrong or mutable action pin** — `mutable_action_ref` for a tag,
+  branch, or non-allowlisted SHA in the executable field;
+  `unapproved_action` for a repository off the two-entry allowlist.
+- **Permissions or trigger drift** — `write_permission`,
+  `pull_request_target`, `missing_required_trigger`, or a shape refusal for
+  a job-level `permissions:` block.
+
+A changed workflow accompanied by a matching changed canonical verifier is
+not self-justifying: the two agreeing proves consistency, not safety, and
+both are repository-controlled. That pair of edits must still receive
+exceptional manual review (CONTRIBUTING.md, "Delivery-control changes").
+
+### Python test checks (`tests-python-3.12` / `tests-python-3.14`)
+
+The two jobs run identical steps; only the interpreter feature line
+differs. Each job log's `python3 -VV` line records the exact resolved
+patch.
+
+- **Both lines fail** → the change itself is broken. Reproduce with full
+  discovery below.
+- **Exactly one line fails** → likely Python-version compatibility drift: a
+  3.14 removal, deprecation-turned-error, or behavior change — or code
+  depending on 3.12-only behavior. A 3.14 failure is never skipped: the fix
+  is a bounded, runtime-neutral correction under its own governed decision,
+  or a separately planned blocker — the job is never weakened to pass.
+
+Focused local runs:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_v04_delivery_gate
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
+```
+
+If you have both interpreters installed, run the same commands under each
+(`python3.12`, `python3.14`).
+
+Bytecode, stated precisely: `python3 -m compileall` **does create ignored
+`__pycache__/` directories even when `PYTHONDONTWRITEBYTECODE=1` is set** —
+the variable suppresses import-time bytecode writing, not explicit
+compilation. Those directories are gitignored, so the clean-tree assertion
+does not see them and the job still passes. An older claim that no
+bytecode appears under this variable was incorrect; do not rely on it.
+
+Do not use destructive cleanup commands to "fix" residue — no `git clean`,
+no recursive deletes of paths you have not identified. Ignored
+`__pycache__` is harmless and may simply stay.
+
+### Distribution smoke (`distribution-smoke-python-3.12`)
+
+What the job proves, in order — and what a failure at each stage means:
+
+- **Exact-pinned build tools.** It installs exactly `pip==26.1.2`, then
+  `build==1.5.0`, `setuptools==83.0.0` (the build backend),
+  `packaging==26.2`, and `pyproject_hooks==1.2.0`, then logs `pip freeze`.
+  The wheel is built with `--no-isolation` so the exact-pinned backend —
+  not a network-resolved one — performs the build. An unexpected package in
+  the freeze log is investigated, not ignored.
+- **Wheel and zipapp membership.** Every wheel member must be an
+  `agentic_os/**/*.py` module, one of the 13 catalog JSON files
+  (`manifest.json` plus twelve passports), or `*.dist-info` metadata; every
+  zipapp member must be the top-level `__main__.py`, a package module, or
+  catalog JSON. Package and catalog bytes must **byte-match the source
+  tree**; an unexpected, missing, or altered member fails closed with a
+  `wheel: …` or `zipapp: …` line on stdout.
+- **Isolated product execution.** Smoke commands run from `$RUNNER_TEMP`,
+  outside the checkout, with `PYTHONPATH` cleared (`unset PYTHONPATH`), so
+  the installed wheel or the zipapp is what actually executes — never the
+  repository through the import path.
+- **Expected smoke behavior.** `--help` succeeds from the console script,
+  `python3 -m agentic_os`, and the zipapp, byte-identically; `init`,
+  `status`, and `doctor` against a fresh `--root` workspace exit 0 with
+  every doctor check passing (41 checks at the U-P2 baseline); and
+  `aos protocol verify-registry` exits 0 — running outside a source
+  checkout, its "comparison unavailable — no source checkout" line is
+  expected and is not a failure.
+
+Local caveat: `python3 -m venv` may fail on machines without
+ensurepip/venv support (for example Debian/Ubuntu without `python3-venv`).
+That is a local environment limitation, not proof of a CI defect — the
+hosted runner provides full venv support. Never weaken the frozen pins to
+make a local machine pass; every pin change is a separately governed
+amendment.
+
+### Clean-tree failures
+
+Every job ends by asserting `git diff --exit-code` and an empty
+`git status --porcelain`. When that step fails:
+
+- **Tracked changes** — an earlier step modified a tracked file. Diagnose
+  read-only: `git diff --stat`, then `git diff`.
+- **Non-ignored untracked residue** — a step created a file the ignore
+  rules do not cover; `git status --porcelain --untracked-files=all` names
+  it.
+- **Allowed bounded build residue** — the wheel build may create `build/`
+  and `agentic_os.egg-info/` inside the checkout. Both are gitignored. The
+  smoke job checks that no *other* ignored residue exists, removes exactly
+  those two paths (`rm -rf build agentic_os.egg-info`), and asserts both
+  are absent. Locally, remove exactly the same two named paths.
+- **Ignored `__pycache__` is a different thing** — ignored paths are
+  invisible to plain `git status --porcelain`, so the clean-tree gate
+  passes with them present. See them with
+  `git status --porcelain --ignored`; they need no cleanup.
+- **Never `git clean`** — not locally, not in CI. It deletes by pattern,
+  not by identity; the gate's own cleanup touches only the two named paths.
+
+Every diagnosis command above mutates nothing:
+`git status --porcelain --untracked-files=all`,
+`git status --porcelain --ignored`, `git diff --stat`, and
+`git diff --exit-code` are all read-only.
+
+### Required-check and ruleset issues
+
+- **Missing vs failing vs pending.** A *missing* check never reported on
+  that head at all: the workflow is absent on the branch, a job was renamed
+  away from the four frozen names, or no run started — ABSENT is a distinct
+  state and is never treated as GREEN. A *failing* check ran and concluded
+  failure. A *pending* check is still RUNNING and is not yet a conclusion.
+- **Check-name identity does not prove unchanged semantics.** A required
+  check name identifies which conclusion a rule waits for; it proves
+  nothing about the computation that produced the conclusion, because that
+  computation is sourced from the same modifiable head.
+- **Ruleset configuration is external GitHub state.** Nothing in this
+  repository — including this page — can prove a ruleset is active.
+  Confirm from the repository's live settings or API; repository files can
+  only describe the planned shape.
+- **Zero required approvals is intentional only for the solo topology.**
+  A pull-request author cannot approve their own pull request, so with one
+  maintainer a required approval would deadlock every PR. Zero approvals is
+  not equivalent to independent review.
+- **Administrators and settings holders can change or bypass repository
+  settings.** Ruleset editing is settings access, outside ruleset scope;
+  that actor is inside the trusted zone, not defended against.
+- **Future independent-authority triggers exist and are deferred**: a
+  second trusted reviewer plus CODEOWNERS and required review; an
+  organization/enterprise required workflow outside the modifiable PR head;
+  or a separately administered GitHub App or external status provider.
+  Until one of those exists, every green conclusion is the work of
+  repository-hosted, self-modifiable controls.
+
+### Trust-boundary summary
+
+Agentic OS operates under the **solo-maintainer honest-authority boundary**
+(trust-boundary amendment, D-v0.4.45). Read these six facts together; any
+stronger reading is wrong:
+
+1. **The delivery controls are repository-hosted and self-modifiable.** The
+   workflow, its canonical verifier, and the verifier's tests are stored in
+   this repository — `.github/workflows/ci.yml`,
+   `tools/verify_ci_workflow.py`, and `tests/test_v04_delivery_gate.py` —
+   so a repository writer can modify all three together in one pull
+   request.
+2. **What they protect is honest development**: ordinary failure
+   enforcement (a real failing check blocks a merge), deterministic
+   delivery, and detection of accidental or isolated drift — an edit to one
+   control file alone is caught by the other two.
+3. **They are not an external or independently administered security
+   authority.** Every enforcing byte is part of the pull-request head being
+   evaluated.
+4. **A required check name by itself does not prove that the check's
+   semantics are unchanged.** Names are identities; the conclusions
+   reported under them are computed by head-controlled code.
+5. **Changes to the delivery-control files require exceptional manual
+   review** — the exact requirements are in CONTRIBUTING.md,
+   "Delivery-control changes".
+6. **Future independent authority is deferred and trigger-gated.**
+   Adversarial tamper resistance becomes its own governed unit when a
+   trigger is met: a second trusted reviewer plus CODEOWNERS and required
+   review; an organization/enterprise required workflow outside the
+   modifiable PR head; or a separately administered GitHub App or external
+   status provider. Nothing from those triggers is partially implemented
+   today.
