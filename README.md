@@ -1280,6 +1280,94 @@ never committed.
 python -m unittest discover -s tests
 ```
 
+## Protected delivery (CI)
+
+U-P2 adds a continuous-integration and delivery gate for changes to this
+repository. It changes how commits are validated and merged; it does not
+change what Agentic OS does at runtime. "Protected delivery" here means
+exactly **ordinary failure enforcement and accidental-change governance** —
+nothing stronger. The trust boundary below states what that does and does
+not include.
+
+One workflow (`.github/workflows/ci.yml`) defines four public checks — the
+job `name:` values, frozen verbatim:
+
+| Check | What it does |
+|---|---|
+| `workflow-integrity` | Runs `python3 tools/verify_ci_workflow.py`, which accepts only the byte-exact frozen canonical workflow and fails closed on any deviation. |
+| `tests-python-3.12` | Compiles `agentic_os`, `tests`, `tools`, `aos.py`, and `aos_hooks.py`, runs full unittest discovery, verifies the protocol projection, and asserts a clean working tree — on Python 3.12. |
+| `tests-python-3.14` | The identical gate on Python 3.14. |
+| `distribution-smoke-python-3.12` | Builds the wheel and zipapp with exact-pinned build tools, asserts archive membership byte-for-byte against the source tree, smoke-runs both artifacts in disposable workspaces outside the checkout, and asserts all three entrypoints print byte-identical `--help`. |
+
+Supported CI feature lines: **Python 3.12** (the `requires-python` floor)
+and **Python 3.14** (the pinned upper CI feature line). Every job prints the exact
+resolved patch (`python3 -VV`) in its log.
+
+Local validation, mirroring the hosted gate:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m compileall -q agentic_os tests tools aos.py aos_hooks.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
+python3 tools/gen_protocols.py
+python3 tools/verify_ci_workflow.py
+git diff --check
+git status --short --branch
+```
+
+Check states are reported as **ABSENT / RUNNING / FAILED / GREEN**, and they
+mean different things for trust: ABSENT means no conclusion exists at all
+(never treat it as a pass — ABSENT is never reported as GREEN); RUNNING is
+not yet a conclusion; FAILED blocks a merge wherever the check is required;
+GREEN is a reported success of a repository-hosted check — trust it
+according to the boundary below, not beyond it.
+
+### Delivery-control trust boundary
+
+Agentic OS operates under the **solo-maintainer honest-authority boundary**
+(trust-boundary amendment, D-v0.4.45). Read these six facts together; any
+stronger reading is wrong:
+
+1. **The delivery controls are repository-hosted and self-modifiable.** The
+   workflow, its canonical verifier, and the verifier's tests are stored in
+   this repository — `.github/workflows/ci.yml`,
+   `tools/verify_ci_workflow.py`, and `tests/test_v04_delivery_gate.py` —
+   so a repository writer can modify all three together in one pull request.
+2. **What they protect is honest development**: ordinary failure enforcement
+   (a real failing check blocks a merge), deterministic delivery, and
+   detection of accidental or isolated drift — an edit to one control file
+   alone is caught by the other two.
+3. **They are not an external or independently administered security
+   authority.** Every enforcing byte is part of the pull-request head being
+   evaluated.
+4. **A required check name by itself does not prove that the check's
+   semantics are unchanged.** Names are identities; the conclusions reported
+   under them are computed by head-controlled code.
+5. **Changes to the delivery-control files require exceptional manual
+   review** — the exact requirements are in
+   [CONTRIBUTING.md](CONTRIBUTING.md).
+6. **Future independent authority is deferred and trigger-gated.**
+   Adversarial tamper resistance becomes its own governed unit when a
+   trigger is met: a second trusted reviewer plus CODEOWNERS and required
+   review; an organization/enterprise required workflow outside the
+   modifiable PR head; or a separately administered GitHub App or external
+   status provider. Nothing from those triggers is partially implemented
+   today.
+
+Branch-ruleset activation (requiring the four checks on `main`) and the
+failing-test acceptance probe are **later bootstrap steps**: whether they
+are active is live GitHub state and must be confirmed from the repository's
+actual settings, never inferred from repository files alone — including
+this one.
+
+There is still **no release publishing**: no PyPI distribution, no GitHub
+Release, no signing, no SBOM, no containers. The wheel and the zipapp are
+built and verified — by CI and locally — and installation remains a local,
+manual step.
+
+The contribution flow, focused pre-PR commands, and delivery-control change
+rules are in [CONTRIBUTING.md](CONTRIBUTING.md). Per-check failure
+diagnosis is in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
 ## Status
 
 Complete-today build, extending the Weekend and Night-1 MVPs — a database
