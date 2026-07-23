@@ -122,6 +122,27 @@ REASON_HINTS: dict[str, str] = {
     "scope_level_mismatch": (
         "agent_scope.project must be present exactly when level is 'project'."
     ),
+    # U-K1/U-T1 manifest cross-field rules
+    "replacement_lifecycle_mismatch": (
+        "replaced_by is permitted only when lifecycle is deprecated or revoked."
+    ),
+    "compensation_side_effect_mismatch": (
+        "The compensation strategy is inconsistent with the declared "
+        "side_effect class."
+    ),
+    "compensation_ref_mismatch": (
+        "compensation.ref must be present exactly when the strategy is "
+        "'compensating_action'."
+    ),
+    "unsafe_retry_policy": (
+        "A mutating tool with max_attempts above 1 must require an "
+        "idempotency key or declare a compensating action."
+    ),
+    "recovery_compensation_mismatch": (
+        "recovery.action 'invoke_compensation' requires a declared "
+        "compensating action."
+    ),
+    "self_dependency": "A skill may not depend on its own skill id.",
     # Filesystem
     "unsafe_input": "Only a regular file is accepted here.",
     "unreadable": "The file cannot be read.",
@@ -392,6 +413,8 @@ REQUIRED_IDENTITIES = (
     "beast.agent-passport/v1",
     "beast.interrupt/v1",
     "beast.result-envelope/v1",
+    "beast.skill-manifest/v1",
+    "beast.tool-manifest/v1",
     "beast.work-spec/v1",
 )
 
@@ -1256,6 +1279,433 @@ _AGENT_PASSPORT_V1 = {
 
 
 # ---------------------------------------------------------------------------
+# beast.skill-manifest/v1 + beast.tool-manifest/v1 (U-K1/U-T1)
+#
+# A manifest is NOT a task message, so it carries the same REDUCED envelope
+# the agent passport introduced: no aos_task_id, no trace, no idempotency_key,
+# no audience, no scope object, no permitted_destinations. Everything in the
+# body is an inert declaration: a manifest states requirements and identity,
+# and no field in it can grant a capability, approval, budget, power, or
+# execution eligibility. The resolver these documents feed is
+# agentic_os/governance.py; this module only parses, validates and hashes.
+
+#: Closed manifest lifecycle. Only `active` is ever execution-eligible; the
+#: eligibility rule lives in governance.py, the vocabulary lives here with
+#: the schemas that carry it.
+COMPONENT_LIFECYCLES = ("draft", "active", "deprecated", "revoked")
+COMPONENT_LIFECYCLE_ACTIVE = "active"
+
+#: Closed skill evaluation/promotion state. Recorded state, never inferred:
+#: only `promoted` is execution-eligible, and no descriptive field can move a
+#: skill along this ladder.
+SKILL_EVALUATION_STATES = ("unevaluated", "candidate", "promoted", "rejected")
+SKILL_EVALUATION_PROMOTED = "promoted"
+
+#: Closed side-effect classification (U-T1). Exactly three: nothing in the
+#: committed vocabulary requires more, and a fourth value here would be an
+#: unreviewed authority claim.
+TOOL_SIDE_EFFECTS = ("pure", "read_only", "mutating")
+TOOL_SIDE_EFFECT_MUTATING = "mutating"
+
+#: How a mutating tool's effects can be undone. `not_applicable` is reserved
+#: for pure/read_only tools (cross-field rule in _check_semantics).
+TOOL_COMPENSATION_STRATEGIES = ("not_applicable", "none", "compensating_action")
+TOOL_COMPENSATION_ACTION = "compensating_action"
+
+#: Whether automatic retry of this tool requires an idempotency reference in
+#: the execution context.
+TOOL_IDEMPOTENCY_MODES = ("not_required", "required_key")
+TOOL_IDEMPOTENCY_REQUIRED_KEY = "required_key"
+
+#: The DECLARED cancellation mode. This unit ships no cancellation transport
+#: or sandbox; the truthful termination vocabulary lives in governance.py.
+TOOL_CANCELLATION_MODES = ("not_supported", "cooperative")
+
+#: Closed recovery actions. `recovery.note` prose is display-only and is
+#: never parsed into control flow.
+RECOVERY_ACTIONS = (
+    "none",
+    "retry_after_backoff",
+    "request_approval",
+    "manual_intervention",
+    "invoke_compensation",
+)
+
+#: A component id: the slug half of REQUIREMENT_PATTERN, without a version
+#: pin. Same source text as CAPABILITY_PATTERN — a separate name because it
+#: names a different concept, exactly as TASK_FAMILY_PATTERN does.
+COMPONENT_ID_PATTERN = r"^[a-z][a-z0-9._-]{1,63}$"
+#: The highest component_version a `/vN` requirement pin can name.
+COMPONENT_VERSION_MAX = 9999
+
+
+def _manifest_defs() -> dict:
+    """The reduced-envelope $defs both manifests vendor (self-contained by
+    design, like every schema here — $ref is local-only)."""
+    return {
+        "Timestamp": _string(
+            min_len=20,
+            max_len=20,
+            pattern=RFC3339_PATTERN,
+            description="UTC RFC3339, second precision, literal Z.",
+        ),
+        "Sha256": _string(min_len=64, max_len=64, pattern=SHA256_PATTERN),
+        "Issuer": _string(min_len=3, max_len=64, pattern=ISSUER_PATTERN),
+        "OpaqueRef": _string(
+            min_len=3,
+            max_len=132,
+            pattern=OPAQUE_REF_PATTERN,
+            description="An opaque versioned reference to a record owned by "
+            "another system. Never dereferenced here.",
+        ),
+    }
+
+
+def _manifest_schema(identity: str, *, title: str, description: str,
+                     properties: dict, required: list[str]) -> dict:
+    """A reduced-envelope manifest artifact (U-K1/U-T1)."""
+    return {
+        "title": title,
+        "description": description,
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "schema",
+            "protocol_version",
+            "content_hash_alg",
+            "content_sha256",
+            "created_at",
+            "issuer",
+            *required,
+        ],
+        "properties": {
+            "schema": {"type": "string", "const": identity},
+            "protocol_version": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 999,
+                "description": "The major version; must equal the major in "
+                "`schema`.",
+            },
+            "content_hash_alg": {"type": "string", "const": CONTENT_HASH_ALG},
+            "content_sha256": _ref("Sha256"),
+            "created_at": _ref("Timestamp"),
+            "expires_at": _ref("Timestamp"),
+            "issuer": _ref("Issuer"),
+            "data_classification": _enum(DATA_CLASSIFICATIONS),
+            **properties,
+        },
+        "$defs": _manifest_defs(),
+    }
+
+
+def _component_shared_properties(component_field: str, *, kind: str) -> dict:
+    """The body fields U-K1 and U-T1 share, in one place so the two schemas
+    cannot drift apart."""
+    return {
+        component_field: _string(
+            min_len=2,
+            max_len=64,
+            pattern=COMPONENT_ID_PATTERN,
+            description=f"The {kind} id this manifest declares for. Bound "
+            "into the hashed body, so a digest cannot be transplanted "
+            f"between {kind}s.",
+        ),
+        "component_version": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": COMPONENT_VERSION_MAX,
+            "description": "This declaration's position in the component's "
+            "immutable version history; the range a `/vN` requirement pin "
+            "can name. Bound into the hashed body.",
+        },
+        "display_name": _string(
+            min_len=1,
+            max_len=128,
+            description="Display-only. Nothing reads this for any decision.",
+        ),
+        "description": _string(
+            min_len=1,
+            max_len=2048,
+            description="Display-only. Nothing reads this for any decision.",
+        ),
+        "lifecycle": _enum(
+            COMPONENT_LIFECYCLES,
+            description="Recorded lifecycle state. Only 'active' is ever "
+            "execution-eligible, and that rule lives outside this document.",
+        ),
+        "io_contracts": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["input_ref", "output_ref"],
+            "properties": {
+                "input_ref": _ref("OpaqueRef"),
+                "output_ref": _ref("OpaqueRef"),
+            },
+            "description": "DECLARED input/output contract references. "
+            "Validation never resolves, fetches or dereferences them.",
+        },
+        "required_capabilities": _array(
+            _string(min_len=2, max_len=64, pattern=CAPABILITY_PATTERN),
+            min_items=1,
+            max_items=16,
+        ),
+        "evidence_expectations": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["evidence_kinds", "min_evidence_count"],
+            "properties": {
+                "evidence_kinds": _array(
+                    _enum(
+                        EVIDENCE_KINDS,
+                        description="IS models.EVIDENCE_KINDS (D-v0.3.10).",
+                    ),
+                    min_items=1,
+                    max_items=len(EVIDENCE_KINDS),
+                ),
+                "min_evidence_count": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 32,
+                },
+            },
+        },
+        "binding": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["binding_id", "binding_sha256"],
+            "properties": {
+                "binding_id": _string(
+                    min_len=2, max_len=64, pattern=COMPONENT_ID_PATTERN
+                ),
+                "binding_sha256": _ref("Sha256"),
+            },
+            "description": "The identity and canonical-record digest of the "
+            "ONLY implementation this manifest may execute through. A "
+            "declared reference: naming it grants nothing, and no import "
+            "path, command or URL is representable here.",
+        },
+        "replaced_by": _string(
+            min_len=2,
+            max_len=70,
+            pattern=REQUIREMENT_PATTERN,
+            description="The successor requirement ref. Permitted only when "
+            "lifecycle is deprecated or revoked (cross-field check).",
+        ),
+        "provenance": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["created_by", "method"],
+            "properties": {
+                "created_by": _string(
+                    min_len=5, max_len=70, pattern=PROVENANCE_PATTERN
+                ),
+                "method": _enum(AGENT_PROVENANCE_METHODS),
+            },
+            "description": "Source metadata. Grants nothing.",
+        },
+    }
+
+
+_SKILL_MANIFEST_V1 = _manifest_schema(
+    "beast.skill-manifest/v1",
+    title="Skill Manifest v1",
+    description=(
+        "An inert, versioned declaration of a governed skill: identity, "
+        "lifecycle, evaluation state, IO contract references, requirements, "
+        "dependencies, limits, budget and implementation binding. It carries "
+        "no credential, no import path, no command, no approval boolean and "
+        "no executable field — these are unrepresentable, not merely "
+        "discouraged. Nothing here grants permission to execute; eligibility "
+        "is decided outside this document from an external grant."
+    ),
+    properties={
+        **_component_shared_properties("skill", kind="skill"),
+        "evaluation": _enum(
+            SKILL_EVALUATION_STATES,
+            description="Recorded evaluation/promotion state. Only "
+            "'promoted' is ever execution-eligible, and that rule lives "
+            "outside this document.",
+        ),
+        "tool_dependencies": _array(
+            _string(min_len=2, max_len=70, pattern=REQUIREMENT_PATTERN),
+            min_items=1,
+            max_items=16,
+        ),
+        "skill_dependencies": _array(
+            _string(min_len=2, max_len=70, pattern=REQUIREMENT_PATTERN),
+            min_items=1,
+            max_items=16,
+        ),
+        "agent_constraints": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["agent_classes"],
+            "properties": {
+                "agent_classes": _array(
+                    _enum(
+                        AGENT_CLASSES, description="IS models.AGENT_CLASSES."
+                    ),
+                    min_items=1,
+                    max_items=len(AGENT_CLASSES),
+                ),
+            },
+            "description": "The passport classes permitted to invoke this "
+            "skill. A constraint on callers, never a grant to any.",
+        },
+        "limits": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [],
+            "properties": {
+                "max_input_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 999999999,
+                },
+                "max_output_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 999999999,
+                },
+                "max_context_tokens": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 99999999,
+                },
+            },
+        },
+        "budget": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [],
+            "properties": {
+                "max_task_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 604800,
+                },
+                "max_cost_microusd": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1000000000000,
+                },
+            },
+            "description": "A DECLARED budget ceiling (passport `limits` "
+            "vocabulary). No live budget protocol exists; nothing here "
+            "reserves or spends anything.",
+        },
+    },
+    required=[
+        "skill",
+        "component_version",
+        "display_name",
+        "description",
+        "lifecycle",
+        "evaluation",
+        "io_contracts",
+        "binding",
+        "provenance",
+    ],
+)
+
+
+_TOOL_MANIFEST_V1 = _manifest_schema(
+    "beast.tool-manifest/v1",
+    title="Tool Manifest v1",
+    description=(
+        "An inert, versioned declaration of a governed tool: identity, "
+        "lifecycle, IO contract references, side-effect class, compensation, "
+        "idempotency, cancellation mode, bounded retry policy, recovery "
+        "policy and implementation binding. It carries no credential, no "
+        "import path, no command, no approval boolean and no executable "
+        "field — these are unrepresentable, not merely discouraged. Nothing "
+        "here grants permission to execute; a deadline is not a "
+        "cancellation, and no field can claim work was stopped."
+    ),
+    properties={
+        **_component_shared_properties("tool", kind="tool"),
+        "side_effect": _enum(
+            TOOL_SIDE_EFFECTS,
+            description="Closed side-effect classification.",
+        ),
+        "compensation": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["strategy"],
+            "properties": {
+                "strategy": _enum(TOOL_COMPENSATION_STRATEGIES),
+                "ref": _ref("OpaqueRef"),
+            },
+            "description": "Reversibility declaration. `ref` names a "
+            "compensating action owned by another system; present exactly "
+            "when strategy is 'compensating_action' (cross-field check).",
+        },
+        "idempotency": _enum(
+            TOOL_IDEMPOTENCY_MODES,
+            description="'required_key' means automatic retry is refused "
+            "unless the execution context carries an idempotency reference.",
+        ),
+        "cancellation": _enum(
+            TOOL_CANCELLATION_MODES,
+            description="The DECLARED cancellation mode. Declaring "
+            "'cooperative' implements nothing; truthful termination is "
+            "reported per attempt, outside this document.",
+        ),
+        "retry": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["max_attempts"],
+            "properties": {
+                "max_attempts": {"type": "integer", "minimum": 1, "maximum": 10},
+            },
+            "description": "The bounded retry declaration. Agentic OS owns "
+            "the outer attempt budget; hidden framework retries are not "
+            "representable and not trusted.",
+        },
+        "approvals_required": _array(
+            _string(min_len=1, max_len=128),
+            min_items=1,
+            max_items=16,
+            # Declared actions the tool says need human approval. NOT an
+            # approval grant; this protocol has no field that can make that
+            # claim.
+        ),
+        "recovery": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["action"],
+            "properties": {
+                "action": _enum(RECOVERY_ACTIONS),
+                "note": _string(
+                    min_len=1,
+                    max_len=512,
+                    description="Display-only prose. Never parsed, matched "
+                    "or executed.",
+                ),
+            },
+        },
+    },
+    required=[
+        "tool",
+        "component_version",
+        "display_name",
+        "description",
+        "lifecycle",
+        "io_contracts",
+        "side_effect",
+        "compensation",
+        "idempotency",
+        "cancellation",
+        "retry",
+        "recovery",
+        "binding",
+        "provenance",
+    ],
+)
+
+
+# ---------------------------------------------------------------------------
 # Registry (contract §4)
 
 @dataclass(frozen=True)
@@ -1286,6 +1736,8 @@ _DEFINITIONS: tuple[tuple[str, int, str, dict], ...] = (
     ("beast.result-envelope", 1, "active", _RESULT_ENVELOPE_V1),
     ("beast.interrupt", 1, "active", _INTERRUPT_V1),
     ("beast.agent-passport", 1, "active", _AGENT_PASSPORT_V1),
+    ("beast.skill-manifest", 1, "active", _SKILL_MANIFEST_V1),
+    ("beast.tool-manifest", 1, "active", _TOOL_MANIFEST_V1),
 )
 
 
@@ -1528,6 +1980,67 @@ def _check_semantics(document: dict, entry: SchemaEntry) -> None:
         has_project = "project" in agent_scope
         if (agent_scope.get("level") == "project") != has_project:
             raise _refuse("scope_level_mismatch", "/agent_scope", where=where)
+
+    # U-K1/U-T1 manifest cross-field rules. All presence-guarded: the fields
+    # exist only in the two manifest schemas (everywhere else they are
+    # already refused as unknown_field), so no other schema's behavior can
+    # change. Structural validation ran first, so the guarded values are
+    # schema-valid types and enum members.
+    if "replaced_by" in document:
+        if document.get("lifecycle") not in ("deprecated", "revoked"):
+            raise _refuse(
+                "replacement_lifecycle_mismatch", "/replaced_by", where=where
+            )
+
+    side_effect = document.get("side_effect")
+    if side_effect is not None:
+        compensation = document.get("compensation", {})
+        strategy = compensation.get("strategy")
+        if side_effect in ("pure", "read_only"):
+            if strategy != "not_applicable":
+                raise _refuse(
+                    "compensation_side_effect_mismatch",
+                    "/compensation/strategy",
+                    where=where,
+                )
+        elif strategy == "not_applicable":
+            raise _refuse(
+                "compensation_side_effect_mismatch",
+                "/compensation/strategy",
+                where=where,
+            )
+        if (strategy == TOOL_COMPENSATION_ACTION) != ("ref" in compensation):
+            raise _refuse(
+                "compensation_ref_mismatch", "/compensation/ref", where=where
+            )
+        max_attempts = document.get("retry", {}).get("max_attempts")
+        if (
+            side_effect == TOOL_SIDE_EFFECT_MUTATING
+            and isinstance(max_attempts, int)
+            and max_attempts > 1
+            and document.get("idempotency") != TOOL_IDEMPOTENCY_REQUIRED_KEY
+            and strategy != TOOL_COMPENSATION_ACTION
+        ):
+            raise _refuse(
+                "unsafe_retry_policy", "/retry/max_attempts", where=where
+            )
+        if (
+            document.get("recovery", {}).get("action") == "invoke_compensation"
+            and strategy != TOOL_COMPENSATION_ACTION
+        ):
+            # A recovery that names a compensation the manifest never
+            # declares is an internal contradiction, not a policy.
+            raise _refuse(
+                "recovery_compensation_mismatch", "/recovery/action", where=where
+            )
+
+    skill_id = document.get("skill")
+    if skill_id is not None:
+        for dep in document.get("skill_dependencies", ()):
+            if dep.split("/", 1)[0] == skill_id:
+                raise _refuse(
+                    "self_dependency", "/skill_dependencies", where=where
+                )
 
     _check_content_hash(document, where)
 

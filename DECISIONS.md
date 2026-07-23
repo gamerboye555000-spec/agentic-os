@@ -1,3 +1,130 @@
+# DECISIONS — Agentic OS v0.4 U-K1/U-T1 governed skill and tool foundations
+
+This section continues the `D-v0.4.*` series for the integrated U-K1/U-T1
+unit: framework-neutral, deterministic manifest contracts and runtime
+governance for skills and tools, frozen in
+`agentic-os-v0.4-u-k1-u-t1-governed-foundations-contract.md`. Branch
+`v0.4-u-k1-u-t1-governed-foundations` (2026-07-23), baseline
+`224d2cd0b98766e52865f8b4752446adb71af850` (U-P2 delivery gate merged and
+closed, which unblocks this unit per D-v0.4.50). The completed Atomic Agents
+evaluation is research evidence only: its runtime loop is a plausible future
+adapter target and its BaseIOSchema a useful IO mapping reference, while
+Atomic Agents as kernel is rejected and BaseTool is not a governance
+boundary; no evaluation source is copied or imported, and no dependency is
+added. Prepended per the established precedent (D-W0.4, reaffirmed in
+D-v0.2.7, D-v0.4.4); everything below stays byte-identical.
+
+## D-v0.4 decisions (U-K1/U-T1, integrated foundations)
+
+- **D-v0.4.51 — Skill and tool manifests are inert U-X1 registry artifacts;
+  the kernel stays framework-neutral.** `beast.skill-manifest/v1` and
+  `beast.tool-manifest/v1` join the embedded schema registry with the
+  passport's reduced envelope; `REQUIRED_IDENTITIES` grows from four to
+  six, the `protocols/` projection is regenerated, and the three spine
+  assertions that pinned "exactly four" (the identity list,
+  `len(REGISTRY)`, and the `protocol list` line count) update to six — the
+  one versioned protocol change, documented in the frozen contract (§14). Every U-X1 rule
+  applies unchanged: canonical JSON v1, self-excluding `content_sha256`,
+  strict unknown-field refusal, credential-shaped property names
+  unrepresentable. Cross-field manifest rules (`unsafe_retry_policy`,
+  `compensation_*`, `recovery_compensation_mismatch`,
+  `replacement_lifecycle_mismatch`, `self_dependency`) live in the spine's
+  `_check_semantics`, presence-guarded so no existing schema's behavior
+  changes. Rejected: adopting Atomic Agents, Claude Agent
+  SDK, or MCP as the kernel (adapters are subordinate, later units); a
+  second manifest format outside the registry — the U-A2 internal-index
+  precedent covers a file with one consumer, while manifests are authored
+  cross-system declarations like passports.
+
+- **D-v0.4.52 — Descriptive metadata never grants authority.** A manifest
+  declares `required_capabilities`; the execution context carries
+  `granted_capabilities`; eligibility requires the subset relation plus
+  every other gate, computed by `governance.evaluate_eligibility` into a
+  typed decision over the closed vocabulary `allow | deny | needs_approval
+  | unavailable | invalid` with closed reason codes in canonical emission
+  order and pinned precedence (invalid > deny > needs_approval >
+  unavailable). Display fields (`display_name`, `description`,
+  `recovery.note`) are read by nothing; `approvals_required` and
+  `approval_ref` are declarations and opaque references — no field
+  anywhere can claim approval was granted. No model output is an input to
+  any governance decision. Rejected: bare-Boolean eligibility; partial or
+  fuzzy capability matching; reading autonomy/eligibility out of prose.
+
+- **D-v0.4.53 — U-K1/U-T1 is a runtime-only foundation: no persistence, no
+  CLI, no doctor change.** Manifests are documents, registries are frozen
+  in-memory values, evidence is a returned record; `SCHEMA_VERSION` stays
+  `"5"`, no table, no migration, no ID prefix, no event, no
+  `power.COMMAND_POLICY` entry. `aos protocol validate` and `aos protocol
+  verify-registry` already cover the new artifacts through registry
+  dispatch. Rejected: manifest tables and a 5→6 migration (anticipatory
+  storage for U-W1 — the D-v0.4.6 rule against pre-minting the next
+  unit's rows); a governance-decision CLI that would invent an
+  authority-context file format ahead of any consumer.
+
+- **D-v0.4.54 — Implementation binding is explicit, digest-verified in-code
+  registration.** A binding is a closed canonical record
+  (`aos.implementation-binding/v1`) plus, for `in_process` kind, a Python
+  callable handed to `BindingRegistry.register` in code; `metadata`
+  bindings prove the contract and can never execute. The manifest declares
+  the binding id and the record's sha256; eligibility verifies registered
+  → binds this exact component → digest equals declaration, failing closed
+  on each. No import path, module string, command, or URL is representable
+  anywhere in the vocabulary, so naming code cannot run code. Rejected:
+  dotted-path dynamic import (the Atomic Agents evaluation's central
+  hazard); hashing Python code objects (not deterministic across builds —
+  the digest covers the canonical record).
+
+- **D-v0.4.55 — A deadline is not a cancellation, and termination is a
+  separate truth.** Results carry `deadline_exceeded` as a status about
+  lateness plus a closed termination outcome; this unit's in-process
+  runner honestly emits only `not_started` and `completed` (a callable
+  that returned control — by value or by raising — mechanically
+  finished). `cooperative_cancelled`, `subprocess_terminated`,
+  `remote_cancellation_requested`, `abandoned`, and `not_supported` exist
+  in the vocabulary for adapters that can prove them; no sandbox or
+  cancellation transport is implemented or claimed, and a manifest's
+  `cancellation` field is a declared mode, not a behavior. Rejected:
+  reporting deadline expiry as termination; pretending a userspace guard
+  is a sandbox.
+
+- **D-v0.4.56 — Unsafe retry combinations are unrepresentable, and
+  `retryable` is derived, never asserted.** Schema-level:
+  `retry.max_attempts` is bounded 1–10 and a mutating tool with
+  `max_attempts > 1` must declare `idempotency: required_key` or a
+  compensating action (`unsafe_retry_policy` refusal). Runtime:
+  `idempotency_ref_required` and `attempt_budget_exhausted` refuse before
+  execution; `derive_retryable` is the only producer of `retryable`
+  (status ∈ {transient_failure, deadline_exceeded}, attempt below both
+  the context and manifest bounds, and the mutating gate again). Agentic
+  OS owns the outer attempt budget — invoke() executes exactly one
+  attempt, hidden framework retries are neither representable nor
+  trusted, and the retry loop itself is U-W1's. Rejected: an in-memory
+  replay cache pretending to be durable idempotency; trusting a
+  framework's internal retry counter.
+
+- **D-v0.4.57 — Invocation evidence is digest-only.**
+  `aos.governed-invocation-evidence/v1` binds invocation id, component
+  identity/version, manifest and binding digests, principal and caller,
+  decision and reasons, attempt accounting, timing, status, error code,
+  input/output digests, termination outcome, recovery action, trace ids,
+  and an optional `previous_sha256` chain link, then self-digests. The
+  idempotency reference is bound as a sha256 leaf; raw inputs, outputs,
+  references, and exception text are never copied in — there is no
+  free-text field to leak through, which is stronger than redaction.
+  Evidence records what the runner did, not what any model claimed.
+  Rejected: embedding "redacted" payload excerpts; trusting
+  caller-supplied evidence fields.
+
+- **D-v0.4.58 — Passport requirement resolution is a read-only
+  projection.** `resolve_passport_requirements` resolves the
+  `skill_requirements`/`tool_requirements` strings U-A1 froze (and
+  explicitly deferred to this unit) against the registries, yielding
+  per-item closed codes (`resolved | unknown_component |
+  unknown_version`) plus resolved version and manifest digest. The
+  passport schema, routing evaluator, handoffs, and every existing
+  fixture are byte-unchanged. Rejected: widening the passport schema;
+  installing or activating anything as a side effect of resolution.
+
 # DECISIONS — Agentic OS v0.4 U-P2 trust-boundary amendment (Wave 0.5)
 
 This section continues the `D-v0.4.*` series for the U-P2 Wave 0.5

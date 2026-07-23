@@ -188,13 +188,17 @@ class ReasonCase(unittest.TestCase):
 
 
 class RegistryTests(ReasonCase):
-    def test_registry_contains_exactly_the_four_required_v1_schemas(self):
+    def test_registry_contains_exactly_the_six_required_v1_schemas(self):
+        # U-K1/U-T1 added the two manifest schemas — the one versioned
+        # registry change that unit's contract documents (§14).
         self.assertEqual(
             [entry.identity for entry in protocols.list_entries()],
             [
                 "beast.agent-passport/v1",
                 "beast.interrupt/v1",
                 "beast.result-envelope/v1",
+                "beast.skill-manifest/v1",
+                "beast.tool-manifest/v1",
                 "beast.work-spec/v1",
             ],
         )
@@ -386,7 +390,7 @@ class RegistryRefusalTests(ReasonCase):
             del protocols.REGISTRY["beast.work-spec/v1"]  # type: ignore[attr-defined]
         self.assertFalse(hasattr(protocols, "register"))
         self.assertFalse(hasattr(protocols, "register_schema"))
-        self.assertEqual(len(protocols.REGISTRY), 4)
+        self.assertEqual(len(protocols.REGISTRY), 6)
 
 
 class SchemaLintTests(ReasonCase):
@@ -1926,7 +1930,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(first.stdout, second.stdout)
         lines = first.stdout.strip().splitlines()
-        self.assertEqual(len(lines), 4)
+        self.assertEqual(len(lines), 6)
         for line, entry in zip(lines, protocols.list_entries()):
             self.assertIn(entry.name, line)
             self.assertIn(f"v{entry.major}", line)
