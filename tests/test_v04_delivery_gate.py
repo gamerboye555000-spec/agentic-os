@@ -24,14 +24,20 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import errno
 import importlib.util
 import io
+import os
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
+import warnings
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -435,7 +441,8 @@ class DiagnosticQualityTests(VerifierTestBase):
 
 class IsolationTests(VerifierTestBase):
     def test_verifier_imports_only_stdlib_and_no_network_or_subprocess(self):
-        tree = ast.parse(VERIFIER_PATH.read_text())
+        source = VERIFIER_PATH.read_text()
+        tree = ast.parse(source)
         imported: set[str] = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -443,7 +450,15 @@ class IsolationTests(VerifierTestBase):
                     imported.add(alias.name.split(".")[0])
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imported.add(node.module.split(".")[0])
-        self.assertLessEqual(imported, {"__future__", "re", "sys", "pathlib"})
+        # os/stat/errno are pulled in only by the bounded regular-file reader
+        # (O_NOFOLLOW/O_NONBLOCK open, fstat, ELOOP classification) — all
+        # standard library, none of them network or subprocess.
+        self.assertLessEqual(
+            imported, {"__future__", "errno", "os", "re", "stat", "sys", "pathlib"}
+        )
+        # Admitting os must not smuggle in a process-spawning escape hatch.
+        for banned in ("os.system", "os.popen", "os.exec", "os.spawn", "os.posix_spawn", "os.fork"):
+            self.assertNotIn(banned, source, banned)
 
     def test_verifier_never_opens_a_socket_or_spawns_a_subprocess(self):
         boom = AssertionError("network or subprocess used")
@@ -596,6 +611,641 @@ class UsageErrorTests(VerifierTestBase):
         self.assertEqual(code, 2)
         self.assertEqual(out, "")
         self.assertIn("usage:", err)
+
+
+# ---------------------------------------------------------------------------
+# Wave 2: proofs of the actual workflow blocks and the hardened reader.
+#
+# These execute the REAL inline Python extracted from ci.yml by stable step
+# name — never a re-implementation — and assert on the frozen workflow shape.
+# Every expected literal stays test-local; no fixture is written in the repo.
+
+BUILDER_PATH = REPO_ROOT / "tools" / "build_zipapp.py"
+
+
+def _load_build_zipapp():
+    spec = importlib.util.spec_from_file_location("aos_build_zipapp_dg", BUILDER_PATH)
+    assert spec is not None and spec.loader is not None, f"cannot load {BUILDER_PATH}"
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _step_run_body(workflow_text: str, step_name: str) -> str:
+    """Return the dedented shell body of a step's `run: |` block scalar,
+    located by its exact `name:`. Dedenting by the block's own base indent
+    yields precisely what GitHub's bash would execute."""
+    lines = workflow_text.split("\n")
+    i = lines.index("      - name: " + step_name)
+    j = i + 1
+    while lines[j].strip() != "run: |":
+        j += 1
+    body = []
+    k = j + 1
+    while k < len(lines):
+        line = lines[k]
+        if line.strip() == "":
+            body.append(line)
+            k += 1
+            continue
+        if len(line) - len(line.lstrip(" ")) <= 8:  # dedent to the step key => end
+            break
+        body.append(line)
+        k += 1
+    return textwrap.dedent("\n".join(body))
+
+
+def _extract_python_block(workflow_text: str, step_name: str) -> str:
+    """The exact Python that `python3 - <<'PY' ... PY` runs in a given step."""
+    body = _step_run_body(workflow_text, step_name).split("\n")
+    start = next(idx for idx, line in enumerate(body) if line.strip() == "python3 - <<'PY'")
+    end = next(idx for idx, line in enumerate(body) if idx > start and line.strip() == "PY")
+    return "\n".join(body[start + 1:end])
+
+
+def _synthetic_source_tree(root: Path):
+    """A minimal but valid-shaped agentic_os tree: a few package modules plus
+    exactly the 13 catalog json files the wheel block requires. Bytes are
+    arbitrary — the blocks byte-compare against this tree, they never parse it."""
+    (root / "agentic_os" / "catalog").mkdir(parents=True)
+    package = {
+        "agentic_os/__init__.py": b"__version__ = '0.0.0'\n",
+        "agentic_os/__main__.py": b"from agentic_os.cli import main\n",
+        "agentic_os/cli.py": b"def main(argv=None):\n    return 0\n",
+    }
+    catalog = {"agentic_os/catalog/manifest.json": b'{"manifest":1}\n'}
+    for index in range(12):
+        catalog["agentic_os/catalog/aos.stub%02d.v1.passport.json" % index] = (
+            b'{"passport":%d}\n' % index
+        )
+    for name, data in {**package, **catalog}.items():
+        (root / name).write_bytes(data)
+    return package, catalog
+
+
+def _write_zip(path: Path, items) -> None:
+    """Write a ZIP whose member names are stored verbatim, so hostile names
+    (backslash, traversal, absolute, case collision, duplicate) survive."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # a deliberate duplicate name warns; that is fine
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, data in items:
+                info = zipfile.ZipInfo("placeholder")
+                info.filename = name  # bypass ZipInfo's name sanitization
+                archive.writestr(info, data)
+
+
+def _with(items, name, data):
+    return [(n, data if n == name else d) for n, d in items]
+
+
+def _without(items, name):
+    return [(n, d) for n, d in items if n != name]
+
+
+def _run_block(block: str, source_root: Path, runner_temp: Path):
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)  # the block must resolve members from RUNNER_TEMP + cwd only
+    env["RUNNER_TEMP"] = str(runner_temp)
+    return subprocess.run(
+        [sys.executable, "-"],
+        input=block.encode("utf-8"),
+        cwd=str(source_root),
+        env=env,
+        capture_output=True,
+        timeout=60,
+    )
+
+
+class WorkflowShapeProofTests(VerifierTestBase):
+    """Mechanical proofs of the frozen shape and the Wave 2 hardening, asserted
+    against the actual .github/workflows/ci.yml. Expected literals are local."""
+
+    def setUp(self):
+        self.text = WORKFLOW_PATH.read_text()
+
+    def test_immutable_action_pins_are_exact(self):
+        self.assertEqual(
+            self.text.count(f"uses: actions/checkout@{CHECKOUT_SHA}        # v7.0.1"), 4
+        )
+        self.assertEqual(
+            self.text.count(f"uses: actions/setup-python@{SETUP_PYTHON_SHA}    # v7.0.0"), 4
+        )
+
+    def test_job_ids_and_check_names_are_exact(self):
+        for job_id in (
+            "workflow-integrity",
+            "tests-python-3-12",
+            "tests-python-3-14",
+            "distribution-smoke-python-3-12",
+        ):
+            self.assertIn(f"  {job_id}:\n", self.text)
+        for name in CHECK_NAMES:
+            self.assertIn(f"    name: {name}\n", self.text)
+
+    def test_python_feature_lines_are_exact(self):
+        self.assertEqual(self.text.count('python-version: "3.12"'), 3)
+        self.assertEqual(self.text.count('python-version: "3.14"'), 1)
+
+    def test_runner_timeouts_triggers_permissions_concurrency_are_exact(self):
+        self.assertEqual(self.text.count("runs-on: ubuntu-24.04"), 4)
+        self.assertEqual(self.text.count("    timeout-minutes: 10\n"), 1)
+        self.assertEqual(self.text.count("    timeout-minutes: 30\n"), 3)
+        self.assertIn("permissions:\n  contents: read\n", self.text)
+        for trigger in ("  pull_request:\n", "  push:\n", "  workflow_dispatch:\n"):
+            self.assertIn(trigger, self.text)
+        self.assertIn(
+            "concurrency:\n"
+            "  group: ci-${{ github.ref }}\n"
+            "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n",
+            self.text,
+        )
+
+    def test_pythonpath_is_cleared_before_every_independent_product_execution(self):
+        for step in (
+            "Install the wheel and smoke the console script",
+            "Smoke the zipapp",
+            "Assert entrypoint help equivalence",
+        ):
+            body = _step_run_body(self.text, step)
+            statements = [line.strip() for line in body.splitlines() if line.strip()]
+            # cleared immediately after strict-bash activation, before execution
+            self.assertEqual(statements[0], "set -euo pipefail", step)
+            self.assertEqual(statements[1], "unset PYTHONPATH", step)
+
+    def test_module_help_is_the_only_intentional_checkout_source(self):
+        body = _step_run_body(self.text, "Assert entrypoint help equivalence")
+        self.assertIn('console_help="$("$RUNNER_TEMP/venv/bin/aos" --help)"', body)
+        self.assertIn(
+            'module_help="$(cd "$GITHUB_WORKSPACE" && python3 -m agentic_os --help)"', body
+        )
+        self.assertIn('zipapp_help="$(python3 "$RUNNER_TEMP/aos.pyz" --help)"', body)
+        self.assertIn('test "$console_help" = "$module_help"', body)
+        self.assertIn('test "$console_help" = "$zipapp_help"', body)
+
+    def test_failure_sensitive_git_status_capture(self):
+        # Every clean-tree assertion captures status first, so a failing
+        # `git status` aborts the step under `set -euo pipefail` rather than
+        # being discarded inside a command substitution.
+        self.assertEqual(self.text.count('status="$(git status --porcelain)"'), 3)
+        self.assertEqual(self.text.count('test -z "$status"'), 3)
+
+    def test_no_discarded_status_or_masked_git_failure(self):
+        self.assertNotIn('test -z "$(git status --porcelain)"', self.text)
+        # The residue query is captured on its own line, so a git failure is
+        # never masked by the `|| true` that tolerates an empty grep result.
+        self.assertIn('ignored_residue="$(git status --porcelain --ignored)"', self.text)
+        self.assertNotIn("git status --porcelain --ignored | grep", self.text)
+
+    def test_workspace_mkdir_precedes_each_init(self):
+        self.assertIn('mkdir -p "$RUNNER_TEMP/ws-wheel"', self.text)
+        self.assertIn('mkdir -p "$RUNNER_TEMP/ws-zipapp"', self.text)
+
+    def test_wheel_and_zipapp_run_the_same_smoke_verbs(self):
+        wheel = _step_run_body(self.text, "Install the wheel and smoke the console script")
+        zipapp = _step_run_body(self.text, "Smoke the zipapp")
+        for verb in ("--help", "init", "status", "doctor", "protocol verify-registry"):
+            self.assertIn(verb, wheel, verb)
+            self.assertIn(verb, zipapp, verb)
+
+    def test_no_hook_management_smoke_command(self):
+        for banned in ("hooks install", "hooks status", "hooks uninstall"):
+            self.assertNotIn(banned, self.text, banned)
+
+    def test_no_git_clean_anywhere(self):
+        self.assertNotIn("git clean", self.text)
+
+
+class _MembershipBlockTestBase(VerifierTestBase):
+    STEP_NAME: str = ""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.block = _extract_python_block(WORKFLOW_PATH.read_text(), cls.STEP_NAME)
+        compile(cls.block, cls.STEP_NAME, "exec")  # the extracted source is valid Python
+
+    def _fixture(self):
+        source_root = Path(tempfile.mkdtemp(prefix="aos-dg-src-"))
+        self.addCleanup(shutil.rmtree, source_root, ignore_errors=True)
+        package, catalog = _synthetic_source_tree(source_root)
+        runner_temp = Path(tempfile.mkdtemp(prefix="aos-dg-rt-"))
+        self.addCleanup(shutil.rmtree, runner_temp, ignore_errors=True)
+        return source_root, runner_temp, package, catalog
+
+
+class WheelMembershipBlockTests(_MembershipBlockTestBase):
+    """Execute the real 'Assert wheel membership' block against valid and
+    hostile wheel-shaped fixtures created outside the repository."""
+
+    STEP_NAME = "Assert wheel membership"
+
+    @staticmethod
+    def _valid_items(package, catalog):
+        return (
+            list(package.items())
+            + list(catalog.items())
+            + [
+                ("agentic_os-1.0.dist-info/METADATA", b"Metadata-Version: 2.1\n"),
+                ("agentic_os-1.0.dist-info/RECORD", b"\n"),
+                ("agentic_os-1.0.dist-info/WHEEL", b"Wheel-Version: 1.0\n"),
+            ]
+        )
+
+    def _place(self, runner_temp, items):
+        (runner_temp / "dist").mkdir(exist_ok=True)
+        _write_zip(runner_temp / "dist" / "agentic_os-1.0-py3-none-any.whl", items)
+
+    def test_valid_canonical_wheel_fixture_passes(self):
+        source_root, runner_temp, package, catalog = self._fixture()
+        self._place(runner_temp, self._valid_items(package, catalog))
+        result = _run_block(self.block, source_root, runner_temp)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(b"wheel membership OK", result.stdout)
+
+    def test_hostile_wheels_fail_closed(self):
+        extra_py = ("agentic_os/extra.py", b"x = 1\n")
+        extra_catalog = ("agentic_os/catalog/extra.json", b"{}\n")
+        mutations = {
+            "duplicate member": lambda base: base + [("agentic_os/cli.py", b"dup")],
+            "traversal member": lambda base: base + [("agentic_os/../evil.py", b"x")],
+            "absolute member": lambda base: base + [("/etc/passwd", b"x")],
+            "backslash member": lambda base: base + [("agentic_os\\evil.py", b"x")],
+            "case collision": lambda base: base + [("agentic_os/CLI.py", b"x")],
+            "unexpected top-level member": lambda base: base + [("setup.py", b"x")],
+            "unexpected directory entry": lambda base: base + [("evil/", b"")],
+            "second dist-info root": lambda base: base
+            + [("agentic_os-9.9.9.dist-info/METADATA", b"x")],
+            "modified package bytes": lambda base: _with(base, "agentic_os/cli.py", b"MUTATED\n"),
+            "missing package module": lambda base: _without(base, "agentic_os/cli.py"),
+            "extra package module": lambda base: base + [extra_py],
+            "modified catalog json": lambda base: _with(
+                base, "agentic_os/catalog/manifest.json", b"MUTATED\n"
+            ),
+            "missing catalog json": lambda base: _without(
+                base, "agentic_os/catalog/manifest.json"
+            ),
+            "extra catalog json": lambda base: base + [extra_catalog],
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(case=label):
+                source_root, runner_temp, package, catalog = self._fixture()
+                self._place(runner_temp, mutate(self._valid_items(package, catalog)))
+                result = _run_block(self.block, source_root, runner_temp)
+                self.assertEqual(
+                    result.returncode, 1, f"{label}: expected refusal\n{result.stdout}{result.stderr}"
+                )
+                self.assertTrue(result.stdout.startswith(b"wheel:"), result.stdout)
+
+    def test_more_than_one_wheel_is_refused(self):
+        source_root, runner_temp, package, catalog = self._fixture()
+        self._place(runner_temp, self._valid_items(package, catalog))
+        _write_zip(
+            runner_temp / "dist" / "agentic_os-2.0-py3-none-any.whl",
+            self._valid_items(package, catalog),
+        )
+        result = _run_block(self.block, source_root, runner_temp)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+    def test_hostile_wheel_member_names_fail_closed(self):
+        """Correction A cases 1-8: drive-like absolute/relative, NUL-bearing,
+        empty, empty/dot path components, and nested / bare-file `.dist-info`
+        members. Each is added to an otherwise-valid wheel and must drive the
+        REAL extracted block to a nonzero exit.
+
+        Observed CPython zipfile behavior (verified on 3.12, and by design on
+        3.14): a member name is truncated at its first NUL before the central
+        directory records it, so the block never sees the NUL. The NUL case
+        therefore proves refusal of the *constructed archive* via the survivor
+        name ``agentic_os/evil.py`` — refused as an unexpected member — and does
+        NOT claim the internal ``"\\x00" in name`` guard was reached.
+        """
+        cases = {
+            # label -> (hostile member name, whether zipfile truncates at NUL)
+            "drive-like absolute member": "C:/evil.py",
+            "drive-like relative member": "c:evil.py",
+            "NUL-bearing member (truncated by zipfile to agentic_os/evil.py)":
+                "agentic_os/evil.py\x00.py",
+            "empty member name": "",
+            "empty path component": "agentic_os//evil.py",
+            "dot path component": "agentic_os/./evil.py",
+            "nested .dist-info member": "agentic_os-1.0.dist-info/licenses/LICENSE",
+            "bare .dist-info root as a non-directory file": "agentic_os-1.0.dist-info",
+        }
+        for label, member in cases.items():
+            with self.subTest(case=label):
+                source_root, runner_temp, package, catalog = self._fixture()
+                items = self._valid_items(package, catalog) + [(member, b"x")]
+                self._place(runner_temp, items)
+                result = _run_block(self.block, source_root, runner_temp)
+                self.assertEqual(
+                    result.returncode, 1,
+                    f"{label}: expected refusal\n{result.stdout}{result.stderr}",
+                )
+                self.assertTrue(result.stdout.startswith(b"wheel:"), result.stdout)
+
+    def test_hostile_wheel_source_tree_shapes_fail_closed(self):
+        """Correction A cases 9-10: source-tree preconditions the block reads
+        from the working directory. A tree with no package Python modules, and a
+        tree whose ``agentic_os/catalog`` json count is not exactly 13, each
+        drive the REAL extracted block to a nonzero exit before the wheel is
+        even opened."""
+        with self.subTest(case="source tree with no package Python modules"):
+            source_root, runner_temp, package, catalog = self._fixture()
+            for module in (source_root / "agentic_os").rglob("*.py"):
+                module.unlink()
+            self._place(runner_temp, self._valid_items(package, catalog))
+            result = _run_block(self.block, source_root, runner_temp)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertTrue(result.stdout.startswith(b"wheel:"), result.stdout)
+
+        with self.subTest(case="source tree with a catalog count other than 13"):
+            source_root, runner_temp, package, catalog = self._fixture()
+            (source_root / "agentic_os" / "catalog" / "extra.json").write_bytes(b"{}\n")
+            self._place(runner_temp, self._valid_items(package, catalog))
+            result = _run_block(self.block, source_root, runner_temp)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertTrue(result.stdout.startswith(b"wheel:"), result.stdout)
+
+
+class ZipappMembershipBlockTests(_MembershipBlockTestBase):
+    """Execute the real 'Assert zipapp membership' block against valid and
+    hostile fixtures, and against an actual archive from tools/build_zipapp.py."""
+
+    STEP_NAME = "Assert zipapp membership"
+
+    @staticmethod
+    def _valid_items(package, catalog):
+        root_main = package["agentic_os/__main__.py"]
+        return (
+            [("__main__.py", root_main)]
+            + list(package.items())
+            + list(catalog.items())
+            + [("agentic_os/", b""), ("agentic_os/catalog/", b"")]
+        )
+
+    def _place(self, runner_temp, items):
+        _write_zip(runner_temp / "aos.pyz", items)
+
+    def test_valid_canonical_zipapp_fixture_passes(self):
+        source_root, runner_temp, package, catalog = self._fixture()
+        self._place(runner_temp, self._valid_items(package, catalog))
+        result = _run_block(self.block, source_root, runner_temp)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(b"zipapp membership OK", result.stdout)
+
+    def test_real_build_zipapp_output_passes(self):
+        """The actual archive tools/build_zipapp.py produces from the real
+        source tree passes the block — offline, stdlib-only."""
+        builder = _load_build_zipapp()
+        runner_temp = Path(tempfile.mkdtemp(prefix="aos-dg-realpyz-"))
+        self.addCleanup(shutil.rmtree, runner_temp, ignore_errors=True)
+        builder.build(runner_temp / "aos.pyz")
+        result = _run_block(self.block, REPO_ROOT, runner_temp)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(b"zipapp membership OK", result.stdout)
+
+    def test_hostile_zipapps_fail_closed(self):
+        extra_py = ("agentic_os/extra.py", b"x = 1\n")
+        extra_catalog = ("agentic_os/catalog/extra.json", b"{}\n")
+        mutations = {
+            "duplicate member": lambda base: base + [("agentic_os/cli.py", b"dup")],
+            "traversal member": lambda base: base + [("agentic_os/../evil.py", b"x")],
+            "absolute member": lambda base: base + [("/etc/passwd", b"x")],
+            "backslash member": lambda base: base + [("agentic_os\\evil.py", b"x")],
+            "case collision": lambda base: base + [("agentic_os/CLI.py", b"x")],
+            "unexpected top-level member": lambda base: base + [("evil.py", b"x")],
+            "unexpected directory entry": lambda base: base + [("evil/", b"")],
+            "modified root __main__": lambda base: _with(base, "__main__.py", b"MUTATED\n"),
+            "modified package module": lambda base: _with(base, "agentic_os/cli.py", b"MUTATED\n"),
+            "missing package module": lambda base: _without(base, "agentic_os/cli.py"),
+            "extra package module": lambda base: base + [extra_py],
+            "modified catalog json": lambda base: _with(
+                base, "agentic_os/catalog/manifest.json", b"MUTATED\n"
+            ),
+            "missing catalog json": lambda base: _without(
+                base, "agentic_os/catalog/manifest.json"
+            ),
+            "extra catalog json": lambda base: base + [extra_catalog],
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(case=label):
+                source_root, runner_temp, package, catalog = self._fixture()
+                self._place(runner_temp, mutate(self._valid_items(package, catalog)))
+                result = _run_block(self.block, source_root, runner_temp)
+                self.assertEqual(
+                    result.returncode, 1, f"{label}: expected refusal\n{result.stdout}{result.stderr}"
+                )
+                self.assertTrue(result.stdout.startswith(b"zipapp:"), result.stdout)
+
+    def test_hostile_zipapp_member_names_fail_closed(self):
+        """Correction B: drive-like absolute/relative, NUL-bearing, empty, and
+        empty/dot path-component member names each drive the REAL extracted
+        zipapp block to a nonzero exit. No ``.dist-info`` cases: ``.dist-info``
+        is not a valid zipapp payload.
+
+        As in the wheel block, CPython zipfile truncates a member name at its
+        first NUL, so the NUL construction is refused via its survivor name
+        ``agentic_os/evil.py`` (an unexpected member), not via the internal NUL
+        guard.
+        """
+        cases = {
+            "drive-like absolute member": "C:/evil.py",
+            "drive-like relative member": "c:evil.py",
+            "NUL-bearing member (truncated by zipfile to agentic_os/evil.py)":
+                "agentic_os/evil.py\x00.py",
+            "empty member name": "",
+            "empty path component": "agentic_os//evil.py",
+            "dot path component": "agentic_os/./evil.py",
+        }
+        for label, member in cases.items():
+            with self.subTest(case=label):
+                source_root, runner_temp, package, catalog = self._fixture()
+                items = self._valid_items(package, catalog) + [(member, b"x")]
+                self._place(runner_temp, items)
+                result = _run_block(self.block, source_root, runner_temp)
+                self.assertEqual(
+                    result.returncode, 1,
+                    f"{label}: expected refusal\n{result.stdout}{result.stderr}",
+                )
+                self.assertTrue(result.stdout.startswith(b"zipapp:"), result.stdout)
+
+
+class VerifierInputHardeningTests(VerifierTestBase):
+    """The bounded, regular-file-only reader: existing reason codes only,
+    value-free diagnostics, no traceback, non-mutating, never blocking."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="aos-verify-input-"))
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.payload = self.canonical.encode("utf-8")
+
+    def _target(self, name: str, data: bytes) -> Path:
+        path = self.dir / name
+        path.write_bytes(data)
+        return path
+
+    def test_regular_canonical_file_is_accepted(self):
+        target = self._target("ci.yml", self.payload)
+        code, out, err = self.run_argv(["--workflow", str(target)])
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(out, "")
+
+    def test_missing_file_is_missing_workflow(self):
+        code, out, _ = self.run_argv(["--workflow", str(self.dir / "absent.yml")])
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "missing_workflow\n")
+
+    def test_directory_target_is_unexpected_shape(self):
+        code, out, _ = self.run_argv(["--workflow", str(self.dir)])
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "unexpected_workflow_shape\n")
+
+    def test_symlink_target_is_refused_and_left_untouched(self):
+        real = self._target("real.yml", self.payload)
+        link = self.dir / "link.yml"
+        link.symlink_to(real)
+        code, out, _ = self.run_argv(["--workflow", str(link)])
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "unexpected_workflow_shape\n")
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(real.read_bytes(), self.payload)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "platform lacks a FIFO primitive")
+    def test_fifo_target_is_refused_without_blocking(self):
+        """Correction D: a writerless FIFO must be refused promptly. The REAL
+        verifier CLI runs in a subprocess under a bounded timeout, so a future
+        regression to a blocking open fails THIS test deterministically instead
+        of hanging the whole suite. No writer is ever opened; `subprocess.run`
+        kills and reaps the child on timeout, leaving no background process, and
+        the FIFO is removed by the setUp-registered cleanup even on failure."""
+        fifo = self.dir / "fifo.yml"
+        os.mkfifo(fifo)
+        self.assertTrue(stat.S_ISFIFO(os.lstat(fifo).st_mode))
+        try:
+            result = subprocess.run(
+                [sys.executable, str(VERIFIER_PATH), "--workflow", str(fifo)],
+                capture_output=True,
+                timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail(
+                "verifier blocked on a writerless FIFO — regression to a blocking open"
+            )
+        self.assertEqual(result.returncode, 1, result.stderr.decode(errors="replace"))
+        self.assertEqual(result.stdout.decode(), "unexpected_workflow_shape\n")
+        self.assertTrue(stat.S_ISFIFO(os.lstat(fifo).st_mode))
+
+    def test_oversized_regular_file_is_unexpected_shape(self):
+        target = self._target("big.yml", b"x" * (self.vcw.MAX_WORKFLOW_BYTES + 1))
+        code, out, _ = self.run_argv(["--workflow", str(target)])
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "unexpected_workflow_shape\n")
+
+    def test_invalid_utf8_is_reported(self):
+        target = self._target("bad.yml", b"\xff\xfe not utf-8\n")
+        code, out, _ = self.run_argv(["--workflow", str(target)])
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "invalid_utf8\n")
+
+    def test_crlf_is_reported(self):
+        target = self._target("crlf.yml", self.canonical.replace("\n", "\r\n").encode("utf-8"))
+        code, out, _ = self.run_argv(["--workflow", str(target)])
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "crlf_present\n")
+
+    def test_bom_prefixed_canonical_is_unexpected_shape(self):
+        target = self._target("bom.yml", b"\xef\xbb\xbf" + self.payload)
+        code, out, _ = self.run_argv(["--workflow", str(target)])
+        self.assertEqual(code, 1)
+        self.assertEqual(self.codes(out), ["unexpected_workflow_shape"])
+
+    def test_internal_failure_is_value_free_internal_error(self):
+        target = self._target("ci.yml", self.payload)
+        with mock.patch.object(self.vcw, "_check_actions", side_effect=RuntimeError("boom")):
+            code, out, err = self.run_argv(["--workflow", str(target)])
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "internal_error\n")
+        self.assertNotIn("Traceback", out + err)
+        self.assertNotIn("boom", out + err)
+
+    def test_reader_outcomes_use_only_frozen_codes(self):
+        seen: set[str] = set()
+        for data in (self.dir / "absent.yml",):
+            _, out, _ = self.run_argv(["--workflow", str(data)])
+            seen.update(self.codes(out))
+        for path in (str(self.dir), str(self._target("big2.yml", b"x" * (self.vcw.MAX_WORKFLOW_BYTES + 2)))):
+            _, out, _ = self.run_argv(["--workflow", path])
+            seen.update(self.codes(out))
+        self.assertLessEqual(seen, FROZEN_REASON_CODES)
+        self.assertEqual(seen, {"missing_workflow", "unexpected_workflow_shape"})
+
+    def test_reader_does_not_mutate_the_target(self):
+        target = self._target("ci.yml", self.payload)
+        self.run_argv(["--workflow", str(target)])
+        self.assertEqual(target.read_bytes(), self.payload)
+
+    def test_character_device_target_is_unexpected_shape(self):
+        """Correction C: a character device (fstat reports S_ISCHR, not
+        S_ISREG) is refused as `unexpected_workflow_shape` with no traceback and
+        no path/value leakage. Skipped only where no character device exists."""
+        dev = "/dev/null"
+        if not (os.path.exists(dev) and stat.S_ISCHR(os.stat(dev).st_mode)):
+            self.skipTest("no character device equivalent to /dev/null available")
+        code, out, err = self.run_argv(["--workflow", dev])
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "unexpected_workflow_shape\n")
+        self.assertNotIn("Traceback", out + err)
+        self.assertNotIn(dev, out + err)
+
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "platform lacks AF_UNIX sockets")
+    def test_unix_socket_target_is_missing_workflow(self):
+        """Correction C: opening a bound AF_UNIX socket path raises ENXIO, which
+        the reader maps to the implementation's frozen `missing_workflow`
+        classification. Value-free, no traceback; the socket is closed and its
+        path removed deterministically, even if an assertion fails."""
+        sock_path = self.dir / "target.sock"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(sock_path))
+        try:
+            self.assertTrue(stat.S_ISSOCK(os.lstat(sock_path).st_mode))
+            code, out, err = self.run_argv(["--workflow", str(sock_path)])
+            self.assertEqual(code, 1)
+            self.assertEqual(out, "missing_workflow\n")
+            self.assertNotIn("Traceback", out + err)
+            self.assertNotIn(str(sock_path), out + err)
+        finally:
+            server.close()
+            if sock_path.exists():
+                sock_path.unlink()
+
+    def test_eacces_target_is_missing_workflow(self):
+        """Correction C: an unreadable target. Rather than rely on chmod 000 (a
+        privileged runner may still read it), the verifier module's `os.open`
+        boundary is patched to raise PermissionError(EACCES) for this exact
+        path; the real `main()` then maps the failed open to `missing_workflow`.
+        The patch is restored automatically by the context manager, no finding
+        is constructed directly, and output is value-free with no traceback.
+
+        The target is a real, readable, canonical file, so only the injected
+        EACCES can produce the refusal — proving the reader's real open path
+        (not a byte-content check) was exercised."""
+        target = self._target("ci.yml", self.payload)
+        real_open = os.open
+
+        def fake_open(path, *args, **kwargs):
+            if os.fspath(path) == str(target):
+                raise PermissionError(errno.EACCES, "Permission denied")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch.object(self.vcw.os, "open", side_effect=fake_open):
+            code, out, err = self.run_argv(["--workflow", str(target)])
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "missing_workflow\n")
+        self.assertNotIn("Traceback", out + err)
+        self.assertNotIn(str(target), out + err)
+        self.assertNotIn("Permission denied", out + err)
 
 
 if __name__ == "__main__":
