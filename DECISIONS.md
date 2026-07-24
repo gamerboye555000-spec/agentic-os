@@ -1,3 +1,240 @@
+# DECISIONS — Agentic OS v0.4 U-W1 deterministic WorkSpec compiler (Wave 0)
+
+This section continues the `D-v0.4.*` series for the U-W1 Wave 0
+architecture freeze: the deterministic WorkSpec
+compiler/linter/resolver/decompiler/semantic-diff unit, frozen in
+`agentic-os-v0.4-u-w1-workspec-compiler-contract.md`. Architecture only —
+no production code, tests, CLI, persistence, scheduling, or execution ship
+in this wave. Branch `v0.4-u-w1-workspec-compiler` (2026-07-24), worktree
+`/home/daksh/Projects/agentic-os-u-w1`, baseline
+`8cf82432d4c137d4a1513f9daee39cc3ee0be92b` (U-K1/U-T1 governed foundations
+merged, ledger schema version `"5"`, milestone
+`milestone/v0.4-u-k1-u-t1-governed-foundations`). Future PR title:
+`feat(v0.4): U-W1 — deterministic WorkSpec compiler`; future tag:
+`milestone/v0.4-u-w1-workspec-compiler`. The Atomic Agents evaluation
+repository is not read in this wave. Prepended per the established
+precedent (D-W0.4, reaffirmed in D-v0.2.7, D-v0.4.4); everything below
+stays byte-identical.
+
+## D-v0.4 decisions (U-W1, Wave 0 architecture freeze)
+
+- **D-v0.4.59 — U-W1 is the static half; the U-W1/U-W2/U-W3 runtime
+  boundary is frozen.** U-W1 compiles, lints, resolves, decompiles, and
+  semantically diffs inert `beast.work-spec/v1` WorkSpecs; it executes
+  zero attempts, schedules zero work, and persists no workflow state.
+  U-W2 owns the deterministic workflow state engine and queue integration
+  (the blueprint §9.2 lifecycle vocabulary is U-W2's). U-W3 owns
+  checkpoints, resume, runtime retry, and compensation. U-K1/U-T1
+  `invoke()` remains single-attempt and byte-unchanged. The two live
+  sentences saying the outer attempt loop "is U-W1's" (the
+  `governance.invoke()` docstring and the U-K1/U-T1 contract §0.2 /
+  D-v0.4.56) are narrowed, not contradicted: U-W1 compiles and statically
+  validates attempt constraints (`retry.max_attempts`,
+  `retry.deadline_at`, and their compatibility with resolved tool
+  manifests); runtime looping is U-W3's. No code changes for this; the
+  docstring prose sits outside U-W1's file boundary and is retouched only
+  by a unit that already modifies `governance.py`. Rejected: shipping
+  even a "minimal" retry loop in U-W1 (execution semantics without a
+  state engine, checkpoints, or compensation would be an untestable
+  half-runtime); editing `governance.py` from this unit just to rephrase
+  a comment.
+
+- **D-v0.4.60 — `beast.work-spec/v1` is reused unchanged.** The live
+  schema — closed fields, static `retry` intent, opaque `policy_refs`,
+  approval booleans/credentials/environment maps/executable fields
+  unrepresentable — was verified sufficient for the whole U-W1 surface.
+  No v2 identity, no second WorkSpec schema, no registry growth
+  (`REQUIRED_IDENTITIES` stays six), no `protocols/` projection change
+  (the checked-in work-spec schema digest
+  `07ac96ba08a1579bbd681ab4087156e9d8facf849f3348e0e494658f3acceab9`
+  remains exact), no edit to `agentic_os/protocols.py`. A protocol change
+  any later U-W1 wave proves necessary is a replan condition (`FAIL —
+  REPLAN REQUIRED`), never an in-flight amendment. Rejected: a richer v2
+  toward the blueprint §9.1 table ahead of any consumer; embedding
+  resolution results in the artifact (`additionalProperties: false` and
+  inertness both forbid it — resolutions ride in the compile report).
+
+- **D-v0.4.61 — The authoring input is a closed, bounded, inert
+  contract.** `aos.work-spec-authoring/v1` with the pinned
+  `aos-workspec-compile/v1` algorithm version (the `aos.routing-request/v1`
+  idiom; not a registry artifact). Four frozen field classes: explicit
+  (`created_at`, `issuer`, `audience`, `scope`, `aos_task_id`,
+  `data_classification`, `goal`, `acceptance_criteria`, plus optional
+  schema-validated pass-throughs), mechanically defaulted (content-derived
+  `work_spec_id`/`idempotency_key`/`trace` via frozen sha256 domain-tag
+  derivations; the least-authority `permitted_destinations` floor
+  `["aos-ledger", "local"]`; the weakest honest `expected_result` floor;
+  the protocol constants), mechanically resolved (`content_sha256` and all
+  report content), and forbidden (`schema`, `protocol_version`,
+  `content_hash_alg`, `content_sha256` in authoring input →
+  `forbidden_field`). No executable expression, import path, command,
+  callable, ambient filesystem scan, network lookup, credential,
+  randomness, locale or environment dependence, or model-granted authority
+  is representable, and the compiler reads no clock (`created_at` is
+  explicit). Requested agents/skills/tools are authoring-only analysis
+  input and are never serialized into the artifact. Rejected: clock or
+  randomness in the compiler (hidden inputs break determinism); defaulting
+  `data_classification`, `issuer`, `audience`, or `aos_task_id`
+  (fabricated facts).
+
+- **D-v0.4.62 — Compilation is a pure function emitting a canonical
+  artifact plus a self-digested report; it grants nothing.**
+  `compile_work_spec(authoring, snapshot)`: normalize (sorted set-arrays,
+  spelled-out defaults) → derive → assemble → validate through
+  `protocols.validate_document` (the same engine every consumer uses) →
+  resolve → lint → status. The artifact is emitted for every status
+  except `invalid`; the report (`aos.work-spec-compile-report/v1`,
+  canonical, self-digested) carries status, findings in canonical order,
+  resolutions, per-field provenance (`explicit | defaulted | resolved`),
+  the applied-defaults list, and exact registry pins (registry version,
+  work-spec schema digest, snapshot digest). Compilation creates no
+  capability, approval, policy decision, budget reservation, secret
+  selection, route authority, or execution permission. Identical
+  `(authoring, snapshot)` yields byte-identical outputs across runs,
+  platforms, and input orderings. Rejected: emitting an artifact for
+  `invalid` input (it either cannot be schema-valid or must not embed the
+  content); free-text report fields; trusting any embedded
+  `content_sha256`.
+
+- **D-v0.4.63 — Semantic lint is closed statics under a six-status
+  precedence and never duplicates a governance decision.** 25 closed
+  reason codes in canonical emission order (the `GOVERNANCE_REASON_CODES`
+  idiom), each mapped to exactly one class; the status is the
+  highest-precedence class with a finding: `invalid > unresolved >
+  ineligible > requires_external_authority > warning > valid`. Findings
+  are value-free: closed code, schema-safe path, enum members, bounded
+  counts, and `secretscan` pattern names — never a field value, document
+  excerpt, or exception text. Secret-shaped free text refuses compile
+  fail-closed (the D-v0.4.19 shipped-content class: a cross-boundary
+  document, not a trusted human's live keystrokes). Lint consumes no
+  `granted_capabilities`, evaluates no execution context, and emits no
+  `allow`/`deny`; `evaluate_eligibility` and `invoke()` re-decide
+  authority at runtime with their own inputs. Rejected: mirroring the
+  governance decision vocabulary in lint (two authorities that can
+  disagree); warn-and-embed handling of secret-shaped compile input.
+
+- **D-v0.4.64 — Resolution is deterministic and snapshot-local.**
+  `WorkSpecSnapshot` = validated `beast.agent-passport/v1` documents with
+  caller-attested ledger lifecycles, plus governance-built skill/tool
+  registries; its canonical projection
+  (`aos.work-spec-registry-snapshot/v1`) digests into every report.
+  Numeric version ordering (integers, never lexicographic); an exact pin
+  resolves exactly or yields `unknown_version`; a bare name resolves the
+  highest version and earns the `unpinned_requirement` warning.
+  Resolution never consults lifecycle or evaluation state — a deprecated
+  or unpromoted latest resolves and then earns its `ineligible` finding,
+  so deprecation stays visible (the governance §7 rule). Duplicate
+  requests and contradictory pins are closed findings; case-folded
+  snapshot name collisions refuse at build (the `build_registry` folded
+  rule); dependency cycles refuse at registry build with governance's
+  `dependency_cycle`, so they cannot reach lint. The compiler never
+  installs, activates, fetches, imports, binds, or executes. Rejected:
+  ledger or database reads inside the compiler; silently skipping
+  ineligible versions during resolution.
+
+- **D-v0.4.65 — A WorkSpec describes requested work; it grants nothing.**
+  `policy_refs.policy_ref`/`approval_ref`/`budget_ref` stay opaque,
+  undereferenced, and non-authoritative until evaluated by their owning
+  subsystem. U-W1 must not approve, reserve or account spend, grant or
+  check capabilities, select credentials, override power mode, construct
+  an execution context, or turn routing/handoff advice into permission —
+  none of these are representable in any U-W1 signature, record schema,
+  or report field. `approval_reference_required` states that external
+  authority will be needed; it never checks it, and a WorkSpec-carried
+  `approval_ref` satisfies nothing at runtime, where governance evaluates
+  its own execution-context inputs. Compile success, `valid` status, and
+  `resolved` codes are consistency statements against a snapshot, never
+  eligibility grants. Rejected: any compile-time "approved"/"funded"
+  status (authority laundering); auto-copying WorkSpec policy refs into
+  an execution context.
+
+- **D-v0.4.66 — Classification and scope are ordered, preserved, and
+  fail-closed.** The `DATA_CLASSIFICATIONS` tuple order is the total
+  order `public < internal < confidential < restricted`.
+  `data_classification` is explicit, required, and emitted exactly as
+  authored — no default, coercion, upgrade, or silent downgrade path
+  exists, and the semantic diff reports any classification change under
+  its own category. A resolved agent must declare the artifact's class in
+  `data_classifications`; an absent declaration fails closed
+  (`classification_mismatch`, the routing rule). A project-scoped
+  resolved agent must match `scope.project` exactly (`scope_mismatch`);
+  global agents are compatible with every project; `scope.tenant` is
+  format-validated and uninterpreted in v1. Diagnostics name paths and
+  enum members only. Rejected: guessing a classification in either
+  direction (too low leaks, too high lies); scope inference from snapshot
+  content.
+
+- **D-v0.4.67 — The decompiler is deterministic, bounded, and
+  secret-safe, and its round-trip claim is semantic only.** Fixed ASCII
+  framing, LF newlines, frozen section order, code-point-sorted paths; no
+  terminal-width probing, locale formatting, or clock stamp. Free-text
+  values truncate at 120 code points with the fixed marker
+  `...(+N chars)`. Every string leaf passes `secretscan.redact_tree`, so
+  an external artifact that never met the compile-time refusal still
+  cannot leak a secret-shaped value. With a digest-matched report
+  (mismatch refuses), fields carry `[explicit]`/`[defaulted]`/`[resolved]`
+  markers. The frozen claim:
+  `compile_work_spec(authoring_view(artifact, report), same snapshot)`
+  reproduces an identical `content_sha256` and report body. Display text
+  is never parsed back, and reconstruction of the author's original input
+  bytes is not claimed — normalization legitimately collapses equivalent
+  spellings, and no U-W1 sentence claims more than this semantic fixed
+  point. Rejected: claiming display-text reversibility; width- or
+  locale-aware rendering.
+
+- **D-v0.4.68 — The semantic diff is typed, closed, and digest-safe.**
+  Change kinds `added | removed | changed` under eight canonical
+  categories (`metadata`, `requirements`, `authority_references`,
+  `budgets_limits`, `retry_idempotency`, `classification`, `resolutions`,
+  `result_contract`); the spine's `/` path grammar with set semantics for
+  uniqueItems string arrays and `(ref_kind, sha256-of-ref)` keys for
+  `inputs`; deterministic order (category, then path, then kind);
+  `from_sha256`/`to_sha256` recomputed from each body, never read from an
+  embedded hash. Raw `from`/`to` values appear only on the frozen
+  allowlist of enum/constant/integer/timestamp/identifier paths;
+  `goal`, `acceptance_criteria[]`, `constraints[]`, `inputs[].ref`,
+  `inputs[].note`, and `idempotency_key` diff by sha256 digest and length
+  only, so no raw secret value can appear. Rejected: raw free-text
+  diffs; order-sensitive diffs of set-semantics arrays (spurious changes
+  from reordering).
+
+- **D-v0.4.69 — Mutation/digest safety and compatibility are frozen.**
+  Every accepted document snapshots by canonical round trip on intake
+  (the `ComponentRegistry`/`EligibilityResult` rule); every return is
+  fresh and unshared, so mutating any input or output after a call
+  changes nothing observable; digests are recomputed over final values at
+  emission — no stale attestation and no trust in embedded hashes;
+  vocabularies are tuples and result types are frozen dataclasses.
+  Existing WorkSpec fixtures, Result Envelope binding
+  (`protocols.verify_binding`), passports, catalog, routing, handoffs,
+  U-K1/U-T1 governance, `secretscan`, packaging (the
+  `packages = ["agentic_os"]` allowlist already ships the one new
+  module), and CI (`unittest discover`, `compileall`,
+  `gen_protocols.py` verify) all remain byte-unchanged. Rejected:
+  caching digests across mutations; touching any existing module to
+  accommodate the compiler.
+
+- **D-v0.4.70 — No persistence, no CLI, no dependency; the implementation
+  boundary is exactly five paths.** No table, migration,
+  `SCHEMA_VERSION` bump (stays `"5"`), event, doctor check, or
+  `power.COMMAND_POLICY` change (the D-v0.4.6 anticipatory-row rule:
+  U-W2 mints its own storage when it exists). No CLI verb — `aos
+  protocol validate` already validates compiled artifacts through
+  registry dispatch, and a compile/lint CLI would require an
+  authoring-file format decision no consumer yet justifies. No dependency
+  of any kind (`pyproject.toml` untouched; stock standard library). The
+  U-W1 boundary is frozen to exactly:
+  `agentic-os-v0.4-u-w1-workspec-compiler-contract.md` (new),
+  `DECISIONS.md` (modified), `agentic_os/workspecs.py` (new),
+  `tests/test_v04_workspec_compiler.py` (new), `README.md` (modified).
+  Any additional path in any later U-W1 wave — including the disfavored
+  `agentic_os/protocols.py`, `protocols/**`,
+  `tests/test_v03_protocol_spine.py`, `agentic_os/cli.py`,
+  `agentic_os/db.py`, `agentic_os/migrations.py`, `agentic_os/power.py`,
+  `.github/**`, and `pyproject.toml` — is `FAIL — REPLAN REQUIRED`, not a
+  quiet extension. Rejected: pre-minting a CLI or storage for U-W2;
+  treating the boundary as advisory.
+
 # DECISIONS — Agentic OS v0.4 U-K1/U-T1 governed skill and tool foundations
 
 This section continues the `D-v0.4.*` series for the integrated U-K1/U-T1

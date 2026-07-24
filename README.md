@@ -551,6 +551,84 @@ subordinate, separate units; component and status names are identities, not
 immutable semantics. The full frozen contract is
 `agentic-os-v0.4-u-k1-u-t1-governed-foundations-contract.md`.
 
+## Deterministic WorkSpec compiler (U-W1)
+
+`agentic_os/workspecs.py` is the static half of the workflow story: a pure,
+standard-library-only compiler from a closed authoring input
+(`aos.work-spec-authoring/v1`) to a canonical, unchanged `beast.work-spec/v1`
+artifact plus a self-digested compile report
+(`aos.work-spec-compile-report/v1`), a semantic linter, deterministic local
+resolution against an immutable registry snapshot
+(`aos.work-spec-registry-snapshot/v1`), a bounded secret-safe decompiler, and
+a typed semantic diff (`aos.work-spec-semantic-diff/v1`). Everything is inert
+data in, inert data out: no CLI verb, no table, no migration, no event, no
+dependency, and no protocol change ship with it.
+
+The public API, frozen by the contract:
+
+- `compile_work_spec(authoring, snapshot)` — normalize, inject the frozen
+  defaults (content-derived `work_spec_id`/`idempotency_key`/`trace` via
+  sha256 domain tags; the least-authority `permitted_destinations` floor; the
+  weakest honest `expected_result` floor), validate through the U-X1 spine,
+  resolve, lint, and report. A report always exists; an artifact exists
+  exactly when the status is not `invalid`.
+- `lint_work_spec(artifact, snapshot, requested=None)` — the same closed
+  gates over an existing artifact: 25 reason codes in canonical order under
+  the six-status precedence `invalid > unresolved > ineligible >
+  requires_external_authority > warning > valid`. Findings are value-free:
+  codes, schema-safe paths, enum members, bounded counts, and secretscan
+  pattern names — never a field value or exception text.
+- `decompile_work_spec(artifact, report=None)` — deterministic ASCII/LF
+  display text, 120-code-point truncation with a fixed marker, every string
+  leaf redacted before rendering, provenance markers
+  (`[explicit]`/`[defaulted]`/`[resolved]`) only with a digest-bound report.
+  Display-only; the text is never parsed back.
+- `authoring_view(artifact, report)` — the semantic round trip: recompiling
+  the view against the same snapshot reproduces an identical
+  `content_sha256` and report body. Byte-level reconstruction of the
+  author's original input is deliberately not claimed.
+- `semantic_diff(a, b, report_a=None, report_b=None)` — typed changes
+  (`added | removed | changed`) under eight closed categories with a frozen
+  raw-value allowlist: free text (`goal`, criteria, constraints, input
+  refs/notes, `idempotency_key`) diffs by sha256 digest and length only, so
+  no raw secret value can appear. `from`/`to` digests are recomputed from
+  each body, never read from an embedded hash.
+
+The load-bearing rules, each mechanically tested:
+
+- **A WorkSpec describes requested work; it grants nothing.** Policy,
+  approval, and budget references stay opaque and undereferenced;
+  compilation creates no capability, approval, spend, credential, power
+  mode, or execution permission, and `valid` is a consistency statement,
+  never an eligibility grant. Runtime governance re-decides with its own
+  inputs.
+- **Determinism is structural.** No clock (`created_at` is explicit), no
+  randomness, no environment, locale, filesystem, network, dynamic import,
+  or database; identical `(authoring, snapshot)` yields byte-identical
+  artifact and report across runs, platforms, and input orderings.
+- **Resolution is snapshot-local and lifecycle-blind.** Numeric version
+  ordering, exact pins or highest version, then lifecycle/promotion/
+  dependency findings make ineligibility visible instead of silently
+  skipping it. The compiler never installs, activates, fetches, imports,
+  binds, or executes.
+- **Reports digest-bind what they describe.** A report's
+  `work_spec_sha256` must equal the consumed artifact's recomputed digest
+  and its snapshot digest names the exact resolution universe; U-W2 must
+  treat an absent, unbound, or mismatched report as no report at all and
+  must never substitute, repair, or silently discard a bound one.
+
+Boundaries: U-W2 owns the workflow state engine and queue integration; U-W3
+owns checkpoints, resume, runtime retry, and compensation; U-K1/U-T1
+`invoke()` stays single-attempt and byte-unchanged. U-W1 executes zero
+attempts and schedules zero work. Known limitations, declared up front:
+snapshot lifecycle facts are caller-attested (no ledger reader ships here);
+lint statics cover the requested ensemble only, because the v1 protocol
+carries no assignment fields; `scope.tenant` is format-validated and
+uninterpreted; the report and diff are internal `aos.*` records, not U-X1
+registry artifacts; and there is no natural-language authoring, CLI,
+persistence, or scheduling — by design. The full frozen contract is
+`agentic-os-v0.4-u-w1-workspec-compiler-contract.md`.
+
 ## Weekend commands
 
 Decisions, handoffs, and memory are first-class ledger rows (each mutation
