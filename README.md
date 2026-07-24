@@ -501,6 +501,56 @@ none may be inferred from a plan or a handoff:
 has no governed approval primitive for these handoffs. The full frozen contract
 is `agentic-os-v0.4-u-a3-routing-handoffs-contract.md`.
 
+## Governed skill and tool foundations (U-K1/U-T1)
+
+The passports above declare `skill_requirements` and `tool_requirements` as
+pattern-bound strings; U-A1 shipped no resolver on purpose. U-K1/U-T1 is that
+resolver's foundation: two new inert protocol artifacts —
+`beast.skill-manifest/v1` and `beast.tool-manifest/v1` — plus a deterministic
+runtime layer in `agentic_os.governance` (registries, implementation
+bindings, a typed eligibility decision, a single-attempt invocation protocol,
+and a digest-only evidence record). Everything validates through the same
+U-X1 spine, so `python aos.py protocol validate ./skill.json` already covers
+the new artifacts, and no new CLI, table, migration, or doctor check exists.
+
+The load-bearing rules, each mechanically tested:
+
+- **Manifests declare requirements; they never grant.** Eligibility requires
+  `required_capabilities ⊆ granted_capabilities` from the execution context
+  plus lifecycle (`active`), skill promotion (`promoted`), agent-class
+  constraints, approval references, and a verified implementation binding —
+  computed into a typed decision (`allow | deny | needs_approval |
+  unavailable | invalid`) with closed reason codes. Agentic OS remains the
+  authority; no model output and no descriptive field participates.
+- **Naming code cannot run code.** A manifest binds to an implementation
+  only through a registered binding record whose canonical digest it
+  declares. Bindings are registered explicitly in code; no import path,
+  command, or URL is representable, and unknown or digest-mismatched
+  bindings fail closed. `metadata` bindings prove the contract and can
+  never execute.
+- **A deadline is not a cancellation.** Results separate the
+  `deadline_exceeded` status from a closed termination-outcome truth; the
+  in-process runner emits only `not_started` and `completed`. Userspace
+  guards are not a sandbox, and none is claimed.
+- **Unsafe replay is unrepresentable.** A mutating tool with more than one
+  attempt must declare an idempotency-key requirement or a compensating
+  action, retry budgets are bounded twice (schema and context), and
+  `retryable` is derived by code alone. Agentic OS owns the outer attempt
+  budget; hidden framework retries are neither representable nor trusted.
+- **Evidence is digest-only.** The invocation evidence record binds
+  identities, digests, decision, timing, status, termination, and recovery
+  — never a raw input, output, idempotency reference, or exception text —
+  and chains by record hash.
+
+On the Atomic Agents evaluation that preceded this unit: its runtime loop is
+a plausible future *adapter* target and its IO schema a useful mapping
+reference, but it is not the kernel, its `BaseTool` is not a governance
+boundary, and its hidden retry behavior must be contained at the adapter
+seam. Framework adapters (Atomic Agents, Claude Agent SDK, MCP) are
+subordinate, separate units; component and status names are identities, not
+immutable semantics. The full frozen contract is
+`agentic-os-v0.4-u-k1-u-t1-governed-foundations-contract.md`.
+
 ## Weekend commands
 
 Decisions, handoffs, and memory are first-class ledger rows (each mutation
@@ -953,7 +1003,7 @@ python aos.py protocol verify-registry
 
 ### The artifacts are inert
 
-Four schemas, all of them declarations rather than actions:
+Six schemas, all of them declarations rather than actions:
 
 | Schema | What it is |
 |---|---|
@@ -961,6 +1011,8 @@ Four schemas, all of them declarations rather than actions:
 | `beast.result-envelope/v1` | An inert, proof-carrying report bound to the exact WorkSpec content hash: honest outcome, evidence references, bounded errors, retryability. |
 | `beast.interrupt/v1` | An inert request to pause, ask, seek approval, cancel, or resume — bound to an exact artifact hash. |
 | `beast.agent-passport/v1` | An inert, versioned declaration of an agent's identity, mission and requirements (U-A1). A reduced envelope — a passport is not a task message — and no field that can carry a credential, an endpoint, or an approval. |
+| `beast.skill-manifest/v1` | An inert, versioned declaration of a governed skill (U-K1): lifecycle, evaluation state, IO contract references, requirements, dependencies, limits, budget, and implementation binding digest. |
+| `beast.tool-manifest/v1` | An inert, versioned declaration of a governed tool (U-T1): lifecycle, side-effect class, compensation, idempotency, cancellation mode, bounded retry, recovery policy, and implementation binding digest. |
 
 **Validation does not execute or import anything, and it does not import
 results into the ledger.** That is the whole boundary, and it is worth stating
