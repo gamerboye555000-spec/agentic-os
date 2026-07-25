@@ -2036,6 +2036,16 @@ def _check_report_shape(fresh: dict) -> None:
             raise WorkSpecError("malformed_report")
 
 
+def accept_work_spec(artifact) -> dict:
+    """The public acceptance seam over ``_accept_workspec`` (U-W2 §0.1).
+
+    Behavior-identical: same canonical round trip, same spine validation,
+    same identity check, same closed refusals. U-W2 admits artifacts through
+    this name so a consumer never reaches into a private gate.
+    """
+    return _accept_workspec(artifact)
+
+
 def _accept_report(report, artifact_digest: str) -> dict:
     if not isinstance(report, dict):
         raise WorkSpecError("malformed_report")
@@ -2053,6 +2063,16 @@ def _accept_report(report, artifact_digest: str) -> dict:
         raise WorkSpecError("report_mismatch")
     _check_report_shape(fresh)
     return fresh
+
+
+def accept_compile_report(report, artifact_digest: str) -> dict:
+    """The public acceptance seam over ``_accept_report`` (U-W2 §0.1).
+
+    Behavior-identical: the same frozen sidecar rule (digest-bind before use,
+    then the closed report shape) raising the same two closed codes,
+    ``malformed_report`` and ``report_mismatch``.
+    """
+    return _accept_report(report, artifact_digest)
 
 
 # ---------------------------------------------------------------------------
