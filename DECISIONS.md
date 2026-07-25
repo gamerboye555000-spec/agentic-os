@@ -1,3 +1,410 @@
+# DECISIONS — Agentic OS v0.4 U-W2 deterministic workflow state engine (Wave 0)
+
+This section continues the `D-v0.4.*` series for the U-W2 Wave 0
+architecture freeze: the deterministic workflow state engine and
+runtime-queue integration unit, frozen in
+`agentic-os-v0.4-u-w2-workflow-state-engine-contract.md`. Architecture
+only — no production code, tests, CLI, persistence, scheduling, or
+execution ship in this wave. Branch `v0.4-u-w2-workflow-state-engine`
+(2026-07-24), worktree `/home/daksh/Projects/agentic-os-u-w2`, baseline
+`0a69a1c1654671cd48577e23252a9c06e2cffba9` (U-W1 deterministic WorkSpec
+compiler merged, ledger schema version `"5"`, milestone
+`milestone/v0.4-u-w1-workspec-compiler`; HEAD = `origin/main` =
+merge-base = this commit). Future PR title:
+`feat(v0.4): U-W2 — deterministic workflow state engine`; future tag:
+`milestone/v0.4-u-w2-workflow-state-engine`. Prepended per the
+established precedent (D-W0.4, reaffirmed in D-v0.2.7, D-v0.4.4);
+everything below stays byte-identical.
+
+## D-v0.4 decisions (U-W2, Wave 0 architecture freeze)
+
+- **D-v0.4.71 — Workflow ownership is outcome B: public kernel in
+  `agentic-os` plus a transport-neutral queue-adapter contract; the
+  runtime adapter is an explicit cross-repository slice.** The
+  authoritative workflow lifecycle lives in `agentic-os` (the governance
+  plane already owns tasks, approvals, evidence, and decisions —
+  blueprint §5.1 — and every lifecycle gate here is a governance gate).
+  Queue integration is a record contract:
+  `aos.workflow-queue-intent/v1` out, `aos.workflow-queue-receipt/v1`
+  in; the runtime-side adapter (slice U-W2.R, contract §18) lives in the
+  private `ai-company-runtime` repository, pins both record shapes by
+  content hash at the U-W2 milestone tag, and never shares a database
+  with agentic-os. Rejected: A (single-repository U-W2) — the live tree
+  contains no queue, lease, or dispatch abstraction at all (verified;
+  the only "queue" occurrences are BFS work-list variables and a test
+  fixture string), the working queue is the private runtime's Postgres
+  queue which blueprint §9.5 preserves and §5.1 forbids agentic-os to
+  own, so a truthful single-repository queue integration does not
+  exist. Rejected: C (cross-repository U-W2A/U-W2B/U-W2C split) — a
+  third protocol repository is explicitly premature below three
+  independent consumers (blueprint §5.1), and splitting the kernel
+  itself would move authoritative lifecycle state out of the governance
+  plane and make the private repository a build dependency of the
+  public one; B places the split at the actual trust boundary (records,
+  not code) while still naming the required cross-repository change
+  instead of hiding it inside one worktree.
+- **D-v0.4.72 — Lifecycle vocabulary: thirteen authoritative states;
+  `proposed` stays authoring-plane; four immutable terminals; the
+  complete matrix is frozen as data; `compensating` edges are reserved
+  to U-W3 under transition-policy v1.** The blueprint §9.2 vocabulary
+  is adopted in full; `proposed` names pre-compile authoring (a task
+  plus an `aos.work-spec-authoring/v1` input — U-W1's domain) and is
+  never a `workflows.state` value, because no instance can exist before
+  an artifact digest exists to bind state to. States: `compiled`,
+  `validated`, `awaiting_approval`, `scheduled`, `running`,
+  `waiting_input`, `waiting_approval`, `paused`, `compensating`,
+  `succeeded`, `failed`, `cancelled`, `compensated`; terminals are the
+  last four and accept no command (the `revoked`/closed-task
+  precedent). The complete 13×13 matrix (contract §5.2) has 25 active
+  edges, 3 reserved edges (`running → compensating`,
+  `compensating → compensated`, `compensating → failed`, refused
+  `transition_reserved` until U-W3 ships policy v2 — the
+  `TERMINATION_OUTCOMES`/`LOCAL_TERMINATION_OUTCOMES` honesty split
+  applied to transitions), and one creation pseudo-edge
+  (`∅ → compiled` via admission). Cancellation is local and immediate
+  from `compiled`/`validated`/`awaiting_approval` (AOS is source of
+  truth before queue acceptance) and two-phase
+  (`cancel_requested` intent → verified `cancelled` receipt) from every
+  post-dispatch nonterminal state; `compensating → cancelled` is
+  illegal in every frozen version (abandoning a compensation mid-flight
+  would be a silent cleanup failure). Two scoping rules keep the matrix
+  exact: it governs STATE-CHANGING edges only (an accepted stateless
+  command traverses no cell and records `to_state` null), and under
+  policy v1 no command or receipt kind targets `compensating`/
+  `compensated`, so two of the three reserved cells have no driver and
+  cannot be attempted at all — `transition_reserved` is a reducer-level
+  refusal v2 activates, not a claim that a v1 caller can reach them.
+  Rejected: inventing a `dispatching` or `cancel_requested` state (the
+  vocabulary is closed; pending intents are snapshot facts, not states);
+  immediate local cancellation after dispatch (AOS cannot truthfully
+  claim `cancelled` while a worker may be running); adopting blueprint
+  §9.2's `awaiting_approval → scheduled` arrow as an edge — the
+  blueprint sentence is a reading order, while `scheduled` means "the
+  runtime holds the work" and is reachable only through a queue
+  `accepted` receipt, so a satisfied admission approval returns the
+  instance to `validated` and dispatch proceeds from there. The
+  deviation is declared in contract §5.1 rather than left for an
+  implementer to discover.
+- **D-v0.4.73 — Closed command/event/refusal/intent/receipt
+  vocabularies; a typed command envelope; all new records are `aos.*`
+  canonical records with a named registry-promotion trigger.** Nine
+  commands (`admit_work_spec`, `validate`, `request_approval`,
+  `record_approval`, `request_dispatch`, `revoke_dispatch`,
+  `request_cancel`, `record_queue_receipt`, `record_result`), seventeen
+  events, forty-three refusal reasons in canonical emission order (the
+  `GOVERNANCE_REASON_CODES` idiom), two intent kinds
+  (`dispatch`/`cancel`), nine receipt kinds (`accepted`, `rejected`,
+  `started`, `waiting_input`, `waiting_approval`, `paused`, `resumed`,
+  `cancelled`, `failed`). Every command carries `schema`
+  (`aos.workflow-command/v1`), `command`, `command_id` (UUID dedupe
+  identity), `workflow_id` (`WF-n`; absent exactly on admission),
+  `expected_revision`, `actor` (`PROVENANCE_PATTERN`), `source`
+  (`cli` | `runtime_adapter`), `created_at` (caller-supplied instant —
+  the no-clock rule), optional `trace`, a closed per-verb `payload`,
+  and a recomputed `content_sha256`. The six record schemas
+  (`aos.workflow-command/v1`, `aos.workflow-event/v1`,
+  `aos.workflow-snapshot/v1`, `aos.workflow-queue-intent/v1`,
+  `aos.workflow-queue-receipt/v1`, `aos.workflow-approval-fact/v1`) are
+  internal canonical records in the established `aos.*` house style —
+  deliberately not U-X1 registry artifacts: the queue records cross to
+  exactly one known counterparty that vendors them by hash; promotion
+  to registry artifacts is triggered by three independent consumers or
+  a signature/attestation need across a trust domain, and would be
+  additive new identities. The nine receipt kinds and nine of the
+  seventeen events form a bijection frozen as a table in contract §7
+  (`accepted → dispatch_accepted` … `failed → workflow_failed`); the
+  other eight events are command-driven, and exactly two names
+  (`workflow_cancelled`, `workflow_failed`) carry a second driver. Every
+  refusal reason likewise has one stated trigger: the seven that no
+  other section names are tabulated in §8. Rejected: growing the U-X1
+  registry now (edits the frozen spine for a two-party exchange);
+  free-form event payloads (closed enum/identifier/digest payloads
+  only); leaving the receipt→event mapping implicit because it is
+  derivable (a test cannot be written against a surface no section
+  freezes).
+- **D-v0.4.74 — The reducer is a pure function: snapshot + typed
+  command + verified facts → next snapshot + events + optional queue
+  intent.** `workflow_engine.decide(snapshot, command, facts)` performs
+  no clock, filesystem, network, database, queue, environment, locale,
+  randomness, or model read; the module imports `protocols`,
+  `workspecs` (the public acceptance seam), `secretscan`, `utils`
+  (`AosError`, the refusal base), `dataclasses`, `hashlib`, and `re`
+  only, with `datetime` excluded (the workspecs calendar-arithmetic
+  rule), enforced by an AST import-discipline test over the module's own
+  import statements — never the transitive closure, since `protocols`
+  legitimately imports `os` and `datetime`. The reducer's first argument
+  is the `aos.workflow-snapshot/v1` record, whose field list contract §9
+  freezes (including `intent_seq`, the revoked/resolved intent id
+  tuples, `last_seq`, and the two approval-ordering seqs) — without it
+  the derived intent identifiers, `receipt_superseded`, and
+  `approval_fact_missing` would not be computable from a pure function.
+  `replay` is NOT a reducer output: exact-duplicate detection is a
+  `workflow_commands` lookup plus an event-range read, so the store
+  answers it before calling `decide` and reports it on `StoreOutcome`. Document verification (artifact, report,
+  approval fact, result envelope, receipt) is pure computation inside
+  the engine; the only shell-verified inputs are the two admission
+  ledger facts (`task_exists`, `task_open`). Companions `fold(events)`
+  and `verify_history(events)` are pure; every accepted document is
+  snapshotted by canonical round-trip on intake and every return is
+  freshly built (the U-W1 §15 mutation-isolation rule). Rejected:
+  letting the store pass open connections or clocks into the reducer;
+  verifying documents in the shell (it would split one trust gate into
+  two half-gates).
+- **D-v0.4.75 — Revision compare-and-swap and dedupe: +1 per accepted
+  command, exact-duplicate replay, conflicting-duplicate refusal,
+  out-of-order refusal.** `revision` starts at 1 at admission and
+  increments by exactly one per accepted command — stateless commands
+  included, since every accepted command appends at least one event.
+  `expected_revision` is mandatory; mismatch refuses
+  `revision_mismatch`, and for every command except `admit_work_spec`
+  the store enforces the same guard as a literal SQL compare-and-swap so
+  the semantic gate and the storage gate must agree. `admit_work_spec`
+  has no row to update: its storage gate is the
+  `UNIQUE(work_spec_sha256)` INSERT refusing `workflow_exists`, and its
+  `expected_revision = 0` is a semantic assertion only. An exact
+  duplicate (same `command_id`, same recomputed canonical digest)
+  replays the original outcome (`StoreOutcome.replay=True`, no new
+  event, no revision change, no new intent, and `intent is None` — the
+  outbox, not a command result, is the delivery channel); a
+  conflicting duplicate (same id, different digest) refuses
+  `command_conflict`; a repeat of a refused command re-evaluates and
+  refuses identically (refusals store nothing). Receipts dedupe by
+  `receipt_id` with the same replay/conflict rules. Rejected: engine-
+  side command queueing or reordering (the caller re-reads and retries
+  deliberately); last-writer-wins on conflicting duplicates.
+- **D-v0.4.76 — WorkSpec admission verifies five things fail-closed;
+  blocking statuses never create an instance;
+  `requires_external_authority` admits but cannot dispatch without an
+  approval fact; one instance per WorkSpec digest.** Admission
+  verifies, in order: artifact (spine validation via
+  `workspecs.accept_work_spec`; refusal wraps the closed spine code as
+  `admission_artifact_invalid`), report self-digest and
+  report→artifact binding (`workspecs.accept_compile_report` — the
+  frozen sidecar rule), registry binding
+  (`registry_state.registry_version` = live `REGISTRY_VERSION` and
+  `work_spec_schema_sha256` = the live WorkSpec schema digest;
+  `snapshot_sha256` is recorded as the compiler's digest-sealed
+  attestation, not re-derived), compile status (`invalid`,
+  `unresolved`, `ineligible` refuse `admission_status_blocking`;
+  `requires_external_authority` admits with `approval_required=true`;
+  `warning`/`valid` admit), and the shell-verified task facts (the
+  artifact's `aos_task_id` must name an existing, non-`done` task).
+  `work_spec_sha256` is UNIQUE — re-admission refuses
+  `workflow_exists`; a revised WorkSpec is a new digest and a new
+  instance. Both documents are stored verbatim (the
+  `agent_passports.document` precedent) because `verify_binding`
+  against result envelopes needs the exact body; digests are recomputed
+  from stored bodies at every use.
+  `approval_required := (status = requires_external_authority) OR
+  (artifact declares policy_refs.approval_ref)` — a declared approval
+  reference obliges a recorded fact before dispatch and is never itself
+  treated as satisfaction. Rejected: admitting blocking statuses as
+  parked instances (a blocking status that exists as a row is one bug
+  away from scheduling); deriving `succeeded`-side facts at admission.
+- **D-v0.4.77 — Approval and evidence are recorded external facts;
+  U-W2 generates neither; the `succeeded` evidence predicate is exact;
+  revocation is deferred to U-W5.** Approval facts are
+  `aos.workflow-approval-fact/v1` records binding `work_spec_sha256`,
+  with scope `admission` (drives `awaiting_approval → validated`; when
+  the artifact declares `policy_refs.approval_ref` the fact must repeat
+  it byte-exact, because that reference names the pre-authored admission
+  authority) or `runtime` (stateless record in `waiting_approval`,
+  binding by digest and scope only and carrying the approving system's
+  OWN opaque reference — a mid-run approval is a distinct, later-minted
+  record, so demanding the artifact's authored reference would either
+  refuse every honest runtime fact or make the engine record an approval
+  nobody issued). The exit edge is the runtime's `resumed` receipt,
+  which refuses `approval_fact_missing` unless a runtime-scope
+  `approval_recorded` EVENT carries a `seq` above the most recent
+  `run_waiting_approval` event — the ordering lives on the event
+  history, since `workflow_facts` has no `seq`. Who may approve is a
+  governance policy this
+  unit does not judge; approval revocation has no v1 path (U-W5's
+  semantic interrupts own `approval.revoked`). `succeeded` requires:
+  spine-valid result envelope, `verify_binding` against the stored
+  WorkSpec (digest and `work_spec_id`), `attempt` within the artifact's
+  declared budget, outcome `success` with `retryable=false`
+  (`result_inconsistent` otherwise), and `counted ≥
+  expected_result.min_evidence_count` where an item counts iff its kind
+  is in `expected_result.evidence_kinds` AND `ref.strip()` and
+  `claim.strip()` are non-empty (the D-v0.2.36 blank-proof rule);
+  `fail` maps to `failed` with no evidence minimum; `partial`/`unknown`
+  refuse `result_outcome_inconclusive` and mutate nothing (retry and
+  salvage are U-W3's). There is deliberately no `--no-evidence`
+  counterpart on the workflow plane; the THRESHOLD, however, is the
+  artifact's own digest-bound declaration, and the live schema admits
+  `min_evidence_count = 0` as `valid`, so such a WorkSpec succeeds with
+  no evidence — the author's admitted declaration, not an engine
+  override, and without the journaled reason the task plane demands
+  (declared in contract §5.3, §12.2, §22). Rejected: requiring coverage
+  of every declared evidence kind (`evidence_kinds` enumerates
+  acceptable kinds, not mandatory ones — the U-W1 subset reading);
+  treating `partial` as terminal failure (dishonest about salvageable
+  work); imposing a U-W2 evidence floor of 1 (it would admit `valid`
+  WorkSpecs whose success is unreachable — a silent trap worse than the
+  declared behavior).
+- **D-v0.4.78 — The queue handshake is two typed records with derived
+  identifiers, at-least-once delivery, verbatim inbox storage, and a
+  frozen source-of-truth split.** Dispatch intents embed the full
+  canonical WorkSpec document (bounded by the spine's 256 KiB artifact
+  bound; the receiver re-verifies it against `work_spec_sha256`) plus
+  `report_sha256`, `snapshot_sha256`, `compile_status`, a validated
+  `queue_route` slug (default `default`), and derived identifiers that
+  are pure functions of history (`intent_id` = UUIDv8 of a
+  domain-separated digest over `work_spec_sha256` and the per-workflow
+  intent sequence; `idempotency_key` = `wfd-` + 40 hex of a second
+  domain-separated digest — distinct per re-dispatch, stable under
+  replay). Receipts are runtime-minted (`receipt_id` UUID),
+  kind-closed, stored verbatim on acceptance; `accepted`/`rejected`
+  must bind an outstanding `intent_id` (`receipt_unbound` /
+  `receipt_superseded` otherwise); `runtime_task_uuid` is minted by the
+  runtime at acceptance (must match any artifact-declared value) and
+  every later receipt must carry it (`runtime_uuid_mismatch`).
+  Rejection returns the workflow to `validated` (stateless
+  `dispatch_rejected`; re-dispatch mints a NEW intent). The adapter
+  delivers receipts per workflow in causal order; the reducer's
+  legality gate enforces it (`receipt_out_of_order` refusals are
+  redeliverable — refusal-then-redeliver IS the ordering protocol,
+  though redelivery is the remedy only for a receipt that arrived EARLY;
+  one that can never become legal refuses permanently and is dropped).
+  Each kind's meaning is frozen in contract §13.2 so two adapter authors
+  cannot read it differently: `accepted` is a durably committed queue
+  row (so AOS `scheduled` maps to the live queue's `pending`, never to
+  its `scheduled_at`/`available_at` columns), `started`/`resumed` assert
+  occupancy of the runtime's EXECUTION PLANE rather than that a worker
+  is executing this instant — which is why runtime-internal retry and
+  lease requeue emit no receipt and stay invisible to the ledger — and
+  `rejected` names only a queue's refusal to ADMIT an intent, a terminal
+  rejection of already-started work being reported as `failed`. Because
+  the intent embeds the full WorkSpec, the adapter must enqueue with the
+  artifact's `retry.max_attempts` (default 1) so the two attempt budgets
+  agree; enqueue parameters are the adapter's to choose, so this needs
+  no runtime change. Revocation before AOS has OBSERVED acceptance is
+  advisory, not authoritative: AOS cannot un-enqueue a committed row,
+  so the task may keep running and a re-dispatch may produce a second
+  runtime task for the same WorkSpec (declared, contract §22).
+  Source of truth: the AOS ledger for lifecycle state, admission,
+  approvals, success judgment, and intents; the runtime for queue
+  membership, leases, workers, attempts, and the `runtime_task_uuid`
+  namespace; records are the only channel in either direction.
+  Rejected: digest-only dispatch intents (the runtime would need a
+  second channel to fetch the work, which does not exist); exactly-once
+  delivery pretenses (at-least-once with idempotent replay is what the
+  outbox/inbox pattern can honestly provide).
+- **D-v0.4.79 — Persistence is layered: pure kernel; local append-only
+  `workflow_events` plus a derived hash-coupled `workflows` snapshot;
+  `workflow_intents` outbox and `workflow_receipts` inbox;
+  `workflow_facts` and `workflow_commands`; schema v6 purely additive;
+  one transaction per accepted command; verification reports and never
+  rewrites.** Six new tables (contract §14.1) land via migration
+  `u-w2-workflow-state-v6` (5 → 6), the U-A3 idiom: empty,
+  FK-parent-first, built from the same `db.py` constants as a fresh
+  init; `db.SCHEMA_VERSION` becomes `"6"` and the normal-command version
+  gate is unchanged. Byte-identity and purity are scoped as the live
+  U-A3 precedent scopes them: fresh and migrated `sqlite_master.sql`
+  match FOR THE SIX NEW TABLES, and the step function touches no
+  existing row and reads no clock — the framework's own
+  `meta.schema_version` bump and per-step `events.emit` journal row are
+  excluded, exactly as `tests/test_v04_routing_handoffs.py` excludes
+  them. The authoritative record is `workflow_events` (plus verbatim
+  stored documents); the `workflows` row is a derived snapshot whose
+  every field except the two document bodies is rebuildable by `fold`
+  (the bodies are deliberately absent from event payloads, which carry
+  digests only, so they are admission-time immutable columns re-verified
+  against the recorded digests), guarded by revision CAS, with
+  `state`/`revision`/pending-intent/uuid/`updated_at`/`content_sha256`
+  moving only together inside one transaction that also appends the
+  event row(s), the accepted-command row, any intent/receipt/fact row,
+  and one redacted `events.emit` journal row — commit together or roll
+  back together (the ops invariant). Crash points: pre-commit leaves
+  nothing; post-commit pre-delivery leaves a re-driveable outstanding
+  intent (outbox pattern; the queue dedupes deliveries on the
+  idempotency key); post-commit pre-output makes the retried command an
+  exact-duplicate replay. Corrupt, reordered, or unknown-version
+  history refuses (`history_corrupt`, `history_unknown_event`,
+  `policy_version_unsupported`); `workflow verify` re-folds and
+  compares (`snapshot_divergence`), reporting only — recovery is a
+  human restoring a verified backup, never the engine rewriting
+  history. `ids.py` gains `"workflow": "WF"` (the two-letter U-M3/U-A3
+  precedent). Rejected: a pure in-memory-only kernel (workflow state
+  must survive a process exit to be a system of record); sharing any
+  table with the runtime (forbidden across the plane boundary);
+  mutable history with snapshot-only truth (unauditable).
+- **D-v0.4.80 — Updateability: integer `TRANSITION_POLICY_VERSION`
+  starting at 1 with U-W3 as version 2; versioned `/v1` record schemas;
+  stable strings, never ordinals; frozen per-version replay;
+  unknown-version refusal; schema changes migrate, history never
+  does.** Every workflow row and event records the policy version it
+  was decided under; a build refuses commands it cannot honor
+  (`policy_version_unsupported`) and replays every shipped version
+  forever via frozen per-version transition tables (the
+  `_V2_MEMORY_CLAIM_DDL` frozen-history trade applied to policy data).
+  State/edge additions require a new policy version plus an additive
+  CHECK-widening migration; removals never happen (states can stop
+  being reachable, never stop being readable). A new receipt kind
+  requires a new receipt schema version (closed CHECKs and closed
+  vocabularies must not disagree between builds); new refusal reasons
+  are emission-side and may grow within a version. Rejected: enum
+  ordinals or implicit ordering anywhere; auto-migrating old histories
+  to new policy semantics (replay must be byte-stable across
+  upgrades).
+- **D-v0.4.81 — Implementation slices and exact paths: three ordered
+  commits in the one frozen agentic-os PR, plus the explicit U-W2.R
+  adapter delivery in `ai-company-runtime`.** U-W2.1 pure kernel
+  (`agentic_os/workflow_engine.py` new;
+  `tests/test_v04_workflow_engine.py` new; `agentic_os/workspecs.py`
+  modified ONLY to add the behavior-identical public wrappers
+  `accept_work_spec`/`accept_compile_report` over the existing private
+  gates — the one U-W1-file edit, pinned by test). U-W2.2 persistence
+  (`agentic_os/workflow_store.py` new; `agentic_os/db.py`,
+  `agentic_os/migrations.py`, `agentic_os/ids.py` modified;
+  `tests/test_v04_workflow_store.py` new). U-W2.3 CLI/docs
+  (`agentic_os/cli.py`, `agentic_os/power.py`, `README.md` modified;
+  `tests/test_v04_workflow_cli.py` new) with the thirteen frozen
+  CLI leaves and their power classes (contract §16), and — since Wave 0
+  commits nothing — the two Wave-0 documents themselves, `DECISIONS.md`
+  (this section) and
+  `agentic-os-v0.4-u-w2-workflow-state-engine-contract.md`. Naming them
+  is load-bearing, not bookkeeping: every prior unit landed its
+  decisions, README, and contract document inside the implementation
+  commit (U-W1 `65e8be1`, U-K1/U-T1 `009e984`), so omitting them would
+  make the exhaustiveness rule below fire on this unit's own delivery.
+  U-W2.R (runtime
+  repository, separate branch/PR named in contract §18) consumes
+  intent files and produces receipt files against the private Postgres
+  queue, pinning both record shapes by content hash at the U-W2
+  milestone tag — the compatibility milestone; it never reads or
+  writes `aos.db` and nothing in the agentic-os PR depends on it. Any
+  other path in any later U-W2 wave is `FAIL — REPLAN REQUIRED`.
+  Untouched (partial list; contract §0.3 is exact):
+  `agentic_os/protocols.py`, `protocols/**`, `agentic_os/models.py`,
+  `agentic_os/governance.py`, `agentic_os/ops.py`,
+  `agentic_os/events.py`, `agentic_os/doctor.py`, delivery-control
+  files, `pyproject.toml`. Rejected: putting the state vocabulary in
+  `models.py` (the U-W1 self-contained-module idiom keeps the file
+  boundary tight; DDL CHECK literals are pinned equal by test, the
+  D-v0.4.23 pattern); a second U-W2 PR for CLI (one unit, one PR, one
+  tag).
+- **D-v0.4.82 — Exclusions are mechanical, not aspirational.** No retry
+  loop, no checkpoint/resume implementation, no compensation
+  execution, no loop-health monitor, no semantic interrupt kernel, no
+  Temporal adoption, no tool/skill/model execution, no approval or
+  policy grant, no credential selection, no cross-cloud failover, no
+  MCP/A2A work, no queue implementation in agentic-os, no shared
+  database, no protocol change. Each is enforced by the §19 test
+  matrix: the import-discipline test proves the reducer's I/O absence;
+  `result_outcome_inconclusive` on `partial` proves no second attempt
+  exists; the compensation edges are frozen shut by the stronger fact
+  that no member of either closed vocabulary targets them under policy
+  v1 (`transition_reserved` itself is only observable on the one
+  attemptable reserved edge); byte-unchanged neighbor suites prove the
+  blast radius;
+  and the store's audited SQL/filesystem surface proves no foreign
+  database is touched. Rejected: shipping "just a minimal" retry or
+  compensation path (execution semantics without U-W3's checkpoint
+  and compensation machinery would be an untestable half-runtime — the
+  D-v0.4.59 rationale, applied one unit later).
+
 # DECISIONS — Agentic OS v0.4 U-W1 deterministic WorkSpec compiler (Wave 0)
 
 This section continues the `D-v0.4.*` series for the U-W1 Wave 0
