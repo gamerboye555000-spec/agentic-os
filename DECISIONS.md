@@ -1,3 +1,173 @@
+# DECISIONS — Agentic OS v0.4 U-W2.2 governed identity-binding amendment
+
+This section continues the `D-v0.4.*` series for the governed amendment the
+U-W2.2 implementation wave required when it reported
+`FAIL — REPLAN REQUIRED` on finding F-001. Architecture only — no
+production code, tests, DDL, migrations, fixtures, CLI, workers, or
+adapters ship in this commit. Branch `v0.4-u-w2-2-workflow-store`
+(amendment 2026-07-28), worktree `/home/daksh/Projects/agentic-os-u-w2-2`,
+baseline `63de8c953f2613a79d6e1bb6052646c669894863`, amended above the
+landed U-W2.2 Wave 0 documentation commit
+`91075d7cb3b94013242b36c777baa59ee37500f9`, which is preserved
+byte-for-byte and is NOT rewritten, amended, squashed, reset, or rebased.
+Prepended per the established precedent (D-W0.4, reaffirmed in D-v0.2.7,
+D-v0.4.4); everything below stays byte-identical, including D-v0.4.83 …
+D-v0.4.95, which D-v0.4.96 supersedes only where it quotes them and never
+rewords.
+
+## D-v0.4 decisions (U-W2.2 governed identity-binding amendment)
+
+- **D-v0.4.96 — the canonical workflow identity representation is the
+  rendered string `"WF-" + str(workflows.id)`, bound into all four §5.8 row
+  hashes by its sha256 leaf; the direct-integer binding that made almost
+  every workflow unsealable is superseded, together with nine further
+  confirmed contract contradictions and silences; commit `91075d7…` is
+  preserved and the U-W2.2 delivery becomes three ordered commits.**
+
+  **The contradiction.** U-W2.2 §5.1 makes `workflows.id` the reducer's
+  DERIVED identity, "always … in `[1, 2**63-1]` = `ids.MAX_ID`". §5.8 binds
+  `workflow_id` as a direct INTEGER in all four row-hash payloads
+  ("integers bound directly"). §5.8 also freezes the digest as
+  `sha256(protocols.serialize_canonical(payload)).hexdigest()`, and
+  `protocols.serialize_canonical` refuses every integer outside
+  `±(2**53-1)` with `ProtocolError[integer_out_of_range]`
+  (`agentic_os/protocols.py:60,188`). Any two clauses hold; all three
+  cannot. `workflow_engine._workflow_identity`
+  (`agentic_os/workflow_engine.py:623-644`) derives
+  `int.from_bytes(tagged_digest[:8], "big") >> 1` with `0 → 1`, so
+  `P(identity ≤ protocols.INT_MAX) = 2**53 / 2**63 = 2**-10`: 1023 of every
+  1024 valid identities are unsealable. Measured independently in the
+  replan session on 2000 real WorkSpec digests, 1998 exceeded the bound,
+  and bound exactly as §5.8 freezes it the FIRST accepted
+  `admit_work_spec` raises `WorkflowStoreError("store_unavailable")` and
+  persists nothing. This was a defect in the frozen architecture, not in
+  the implementation, which is why the wave reported a replan rather than
+  landing a byte-unfaithful store.
+
+  **The representation.** One canonical representation, and it is the one
+  the architecture already froze five times over: the rendered identity
+  string `"WF-" + str(workflows.id)` — byte-identical to
+  `workflow_engine._workflow_identity`'s output, to the store's §5.1
+  renderer, to the `workflow_id` §7.4 reconstitutes into every event
+  record, to the `workflow_id` §7.2 step 6 compares, and to the `WF-<n>`
+  every public store type carries. It is total over `[1, 2**63-1]`,
+  injective, pure, `ids.parse_id`-round-trippable, at most 22 characters,
+  single-spelled, and closed. Being TEXT, it binds into a §5.8 payload the
+  way §5.8 already binds every text column — by its sha256 leaf, as
+  `workflow_id_sha256`. No new identity algorithm, no new serializer, no
+  relaxed bound, no new path: the digest function, the `record_schema` key,
+  direct binding for the small rowid columns, `None` pass-through, and
+  `content_sha256` exclusion are all unchanged.
+
+  **The superseded clauses**, exactly and no others: §5.8's `workflow_id`
+  (int) member in all four payloads; §7.2 step 6's inclusion of `id` (as
+  `workflow_id`) among seventeen LIVE comparisons, which is a tautology
+  because §7.4 reconstitutes the identity from that same column — the real
+  binding is the sealed event digest and the comparison is retained as a
+  declared backstop, reducing step 6 to sixteen live comparisons; §8.4's
+  "the one deliberate non-exception trigger", replaced by an exhaustive
+  six-trigger table over the module's ten raise sites — four deliberate
+  non-exception triggers where the text claimed one, plus a deliberate
+  mapping of a non-`sqlite3` exception the text did not mention; §13.3's
+  three injection mechanisms, which cannot express K4 ("inside
+  `_insert_command`, before its row-hash finalization"), K13 ("inside
+  `_journal`, after the first of two `events.emit` calls") or KA8 ("inside
+  `_journal`") because patching a named helper raises before the helper
+  acts — a fourth mechanism wraps a NAMED internal callee (`_row_digest`
+  for K4, `events.emit` for K13 and KA8), the crash POINTS are unchanged,
+  and three test-side label errors that followed from the same gap (KA7
+  labelled KA8 with KA8 unexercised, KA1 injected before its task read
+  rather than after it, and a K12 instant labelled K13) are corrected with
+  it; §3's
+  unqualified worst-case claim, scoped to the six workflow tables because
+  `tasks.status` is the shell-verified `AdmissionFacts` input by design
+  (§4.2, §9.5) and flipping it by direct SQL was reproduced turning
+  `refused/admission_task_closed` into `accepted`; §5.1's unconstrained
+  `id`, which gains `CHECK (id >= 1)` — the only DDL change — making a
+  declared invariant structural without replacing the code's failing
+  closed; §8.3/§15.3/§15.4's integrity scope, where `read_workflow`
+  reported `ok` and `submit` kept ACCEPTING on a database `verify` reported
+  divergent (both reproduced), now declared as deliberately different
+  verdicts — the readers and the write gate carry the snapshot-and-history
+  verdict, `verify` alone is total, and §15.4 step 4 is extended to
+  re-digest the two documents its row hashes bind only by column leaf.
+  Rows-only divergence deliberately does NOT freeze mutations: the four
+  row-hash tables feed no acceptance decision, so gating on them would deny
+  service without protecting one, and what is lost is prompt detection
+  rather than soundness. §14.2's unqualified exact-duplicate rule is
+  superseded in the fail-closed direction: a replay is a mutating command's
+  answer (§15.3) and is now held to the FULL §7.2 gate, not the
+  history-only check the wave shipped — reproduced, a workflow with an
+  intact history and a tampered projection refused a fresh command with
+  `snapshot_divergence` while a duplicate still replayed with events, and
+  the two now agree. Also superseded: §18.1's "at every use" as applied to
+  `workflow_receipts.receipt_sha256` and `workflow_facts.document_sha256`;
+  and the two-commit delivery identity of U-W2 §A.6/§A.7 and U-W2.2 §19.5.
+
+  **Four silences closed**, because the U-W2.2 contract's own closing
+  sentence makes an unlicensed behavior a defect: `rebuild` / `verify` /
+  `read_workflow` / `read_history` on a workflow identity with no row
+  (`rebuild` reports `integrity="history_corrupt"` with the precise
+  `reason="workflow_unknown"`, because `STORE_INTEGRITY` is a frozen
+  five-member public vocabulary with no "no such workflow" member and
+  widening it for one case is rejected); the `where` a rows-only divergence
+  carries (`"/rows"`, a schema-safe fixed token); the positional derivation
+  of the closed-task status constant, whose frozen VALUE `"done"` (§10.4)
+  is unchanged and is now pinned three ways so an appended `TASK_STATUSES`
+  member fails a test rather than silently redefining "closed"; and the
+  snapshot a refusal carries on an unverifiable history (`None`).
+
+  **Implementation and test consequence**, inside the existing sixteen
+  paths and no others: `agentic_os/workflow_store.py`'s four row-hash
+  payload builders bind `workflow_id_sha256` from the rendered identity
+  rather than the wave's unauthorised bare-decimal leaf, and the intent
+  close rebuilds the same member; the replay path runs the full §7.2 gate;
+  `agentic_os/db.py`'s `WORKFLOWS_DDL` gains `CHECK (id >= 1)`, which
+  reaches fresh and migrated databases through the one `WORKFLOW_TABLES`
+  enumeration with no extra migration step;
+  `tests/test_v04_workflow_store.py` gains the frozen rows S25–S33 and the
+  eleven frozen mutations M-A … M-K, and its crash matrix is corrected to
+  the amended labels and mechanisms. `agentic_os/workflow_engine.py`
+  and `agentic_os/workspecs.py` stay byte-identical: editing the landed
+  reducer is a replan (§19.4), and every U-W2.1 event digest was sealed
+  over its identity derivation.
+
+  **Delivery.** Commit `91075d7…` is preserved exactly; this amendment
+  lands as a second, independently visible documentation-only commit over
+  the same three architecture paths, and the implementation lands as a
+  third over the sixteen implementation paths — the U-P2 D-v0.4.50 landing
+  model applied a second time, because a governed amendment arrived after
+  the first documentation commit rather than before it. No amend, squash,
+  reset, or rebase. The closed nineteen-path inventory and U-W2 §A.5's
+  no-expansion rule are unchanged; a twentieth path is
+  `FAIL — REPLAN REQUIRED`; no standing authority of any kind is created.
+
+  **Rejected alternatives.** Raising `protocols.INT_MAX` — it is the
+  IEEE-754-double round-trip guarantee of the whole repository (D-v0.3.5)
+  and raising it would silently widen every canonical document in every
+  unit. A second serializer for row-hash payloads — §5.8 itself calls a
+  competing integrity claim over the same bytes a defect. Reducing the
+  identity to 53 bits at minting, or allocating `workflows.id` from a
+  sequence — both rewrite a landed unit, invalidate stored history, and
+  break the structural "one instance per WorkSpec" agreement between the
+  primary key and `UNIQUE(work_spec_sha256)`. Binding the bare decimal
+  `str(id)` or its leaf, which is what the wave's unauthorised deviation
+  D1 did — a spelling that appears nowhere else in the architecture, and
+  freezing two spellings of one identity reintroduces the ambiguity this
+  decision removes. Binding the rendered identity as a RAW string member —
+  a second deviation from the leaf convention inside the clause being
+  repaired, against both live row-hash precedents (`routing.py`,
+  `agent_handoffs.py`). Making `read_workflow` recompute every row hash —
+  it would turn `list_workflows`, a declared full scan, into an O(total
+  rows) integrity sweep of the ledger, and U-W2 §17 already settled that
+  integrity is `verify`'s surface. Rewriting commit `91075d7…` or folding
+  A2 into A1's bytes — frozen commits and frozen contract text are
+  immutable history; amendments supersede and history stays byte-identical
+  (D-v0.4.33, D-v0.4.45, D-v0.4.50, and A1's own precedent). Leaving the
+  four silences undeclared, or deferring the repair to U-W2.3 — U-W2.2
+  cannot land at all under the contradiction, and deferring would land an
+  implementation its own contract forbids.
+
 # DECISIONS — Agentic OS v0.4 U-W2.2 deterministic workflow store (Wave 0)
 
 This section continues the `D-v0.4.*` series for the U-W2.2 Wave 0
