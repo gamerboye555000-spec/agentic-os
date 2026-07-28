@@ -1,3 +1,384 @@
+# DECISIONS — Agentic OS v0.4 U-W2.2 deterministic workflow store (Wave 0)
+
+This section continues the `D-v0.4.*` series for the U-W2.2 Wave 0
+architecture freeze and the governed U-W2 contract amendment it required:
+deterministic local workflow persistence and store semantics, frozen in
+`agentic-os-v0.4-u-w2-2-workflow-store-contract.md`, plus governed
+amendment A1 appended to the landed
+`agentic-os-v0.4-u-w2-workflow-state-engine-contract.md` with the landed
+body byte-preserved as that file's exact prefix (D-v0.4.95). Architecture
+only — no production code, tests, DDL, migrations, fixtures, CLI, workers,
+or adapters ship in this wave. Branch `v0.4-u-w2-2-workflow-store`
+(2026-07-25; replan re-freeze 2026-07-26), worktree
+`/home/daksh/Projects/agentic-os-u-w2-2`, baseline
+`63de8c953f2613a79d6e1bb6052646c669894863` (U-W2.1 deterministic workflow
+state engine merged, ledger schema version `"5"`, milestone
+`milestone/v0.4-u-w2-workflow-state-engine`; HEAD = `origin/main` =
+merge-base = this commit). Future PR title:
+`feat(v0.4): U-W2.2 — deterministic workflow persistence`; future commits:
+`docs: adopt U-W2 path amendment and freeze U-W2.2 store architecture`,
+then `feat(v0.4): add deterministic workflow store` (U-W2 amendment §A.7);
+future tag: `milestone/v0.4-u-w2-2-workflow-store`. Prepended per the
+established precedent (D-W0.4, reaffirmed in D-v0.2.7, D-v0.4.4);
+everything below stays byte-identical, including D-v0.4.81, which
+D-v0.4.95 extends and never rewords.
+
+## D-v0.4 decisions (U-W2.2, Wave 0 architecture freeze)
+
+- **D-v0.4.83 — U-W2.2 is persistence only: the landed U-W2.1 reducer is
+  consumed byte-unchanged, and the store's whole authority is the set of
+  judgments that need stored rows.** U-W2.1 landed at `aedbc49` (merged
+  `63de8c9`, tagged `milestone/v0.4-u-w2-workflow-state-engine`) with
+  `agentic_os/workflow_engine.py` (2265 lines), the two `workspecs.py`
+  acceptance wrappers, and `tests/test_v04_workflow_engine.py` (4921
+  lines); `decide`, `fold`, `verify_history`, `AdmissionFacts`,
+  `WorkflowDecision`, `WorkflowRefusal`, the thirteen states, nine
+  commands, seventeen events, forty-three refusal reasons, nine receipt
+  kinds and the 13×13 matrix are all present and closed (verified). The
+  store therefore decides exactly six things, all of which a pure
+  function provably cannot: does this workflow exist; has this
+  `command_id` been accepted, and with this digest; has this `receipt_id`
+  been stored, and with this digest; does the artifact's task exist and
+  is it open; does the stored projection agree with the stored history;
+  did the compare-and-swap win. Legality, revision arithmetic, document
+  verification, evidence, binding, ordering and identifier derivation
+  stay the reducer's, and the store neither anticipates nor
+  second-guesses them. U-W2.3 owns the thirteen CLI leaves, the power
+  policy, `README.md` and the observability journal row for a REFUSED
+  command; U-W2.R owns the private-runtime adapter in another repository
+  against another database; U-W3 owns retry, checkpoint, resume and
+  compensation. `workflow_store` never opens a connection, never touches
+  a path, and issues SQL against the six new tables plus read-only
+  `tasks`/`meta` and write-only `events` — so the local and runtime
+  databases cannot be shared even by accident.
+- **D-v0.4.84 — Schema version `"6"` is exactly the six frozen tables,
+  built from one `db.WORKFLOW_TABLES` constant, with a purely additive
+  5 → 6 migration that fabricates no history.** The landed contract's six
+  names (`workflows`, `workflow_events`, `workflow_commands`,
+  `workflow_intents`, `workflow_receipts`, `workflow_facts`) are verified
+  frozen and implementable; the contract's §5 gives each its complete
+  column list, CHECK set, UNIQUE set, foreign keys, mutability class,
+  retention rule, source-of-truth role and index decision. The
+  storage-side closures are the point: thirteen-state and
+  seventeen-event enums, biconditionals pinning `from_state IS NULL`
+  exactly to `workflow_admitted`, `resulting_revision =
+  expected_revision + 1`, `admit_work_spec` exactly to
+  `expected_revision = 0`, `resolved` exactly to a receipt id, and
+  `fact_scope` exactly to `fact_kind = 'approval'` — plus the four
+  receipt CHECKs that mirror `workflow_engine._RECEIPT_*` so the storage
+  boundary and the reducer's closed vocabulary cannot disagree between
+  builds. No explicit index is added: every hot path is a PK or a UNIQUE
+  lookup, and `list_workflows`/`list_outstanding_intents` are declared
+  scans (the D-v0.4.28 precedent). `u-w2-workflow-state-v6` creates six
+  empty tables FK-parent-first under their real names by iterating
+  `db.WORKFLOW_TABLES`, so a migrated schema is BYTE-identical to a fresh
+  one and a seventh table cannot be added in one place and forgotten in
+  the others. It reads no existing table, rebuilds nothing, re-stamps
+  nothing, reads no clock, and — because no table anywhere models a
+  workflow today — has nothing to derive history from and derives none:
+  a pre-existing task or run gets no workflow, no admission event, and no
+  synthetic snapshot. The 3 → 4 / 4 → 5 freeze obligation does not fire,
+  because this slice edits none of the constants a shipped step builds
+  from.
+- **D-v0.4.85 — The `workflows` row is a PROJECTION and the reducer's
+  snapshot is rebuilt by `fold(events)` plus the two stored bodies, so
+  the seven derived fields need no column.** `decide` requires a sealed
+  26-member `aos.workflow-snapshot/v1`; the landed §14.1 column list
+  supplies eighteen — the nineteenth, `schema`, is the frozen
+  record-identity constant with no column — and gives no column to
+  `admission_approval_satisfied`, `intent_seq`, `revoked_intent_ids`,
+  `resolved_intent_ids`, `last_seq`, `last_wait_entry_seq` or
+  `last_runtime_approval_seq`. Rejected: adding seven columns — it would
+  contradict the landed enumeration and its mutable-column list, and it
+  would create a second source of truth for values the contract already
+  calls derived. Rejected: storing the whole canonical snapshot in a
+  column — same objection, plus a body that would drift from the columns
+  beside it. Chosen: `_load_snapshot` reads the row, reads the history,
+  folds it, splices the two verbatim bodies, re-seals with the engine's
+  own two-line idiom, and requires the resulting digest AND the seventeen
+  member-backed projection columns (contract §7.2's enumeration; the two
+  row timestamps have no snapshot counterpart) to agree with the stored
+  row (`snapshot_divergence` otherwise). Consequences, all wanted: the row is exactly what U-W2
+  §14.2 calls it; snapshot/history agreement is checked on EVERY command
+  rather than only at `verify`; no column is added to a frozen table; and
+  the cost is one indexed range read that the reducer's own re-acceptance
+  of the stored artifact already dominates. The identity is likewise
+  derived, never allocated: `workflows.id` is
+  `_workflow_identity(work_spec_sha256)` parsed to an integer, and the
+  store renders it back as unpadded `"WF-" + str(id)` because
+  `ids.render_id` would zero-pad to `WF-0007` and break every event
+  digest — `ids.PREFIXES["workflow"] = "WF"` exists for `parse_id` at the
+  U-W2.3 CLI and for nothing else.
+- **D-v0.4.86 — Events are reconstituted from their columns, and the
+  sealed record digest is the proof the reconstitution is faithful; the
+  four row-hash tables (`workflow_commands`, `workflow_intents`,
+  `workflow_receipts`, `workflow_facts`) carry `record_schema` row hashes
+  while `workflows` and `workflow_events` carry record digests.** The landed
+  §14.1 gives `workflow_events` columns, not a `document` column, so the
+  store rebuilds each `aos.workflow-event/v1` record from
+  `WORKFLOW_EVENT_SCHEMA`, the rendered identity, the row's
+  `work_spec_sha256` parent, the same-named columns and the canonically
+  parsed `payload_json`. Because the sealed digest covers `workflow_id`
+  and `work_spec_sha256`, a spliced parent row makes every event digest
+  fail and the workflow reads `history_corrupt` rather than folding
+  silently under a false identity — the columns ARE the record, with no
+  dual representation to drift. `workflows.content_sha256` and
+  `workflow_events.content_sha256` stay the CANONICAL RECORD digests U-W2
+  §9 and §7 already assign them, because those two rows are records and a
+  second integrity claim over the same bytes would be a defect, not a
+  defence. The other four carry ordinary row hashes in the live U-A3
+  idiom (`record_schema` key, sha256 text leaves, direct integers,
+  `content_sha256` excluded, `sha256(serialize_canonical(payload))`)
+  under four new `aos.workflow-*-row/v1` payload identities — which are
+  row-hash names, not document schemas, and touch neither U-W2 §13.4's
+  six minted record schemas nor the U-X1 registry. They bind `id`, so
+  they are finalized by one `UPDATE` inside their own creating
+  transaction, the `routing_plans` post-commit-immutable precedent.
+- **D-v0.4.87 — `StoreOutcome` is a RETURNED, closed four-status record,
+  and a refusal persists nothing anywhere.** `submit` returns
+  `accepted`, `replay`, `refused` or `conflict` for every closed outcome
+  and never raises `WorkflowRefusal`, because the landed §18's "or a
+  refusal" plus the demand to freeze `StoreOutcome`'s meanings for all
+  four make refusals statuses of the record rather than exceptions past
+  it; the exact refusal object rides along so the CLI's single choke
+  point can still exit 1 with a bounded message. `conflict` is a distinct
+  status exactly for `command_conflict` and `receipt_conflict` — the one
+  refusal class caused by STORED state disagreeing with a delivered
+  document, and the one that redelivery can never make legal — so a
+  caller branches on a field rather than string-matching a code.
+  `replay` is a first-class boolean because the landed §10 and §19 name
+  it; `intent is None` off the accepted path because an intent is
+  delivered from the outbox, never from a command result; `revision` on
+  a replay is the ORIGINAL resulting revision while `snapshot` is the
+  CURRENT one, and the possible disagreement is stated rather than
+  discovered. A refused or conflicting `submit` writes NO row in any of
+  the six tables and NO `events` row: journalling a refusal belongs
+  outside the transaction that declined it, which makes it U-W2.3's, and
+  the declared consequence is that until U-W2.3 ships a refusal leaves no
+  trace in `aos.db` at all.
+- **D-v0.4.88 — The public store API is exactly seven functions and six
+  types, and `WorkflowStoreError` carries three infrastructure codes that
+  never widen the frozen 43-reason vocabulary.** `submit`,
+  `read_workflow`, `list_workflows`, `read_history`,
+  `list_outstanding_intents`, `rebuild`, `verify` — with `StoreOutcome`,
+  `WorkflowRecord`, `HistoryView`, `IntentView`, `RebuildResult` and
+  `VerifyReport`. U-W2.3 may add none; needing one is a replan trigger
+  rather than a quiet edit to a U-W2.2 file. The three codes —
+  `store_schema_unsupported`, `store_argument_invalid`,
+  `store_unavailable` — are facts about the LEDGER, not about a workflow,
+  which is why they cannot be members of a vocabulary the pure reducer
+  owns; every workflow-scoped failure, including a hostile row, still
+  lands on one of the forty-three. `WorkflowRecord.task_id` is the
+  integer row id rather than a rendered `T-<n>`, because `T-7` and
+  `T-0007` are both pattern-valid and the admitted string lives verbatim
+  in the snapshot and the admission payload — re-rendering would state a
+  string nobody wrote.
+- **D-v0.4.89 — One `BEGIN IMMEDIATE` transaction per accepted command,
+  in one frozen mutation order per path, through nine named helpers, and
+  the whole write path reads no clock.** `BEGIN IMMEDIATE` is the first
+  statement inside the single `db.transaction` block (the live
+  `routing.py`/`agent_handoffs.py` "write lock before the re-reads"
+  idiom), so dedupe, snapshot read, decision, writes and journal form one
+  serialized critical section and a deferred begin's wasted-decision
+  failure mode never exists. The non-admission order is command row →
+  events → intent → intent closures → receipt → fact → snapshot CAS →
+  journal; the admission order differs and is frozen separately, because
+  `workflow_commands.workflow_id` is an immediate foreign key and the
+  parent row must exist first. The CAS is `UPDATE workflows … WHERE id =
+  ? AND revision = ?` with a required rowcount of 1 (`revision_mismatch`
+  otherwise, the code the landed §10 pairs with it); the admission gate
+  is the `workflows` INSERT under `UNIQUE(work_spec_sha256)`, pre-checked
+  deterministically under the lock so the `IntegrityError` mapping is a
+  backstop rather than a control path; each intent closure is itself a
+  `WHERE status = 'outstanding'` CAS, so a second close is impossible.
+  The nine mutation helpers (`_insert_workflow`, `_insert_command`,
+  `_insert_events`, `_insert_intent`, `_resolve_intent`,
+  `_insert_receipt`, `_insert_fact`, `_cas_snapshot`, `_journal`) are
+  frozen ARCHITECTURE because the crash matrix injects at them. Every
+  timestamp in all six tables is the accepted command's own `created_at`,
+  so the store imports no time module, the six-table write is a pure
+  function of the command and the prior rows, and a crash-and-retry
+  writes byte-identical rows; the only wall clock in the transaction is
+  `events.emit`'s `ts`, which the journal framework owns. One journal row
+  is written PER APPENDED EVENT, not per command, because `action` is the
+  event name and one row would have to drop the other.
+- **D-v0.4.90 — Two dedupe axes, both evaluated before `decide`:
+  commands by `command_id` + recomputed digest, receipts by `receipt_id`
+  + recomputed digest.** An exact command duplicate returns the original
+  events and resulting revision from the
+  `[event_seq_first, event_seq_last]` range without calling `decide`; a
+  digest disagreement is `command_conflict`; a duplicate of a REFUSED
+  command is re-evaluated and refuses identically, because refusals store
+  nothing. The receipt axis is load-bearing and its ORDERING is the
+  discriminating decision: a redelivered `accepted` receipt arrives after
+  the workflow has moved to `scheduled`, so handing it to the reducer
+  would produce `receipt_out_of_order` for a receipt that was in fact
+  applied — dedupe first turns it into the accepted no-op the landed
+  §13.3 promises, and the original events are recoverable because every
+  receipt-driven event payload carries `receipt_id` and `receipt_sha256`.
+  Both digests are RECOMPUTED from the stored or delivered bytes, never
+  read from a document's own member, and a same-digest row naming a
+  different workflow is a conflict rather than a replay, because the
+  digest covers `workflow_id` and that pair can only exist through
+  tampering. Nothing is merged, nothing is guessed, and nothing is ever
+  pruned: the contract's §14.4 states, table by table, exactly which
+  guarantee a deletion would break, which is why no `DELETE` statement
+  and no prune surface exists anywhere in the slice.
+- **D-v0.4.91 — Contention handling is SQLite's already-configured
+  bounded busy timeout and nothing else, which is why it is a storage
+  primitive and not U-W3 retry.** `db.connect` already sets
+  `timeout=5.0` and `PRAGMA busy_timeout=5000`; the store adds no loop,
+  no sleep, no backoff, no re-issue and no automatic re-decision, and a
+  post-timeout `OperationalError` becomes `store_unavailable` for a human
+  to retry. The distinction is exact rather than rhetorical: lock waiting
+  carries no workflow semantics, consumes no attempt budget, appends no
+  event and changes no state, and the same command produces the same
+  decision once the lock frees; U-W3 retry is re-EXECUTION of work that
+  advances an attempt counter, is bounded by the artifact's
+  `retry.max_attempts`, and changes what the workflow claims about the
+  world. A `revision_mismatch` refusal is not a retry either — the caller
+  must mint a NEW `command_id`, which is a fresh recorded decision. If
+  the slice contained any automatic re-issue, U-W2 §0.2's "no retry loop
+  of any kind" would be false; it contains none, and an AST test proving
+  the absence of `while`, `sleep` and recursive `submit` is what keeps
+  that honest.
+- **D-v0.4.92 — Integrity is REPORTED, never repaired, under a closed
+  five-member `STORE_INTEGRITY` vocabulary.** `ok`, `history_corrupt`,
+  `history_unknown_event`, `policy_version_unsupported` and
+  `snapshot_divergence` are the only verdicts; the contract's §15.2 maps
+  every corruption — seq gap, duplicate seq, reordering, digest mismatch,
+  chain break, misplaced admission event, broken revision arithmetic,
+  unknown event name, unsupported policy version, unparseable payload,
+  non-text document, divergent projection, re-digest failure — to its
+  exact verdict AND states whether storage can even express it. Duplicate
+  `seq`, reordering and unknown event names are declared UNREACHABLE
+  through this store (the `UNIQUE(workflow_id, seq)` and `event` CHECKs
+  forbid them), and the contract tests the constraint rather than
+  pretending to test a store-side path that cannot exist. While a
+  workflow fails verification its mutating commands refuse with the exact
+  code and write nothing, while every read path stays total — a typed
+  `integrity` field and an `unreadable_seq`, rather than a printed
+  warning. `verify` rebuilds, compares the seventeen member-backed
+  projection columns, the
+  snapshot digest, both stored bodies against the digests
+  `workflow_admitted` recorded, and all four row hashes, then returns a
+  report; it opens no transaction and issues no write, and a whole-file
+  byte comparison proves it. Recovery is a human restoring a verified
+  backup, never the engine editing history.
+- **D-v0.4.93 — Persisted rows are untrusted input, and the defences are
+  structural rather than procedural.** Every digest is recomputed from
+  stored bytes at every use; the reducer additionally re-runs the U-W1
+  acceptance gate on the stored artifact on every command, so a body that
+  merely re-digests is not thereby trusted. Every statement is
+  parameterized and the only interpolated identifiers are the six frozen
+  `db.py` table-name constants; no `DELETE`, `DROP`, `ALTER`, `ATTACH`,
+  `PRAGMA`, `executescript`, `eval`, `exec`, `compile`, `__import__`,
+  `subprocess` or `socket` appears in the module. Oversized and malformed
+  bodies are bounded by the spine's own `MAX_ARTIFACT_BYTES`,
+  `MAX_ARRAY_ITEMS`, `MAX_STRING_CHARS` and `INT_MAX`, and the reducer
+  refuses at admission any instance whose snapshot could not survive its
+  own maximum growth — so a workflow that admits can always be advanced
+  and can never brick. Every raising call site is mapped explicitly:
+  `WorkflowRefusal` to a `StoreOutcome`, `ProtocolError` to an integrity
+  verdict or `command_malformed`, hostile-row shape errors to a verdict
+  via type checks BEFORE the access rather than broad excepts, the one
+  `workflows` INSERT's `IntegrityError` to `workflow_exists`, and every
+  other `sqlite3.Error` to `store_unavailable`. Stored text that reads as
+  an instruction — "run this tool", "reveal your prompt", "widen your
+  scope" — is DATA structurally: it never becomes SQL, never becomes a
+  message, never becomes a path, and is never executed, and the frozen
+  test proves a hostile corpus produces byte-identical decisions to a
+  benign one. Refusal messages carry a closed code, a schema-safe path
+  and a fixed hint; a credential-shaped value planted in every text
+  column of all six tables must appear in no message, no diagnostics and
+  no journal row. This decision states the limit honestly: the guarantee
+  is that no PARTIAL tampering survives, not that a fully coherent
+  forgery is detectable — and a fully coherent forgery is a different
+  workflow identity, not a corrupted one.
+- **D-v0.4.94 — The exact implementation boundary is the nineteen paths of
+  contract §19 — the closed inventory U-W2 governed amendment A1
+  authorizes — and nothing in it is standing authority.** Four production
+  paths (`agentic_os/workflow_store.py` new; `agentic_os/db.py`,
+  `agentic_os/migrations.py`, `agentic_os/ids.py` modified) and one new
+  test module are what the landed §18 named. `db.SCHEMA_VERSION = "6"`
+  mechanically breaks hard-coded version assertions in eight existing test
+  modules (`test_core.py:116`,
+  `test_v02_migrations.py:199,201,211,226,234,1075,1084`,
+  `test_v02_power_modes.py:1380`, `test_v03_memory_claims.py:191`,
+  `test_v03_memory_graph.py:253,256,280,288,290-294,314,322,715,721`,
+  `test_v04_agent_passports.py:205-208,219,229,262`,
+  `test_v04_agent_catalog.py:851-855,1381-1394`,
+  `test_v04_routing_handoffs.py:343-346,348,358,363-372,379,433,1062,1063,1065`),
+  and the three historical fixtures must drop the six new tables or a
+  "v1"/"v2"/"v3" workspace would carry v6 tables and the 5 → 6 step's
+  `CREATE TABLE` would fail when the fixture was migrated forward. This
+  is not novel: commit `7c5fea4`, the U-A3 4 → 5 bump, touched exactly
+  this class of file for exactly these reasons (verified by
+  `git show --stat`). The landed §18 forbade these paths three ways
+  (§0.3, the five-path table with its closure rule, §19.22), so the
+  audited candidate's attempt to declare them from inside this
+  subordinate contract was an unauthorized amendment — the replan
+  trigger. U-W2 governed amendment A1 (D-v0.4.95) now supersedes exactly
+  those clauses and authorizes exactly these edits, in six frozen classes
+  restated per file in contract §19.3: version-literal rebase;
+  registry/plan-list step addition; nine enumerated ordinal-bearing
+  method renames; ONE meaning-rebased assertion
+  (`test_no_version_six_transition_exists`, re-scoped to the new ceiling
+  and renamed — declared, not hidden under "no meaning changes"); one
+  migration-target rebase (`migrate(target="5")` → `"6"`); and one
+  fixture drop loop per fixture. No test is deleted, skipped or
+  weakened; `FIXTURE_TABLES` is not extended (it enumerates tables whose
+  CONTENTS a migration compares, and the six do not exist before); no
+  new fixture module is added because the equivalence test migrates
+  `build_v3_workspace` forward exactly as U-A3's does. The three Wave-0
+  architecture documents (`DECISIONS.md`, the amended landed contract,
+  this contract) are paths 17–19, per the landed §18's own
+  Wave-0-documents rule. Nine further paths are named as deliberately
+  UNCHANGED with their reasons — the reducer, the compiler seam, the
+  spine, `models.py`, `ops.py`, doctor, backup/export/mirror, packaging
+  and CI — so that "not in the table" is a decision rather than an
+  omission. Rejected: a standing licence for future bumps ("has always
+  required and always will" — an escape hatch; each future bump earns its
+  own governed amendment).
+- **D-v0.4.95 — Governed amendment A1 to the landed U-W2 contract:
+  appended, byte-preserving, minimal, and one-shot; D-v0.4.81 is
+  extended, never reworded.** The U-P2 trust-boundary mechanism
+  (D-v0.4.45–50) applied to U-W2: amendment A1 names the audit finding it
+  resolves, quotes every superseded clause verbatim with its replacement
+  (U-W2 §A.3.1: the five-path U-W2.2 slice table; the closure rule's
+  table binding; §0.3's every-test/fixture clause for exactly the eleven
+  files; §19.22's byte-unchanged clause; the §1-index exhaustiveness
+  claim of D-v0.4.81 and its one-PR delivery identity, already superseded
+  in ratified practice by the U-W2.1 merge as PR #20; and the per-event
+  reading of §14.2's journal clause), enumerates everything NOT
+  superseded (§A.3.2), replaces the five-path set with the closed
+  nineteen-path inventory (§A.4), and re-attaches the exhaustiveness rule
+  over the amended tables with an explicit negative boundary: no
+  production, packaging, protocol, CLI, migration, delivery-control, or
+  unrelated documentation file beyond the nineteen named paths, no edit
+  class beyond the six frozen ones, one delivery only, and no standing
+  authority for any future wave, bump, or unit (§A.5). Representation,
+  forced and documented: the replan session's write boundary is exactly
+  three repository paths, so A1 is an append-only addendum INSIDE the
+  landed contract file — the landed body stays byte-identical as the
+  file's exact prefix (original-body SHA-256
+  `409745bbba541cb81a40da5384a97127db40c38f8f8e116f334706c70dc53aaf`,
+  machine-checked against `git show` at the baseline), where U-P2's
+  amendment was a sibling file. Landing mirrors U-P2's D-v0.4.50 model:
+  the amendment lands first as one documentation-only commit (`docs:
+  adopt U-W2 path amendment and freeze U-W2.2 store architecture`,
+  exactly the three Wave-0 documents), then the implementation commit
+  (`feat(v0.4): add deterministic workflow store`, exactly the sixteen
+  implementation paths), both inside the one U-W2.2 PR through the U-P2
+  gate; U-W2.1's landed bytes are not retroactively modified. Rejected:
+  rewriting the landed contract in place (frozen history — amendments
+  supersede, per D-v0.4.33/D-v0.4.45); a sibling amendment file (a fourth
+  repository path outside the session's authorized writes); the audited
+  candidate's self-amendment (a subordinate contract cannot amend its
+  landed parent); dropping schema v6 from U-W2.2 (strands the landed §14
+  persistence architecture and only defers the same amendment); landing
+  the test edits as a quiet extension (exactly what §18 forbids).
+
 # DECISIONS — Agentic OS v0.4 U-W2 deterministic workflow state engine (Wave 0)
 
 This section continues the `D-v0.4.*` series for the U-W2 Wave 0

@@ -1646,3 +1646,428 @@ git diff --check
 *This contract is the audit surface for U-W2: an implementation behavior
 the sections above do not license is a defect, whichever file it lives
 in.*
+
+---
+
+# Agentic OS v0.4 — U-W2 governed contract amendment A1 (U-W2.2 mechanical-path closure)
+
+Unit: U-W2 — deterministic workflow state engine (landed). Amending wave:
+U-W2.2 — deterministic workflow store, Wave 0.
+Amends: the original contract body above (frozen 2026-07-25, decisions
+D-v0.4.71 … D-v0.4.82), landed in commit
+`aedbc499f9a45a8316cf62a55288b67165f881a3`, merged as PR #20 at
+`63de8c953f2613a79d6e1bb6052646c669894863`, tagged
+`milestone/v0.4-u-w2-workflow-state-engine`.
+Original-body hash:
+`409745bbba541cb81a40da5384a97127db40c38f8f8e116f334706c70dc53aaf`
+(SHA-256 of this file as landed — 98,556 bytes, ending at the italic
+audit-surface line and its newline; the first 98,556 bytes of this file
+are byte-identical to the landed file, and one blank line plus the `---`
+separator that opens this amendment follow them).
+Amendment baseline: `63de8c953f2613a79d6e1bb6052646c669894863` (= HEAD =
+`origin/main` = the merge-base = the milestone tag target at amendment
+time).
+Amendment frozen: 2026-07-26. Branch: `v0.4-u-w2-2-workflow-store`;
+worktree: `/home/daksh/Projects/agentic-os-u-w2-2`.
+Decisions: D-v0.4.95 (recorded in `DECISIONS.md` with the U-W2.2 Wave 0
+decisions D-v0.4.83 … D-v0.4.94).
+Provenance: the independent combined audit of the U-W2.2 Wave 0 candidate
+(2026-07-25; lead auditor plus one independent read-only auditor; verdict
+`FAIL — REPLAN REQUIRED`), finding accepted in full; resolved in the
+governed U-W2.2 replan session of 2026-07-26 (one lead architect, one fresh
+independent pre-amendment auditor, one fresh independent post-repair
+verifier).
+
+This is a governed amendment, not a rewrite — the mechanism of the U-P2
+trust-boundary amendment (`agentic-os-v0.4-u-p2-trust-boundary-amendment.md`,
+D-v0.4.45 … D-v0.4.50), applied to this contract. It supersedes **only** the
+clauses enumerated in §A.3.1. Every other clause of the original contract
+remains in force verbatim; the original body is not edited, deleted, or
+reworded. Where this amendment and the original body conflict, this
+amendment is authoritative; everything not named in §A.3.1 is not
+superseded.
+
+One representation difference from the U-P2 precedent, itself governed and
+recorded here as the byte-level change it is: the U-P2 amendment is a
+sibling document, but the governed U-W2.2 replan session is authorized to
+write exactly three repository paths — `DECISIONS.md`, this file, and
+`agentic-os-v0.4-u-w2-2-workflow-store-contract.md` — and no fourth. This
+amendment is therefore carried INSIDE the amended contract file as an
+append-only addendum. The preservation invariant is machine-checkable
+rather than merely declared: the original body remains the exact byte
+prefix of this file, equal to
+`git show 63de8c953f2613a79d6e1bb6052646c669894863:agentic-os-v0.4-u-w2-workflow-state-engine-contract.md`,
+and the landed commit itself is immutable history. The file-level hash
+necessarily changes with this addendum; the original-body hash above is the
+frozen reference.
+
+## A.1 The audit finding this amendment resolves
+
+Five landed statements are jointly unsatisfiable, and the impossibility
+lives in this contract, not in the U-W2.2 candidate:
+
+1. §0.1/§14.1 freeze `db.SCHEMA_VERSION = "6"` inside slice U-W2.2.
+2. That bump mechanically falsifies hard schema-version assertions in
+   eight existing test modules and requires one drop loop in each of the
+   three historical fixtures (the complete inventory is §A.4.3; the
+   necessity of every item and the absence of a twelfth file were verified
+   against the live tree, and commit `7c5fea4` — the U-A3 4 → 5 bump —
+   touched exactly this class of file for exactly these reasons).
+3. §0.3 declares "every existing test, and every existing fixture"
+   untouched.
+4. §19 row 22 requires "the full existing suite passes byte-unchanged."
+5. §18's slice U-W2.2 table names exactly five paths, §18 closes with
+   "Any path outside the tables above appearing in any later U-W2 wave is
+   `FAIL — REPLAN REQUIRED`, not a quiet extension.", and D-v0.4.81
+   declares "the exact file table in §18 is exhaustive."
+
+Items 3–5 forbid exactly the edits item 1 forces. The audited candidate
+attempted to resolve this inside its own subordinate contract ("the loud
+amendment U-W2 §18 demands"); the audit correctly found that reading
+unlawful — the §18 sentence names a verdict and authorizes nothing, and a
+subordinate contract cannot amend its landed parent. The lawful resolution
+is this governed amendment to the landed contract itself, through the
+established U-P2 mechanism.
+
+## A.2 What this amendment changes, and what it does not
+
+This amendment changes PATH AUTHORITY and DELIVERY IDENTITY only. It adds
+no state, command, event, receipt kind, refusal reason, matrix edge, table,
+column, CHECK, API function, transaction step, or record schema, and it
+removes none. The reducer boundary (§9), revision and dedupe semantics
+(§10), admission (§11), approval and evidence facts (§12), the queue
+handshake (§13), persistence and crash-point rules (§14), updateability
+(§15), the CLI table (§16, U-W2.3's), the exclusions (§0.2, §17), the test
+matrix (§19), and the known limitations (§22) all stand unchanged.
+Ownership is preserved exactly: U-W2.1 (landed) owns the pure kernel;
+U-W2.2 owns local persistence; U-W2.3 owns CLI, power policy, README, and
+refusal journaling; U-W2.R owns the private-runtime adapter in its own
+repository against its own database; U-W3 owns retry, checkpoint, resume,
+and compensation; U-W4/U-W5/U-W6 as frozen. The no-shared-database rule
+stands: nothing here authorizes any CLI, queue-worker, retry, checkpoint,
+or private-runtime work, and the local and runtime databases remain never
+shared.
+
+The distinction this amendment draws, and the whole of its new authority:
+
+- A **semantic implementation path** carries new behavior (the five §18
+  slice-table paths for U-W2.2, unchanged here).
+- A **mechanical schema-pin edit** is a forced consequence of the frozen
+  `SCHEMA_VERSION = "6"` inside an EXISTING test or fixture: a version
+  literal rebased `5`/`"5"` → `6`/`"6"`, a migration-registry or plan-list
+  equality gaining the one new step, an ordinal-bearing test-method name
+  renamed to stay truthful, one guard assertion re-scoped to the new
+  ceiling (§A.4.3, declared singly), one migration-target literal rebased,
+  and one fixture drop loop. Such edits add no assertion, delete no test,
+  skip nothing, and weaken nothing.
+- An **architecture document** is the wave's own decision record and
+  contract text, which every prior unit landed with its implementation
+  commit.
+
+Only the second and third categories are added to the closed U-W2.2 path
+set, each by name in §A.4.
+
+## A.3 Exact supersession scope
+
+### A.3.1 Superseded clauses
+
+1. **§18, slice U-W2.2, the "Paths:" list** — "Paths:
+   `agentic_os/workflow_store.py` (new); `agentic_os/db.py` (modified:
+   `SCHEMA_VERSION = "6"`, six DDL constants, table-list tuple, schema
+   composition); `agentic_os/migrations.py` (modified: the 5 → 6 step and
+   registry entry); `agentic_os/ids.py` (modified: the `WF` prefix);
+   `tests/test_v04_workflow_store.py` (new)." — Superseded by §A.4: those
+   five paths remain, unchanged in content and responsibility, and the
+   closed slice inventory is extended to the nineteen paths of §A.4.
+   Nothing else in the U-W2.1, U-W2.3, or U-W2.R slice definitions is
+   touched.
+2. **§18, the closing rule** — "Any path outside the tables above
+   appearing in any later U-W2 wave is `FAIL — REPLAN REQUIRED`, not a
+   quiet extension." — Superseded by §A.5 ONLY in what "the tables above"
+   denotes: the §18 tables as amended by §A.4. The rule itself is
+   preserved verbatim and continues to fire on every path outside the
+   amended tables.
+3. **§0.3, the closing clause of the untouched list** — "…`pyproject.toml`,
+   every existing test, and every existing fixture." — Superseded by §A.4.3
+   for EXACTLY the eleven files named there and EXACTLY their enumerated
+   edit classes. For every other existing test and fixture — and for every
+   other path §0.3 names — §0.3 remains in force verbatim, including
+   "Existing artifacts remain valid without edits."
+4. **§19 row 22, the final clause** — "the full existing suite passes
+   byte-unchanged." — Superseded by: the full existing suite passes; every
+   existing test and fixture file OUTSIDE the eleven §A.4.3 paths is
+   byte-unchanged; the eleven receive exactly the §A.4.3 edits, no test is
+   deleted, skipped, or weakened, and exactly one assertion is re-scoped
+   and renamed (§A.4.3, `test_no_version_six_transition_exists`). Every
+   other clause of row 22 stands.
+5. **§1, the D-v0.4.81 index entry's closing claim** — "the exact file
+   table in §18 is exhaustive." — Superseded by: the exact file table in
+   §18, AS AMENDED BY §A.4, is exhaustive. The landed D-v0.4.81 ledger
+   entry itself stays byte-identical history in `DECISIONS.md`; D-v0.4.95
+   supersedes its five-path enumeration and its one-PR delivery clause,
+   extending and never rewording it (the D-v0.4.44 → D-v0.4.50 precedent).
+6. **§18 preamble and §21, the one-PR delivery identity, as applied to
+   slices U-W2.2 and U-W2.3** — "All agentic-os slices land as ordered
+   commits on `v0.4-u-w2-workflow-state-engine` inside the ONE frozen PR
+   (`feat(v0.4): U-W2 — deterministic workflow state engine`), delivered
+   through the U-P2 gate; the tag `milestone/v0.4-u-w2-workflow-state-engine`
+   follows the merge." — and slice U-W2.2's "Commit subject: `feat(v0.4):
+   U-W2.2 — workflow ledger, outbox/inbox, and revision CAS`". Superseded
+   by §A.6, which records the supersession that ratified practice already
+   made. §21 stands as the accurate record of the U-W2/U-W2.1 delivery
+   that occurred.
+7. **§14.2, one reading of the journal clause** — "and `events.emit` one
+   AOS journal row (`entity="workflow"`, action = the event name; …)" —
+   Any reading under which a multi-event command writes ONE journal row is
+   superseded: `action` IS the event name, so the clause is read as one
+   journal row PER APPENDED WORKFLOW EVENT. This resolves an ambiguity; no
+   transaction semantics change.
+
+### A.3.2 Explicitly not superseded
+
+Everything else in the original body remains in force, including: the §0.1
+in-scope list (schema version `"6"` itself — the cause stands; this
+amendment makes it implementable); the §0.2 not-in-scope list in full;
+§0.3 for every path outside §A.4.3; the §1 decision index apart from the
+one D-v0.4.81 claim named above; §2–§17 in full (dependencies, threat
+model, ownership outcome B, states and the 13×13 matrix, commands, events,
+refusal reasons, the pure reducer and snapshot record, revision/dedupe,
+admission, approval and evidence facts, the queue handshake and record
+schemas, persistence/schema v6/transactions/crash points, updateability,
+CLI, exclusions); §18's slice definitions for U-W2.1, U-W2.3, and U-W2.R,
+including U-W2.3's own path list and its Wave-0-documents paragraph; §19
+rows 1–21 and every clause of row 22 except the one named above; §20; §21
+as historical record; §22 in full; and the closing audit-surface sentence.
+D-v0.4.71 … D-v0.4.80 and D-v0.4.82 are untouched.
+
+## A.4 The amended closed U-W2.2 path inventory (nineteen paths)
+
+This table REPLACES the five-path slice list as the complete, closed,
+exhaustive U-W2.2 inventory. Per-path detail — why each changes, the exact
+edit class, whether it is semantic or mechanical, and the acceptance test
+that covers it — is frozen in the U-W2.2 contract
+(`agentic-os-v0.4-u-w2-2-workflow-store-contract.md` §19), which is
+subordinate to this amendment and must enumerate exactly these paths.
+
+### A.4.1 Production (4) — semantic; unchanged from the original slice list
+
+```text
+agentic_os/workflow_store.py    new       the store module (U-W2.2 §8–§18)
+agentic_os/db.py                modified  SCHEMA_VERSION "6"; six DDL constants;
+                                          six table-name constants; WORKFLOW_TABLES;
+                                          SCHEMA_SQL composition
+agentic_os/migrations.py        modified  _workflow_state_v6; WORKFLOW_STATE_V6;
+                                          MIGRATIONS gains the one 5 → 6 entry
+agentic_os/ids.py               modified  PREFIXES["workflow"] = "WF"; docstring clause
+```
+
+### A.4.2 New focused test (1) — semantic; unchanged from the original slice list
+
+```text
+tests/test_v04_workflow_store.py  new     the U-W2.2 §20 matrix, rows S1–S24
+```
+
+### A.4.3 Mechanical schema-pin and fixture edits (11) — forced by `SCHEMA_VERSION = "6"`
+
+Frozen edit classes, and no others: (a) version-literal rebase `5`/`"5"` →
+`6`/`"6"`; (b) migration-registry/plan-list equality gains exactly the
+`(5, 6, "u-w2-workflow-state-v6")` step; (c) ordinal-bearing test-method
+rename; (d) the single guard re-scope, declared here; (e) the single
+migration-target rebase, declared here; (f) the fixture drop loop
+`for table, _ddl in reversed(db.WORKFLOW_TABLES): DROP TABLE`, placed
+before the existing `ROUTING_HANDOFF_TABLES` loop. Line numbers are
+evidence anchors at the amendment baseline; the method names are the
+stable identities.
+
+```text
+ 6  tests/test_core.py                (a) test_schema_version_recorded (:116)
+ 7  tests/test_v02_migrations.py      (a) :199; (b) :211, :226, :234, :1075, :1084;
+                                      (c) test_production_registry_is_the_four_production_steps (:201)
+ 8  tests/test_v02_power_modes.py     (a) test_schema_version_is_whatever_the_one_declaration_says (:1380)
+ 9  tests/test_v03_memory_claims.py   (a) test_fresh_init_creates_the_current_schema_version (:191)
+10  tests/test_v03_memory_graph.py    (a) :253, :256; (b) :280, :314, :322; (a) :288;
+                                      (d) test_no_version_six_transition_exists (:290-294) — the
+                                          predicate re-scopes to the new ceiling (`> 5` → `> 6`), the
+                                          method renames, and the docstring restates the guard: the
+                                          suite then asserts the 5 → 6 step EXISTS and nothing
+                                          transitions past 6. This is the one edit whose assertion
+                                          meaning is rebased rather than re-literaled, declared here;
+                                      (e) test_corrected_retry_succeeds_exactly_once —
+                                          `self.migrate(target="5")` → `"6"` (:715), keeping the
+                                          doctor exit-0 assertion (:721-722) true under a v6 build
+11  tests/test_v04_agent_passports.py (a)+(c) test_fresh_init_is_version_five_with_both_agent_tables
+                                      (:205-208); (b) :229, :262;
+                                      (c) test_registry_is_exactly_the_four_steps_in_order (:219)
+12  tests/test_v04_agent_catalog.py   (a)+(c) test_schema_stays_version_five (:851-855);
+                                      (a)+(c) test_schema_stays_5_and_migration_state_is_untouched
+                                      (:1381-1392)
+13  tests/test_v04_routing_handoffs.py (a)+(c) test_schema_version_is_five (:343-346, three literals);
+                                      (b)+(c) test_registry_has_the_new_fourth_step_in_exact_order
+                                      (:348, :358); (a)+(b)+(c)
+                                      test_migration_status_and_plan_report_four_to_five (:363-372);
+                                      (a) :379, :433, :1062; (a) len(MIGRATIONS) 4 → 5 (:1063);
+                                      (a) MIGRATIONS[-1].migration_id (:1065)
+14  tests/fixtures/v1_workspace.py    (f) one loop (:156 region)
+15  tests/fixtures/v2_workspace.py    (f) one loop (:179 region)
+16  tests/fixtures/v3_workspace.py    (f) one loop (:120 region)
+```
+
+The nine method renames authorized by classes (c) and (d), exhaustively:
+`test_production_registry_is_the_four_production_steps`,
+`test_no_version_six_transition_exists`,
+`test_fresh_init_is_version_five_with_both_agent_tables`,
+`test_registry_is_exactly_the_four_steps_in_order`,
+`test_schema_stays_version_five`,
+`test_schema_stays_5_and_migration_state_is_untouched`,
+`test_schema_version_is_five`,
+`test_registry_has_the_new_fourth_step_in_exact_order`,
+`test_migration_status_and_plan_report_four_to_five`. No other existing
+test method is renamed, added, deleted, skipped, or weakened.
+
+### A.4.4 Architecture documents (3)
+
+```text
+DECISIONS.md                                              modified  the prepended
+    U-W2.2 Wave 0 section, decisions D-v0.4.83 … D-v0.4.95; everything below the
+    prepend stays byte-identical
+agentic-os-v0.4-u-w2-workflow-state-engine-contract.md    modified  THIS amendment,
+    appended; the original body byte-preserved as the exact prefix
+agentic-os-v0.4-u-w2-2-workflow-store-contract.md         new       the U-W2.2
+    Wave 0 architecture contract
+```
+
+The landed §18 already settled that a wave's documents belong in its
+implementation inventory ("Wave 0 commits nothing (§21), so these two land
+here; naming them is not optional bookkeeping — … the exhaustiveness rule
+below would otherwise declare this unit's own delivery a replan"); this
+amendment applies that settled rule to U-W2.2's own documents.
+
+### A.4.5 Completeness
+
+No twentieth path exists. Verified at the amendment baseline,
+independently by two auditors: the only literal schema-version pins in the
+tree are in the eight §A.4.3 test modules; every remaining
+`sqlite_master` enumeration is a membership, subset, or absence assertion
+that six added tables cannot break; the fixtures are the only builders of
+historical workspaces; `pyproject.toml` packages the `agentic_os` package
+by allowlist and needs no edit; CI discovers tests by pattern and needs no
+edit; no production module outside §A.4.1, no tool, and no documentation
+file outside §A.4.4 requires any change.
+
+## A.5 Closure — this amendment is not an expansion mechanism
+
+The §18 rule continues in force over the amended tables, verbatim in
+effect: any path outside the tables above, as amended by §A.4, appearing
+in any later U-W2 wave is `FAIL — REPLAN REQUIRED`, not a quiet extension.
+
+This amendment authorizes exactly one delivery: the U-W2.2 implementation
+described by the U-W2.2 contract at this baseline, over exactly the
+nineteen §A.4 paths, in exactly the two §A.7 commits. It grants no
+standing authority of any kind: no future schema-version bump, no later
+U-W2 wave, and no other unit inherits any path permission from it. A
+future mechanical necessity — including the same class of version-pin edit
+in U-W2.3 or any later unit — requires its own governed amendment through
+this same mechanism. No production, packaging, protocol, CLI, migration,
+delivery-control, or unrelated documentation file is authorized by this
+amendment beyond the nineteen named paths, and within the eleven §A.4.3
+paths nothing beyond the frozen edit classes (a)–(f) is authorized.
+
+## A.6 Delivery-identity supersession (recording ratified practice)
+
+The original §18/§21 delivery model — three ordered slice commits inside
+one U-W2 PR with one tag at its merge — was superseded in ratified
+practice when slice U-W2.1 landed ALONE: commit
+`aedbc499f9a45a8316cf62a55288b67165f881a3` with subject `feat(v0.4): add
+deterministic workflow state engine` (not the frozen slice subject),
+merged as PR #20 (`63de8c95…`), with `milestone/v0.4-u-w2-workflow-state-engine`
+minted at that merge. This amendment declares what that practice made
+true: the remaining slices land as per-slice PRs.
+
+- U-W2.2: branch `v0.4-u-w2-2-workflow-store`; PR title `feat(v0.4):
+  U-W2.2 — deterministic workflow persistence`; tag after merge
+  `milestone/v0.4-u-w2-2-workflow-store`; commits per §A.7. The original
+  slice commit subject is superseded by the §A.7 subjects.
+- U-W2.3: delivers as its own PR against the then-current base; its
+  branch, PR title, tag, and commit identity are frozen at its own Wave 0
+  against this amended contract — not silently, and not here. The two
+  U-W2 Wave-0 documents the original §18 U-W2.3 paragraph expected to
+  land with U-W2.3's commit in fact landed with U-W2.1 in `aedbc49…`
+  (ratified practice, above), so that paragraph's two-documents clause is
+  already discharged and U-W2.3 carries no Wave-0-document obligation
+  from it.
+- U-W2.R: unchanged (separate repository, separate PR, pins by content
+  hash at the U-W2 milestone tag, exactly as §18 froze it).
+
+## A.7 Landing
+
+Mirroring the U-P2 Wave 0.5 landing model (D-v0.4.50: a governed amendment
+lands as its own documentation-only commit, independently visible, before
+any implementation file is staged), the U-W2.2 delivery is exactly two
+ordered commits on `v0.4-u-w2-2-workflow-store`, inside the one U-W2.2 PR,
+through the U-P2 gate:
+
+1. `docs: adopt U-W2 path amendment and freeze U-W2.2 store architecture`
+   — exactly the three §A.4.4 documents.
+2. `feat(v0.4): add deterministic workflow store` — exactly the sixteen
+   §A.4.1–§A.4.3 implementation paths.
+
+No implementation path may be staged before commit 1 exists. Wave 0 of
+U-W2.2 (the session that produced this amendment) stages nothing and
+commits nothing. This amendment does not retroactively modify U-W2.1's
+landed bytes: `agentic_os/workflow_engine.py`, `agentic_os/workspecs.py`,
+and `tests/test_v04_workflow_engine.py` remain byte-identical at the
+amendment baseline, and the landed history of this contract and
+`DECISIONS.md` is preserved as frozen bytes (prefix and suffix
+respectively).
+
+## A.8 Verification that this amendment did not become an escape hatch
+
+Checkable, and checked before landing:
+
+1. Prefix identity: bytes 1–98,556 of this file equal the landed original
+   (`git show 63de8c95…:agentic-os-v0.4-u-w2-workflow-state-engine-contract.md`).
+2. `DECISIONS.md` suffix identity: the working file ends with the exact
+   landed bytes; D-v0.4.1 … D-v0.4.82 byte-identical; new decisions are
+   exactly D-v0.4.83 … D-v0.4.95, contiguous and unique.
+3. Closed enumeration: the U-W2.2 contract §19 lists exactly the nineteen
+   §A.4 paths; its §19.3 edit inventory matches §A.4.3 exactly, including
+   the nine renames, the one guard re-scope, and the one target rebase.
+4. No expansion language: this amendment and the U-W2.2 contract name
+   every authorized path individually, contain no open path category, no
+   related-files or as-needed phrasing, no non-exhaustive enumeration
+   marker, and no standing licence for future bumps; §A.5's one-delivery
+   clause is present.
+5. The delivery is two commits over nineteen paths and nothing else; the
+   repository state at freeze shows exactly the three §A.4.4 documents
+   changed and nothing staged.
+
+## A.9 Rejected alternatives
+
+- **Rewriting the landed contract in place** — frozen contracts are
+  immutable history; amendments supersede, history stays byte-identical
+  (D-v0.4.33, D-v0.4.45, D-v0.4.50 precedent).
+- **A sibling amendment document** (the literal U-P2 form) — a fourth
+  repository path, outside the governed replan session's authorized write
+  set; the append-only addendum preserves the same invariant
+  machine-checkably (§ preamble).
+- **The candidate's self-amendment** (`§19.3` of the audited U-W2.2
+  candidate declaring the paths itself) — a subordinate contract cannot
+  amend its landed parent; this was the audited defect.
+- **Dropping schema v6 from U-W2.2** — it would strand the landed §14
+  persistence architecture without a store, contradict §0.1, and merely
+  move the same amendment to a later wave.
+- **Landing the test edits as a quiet extension** — exactly what §18
+  forbids; the amendment exists so the edits are loud, closed, and
+  finite.
+- **A general mechanical-edit licence for future bumps** — the audited
+  candidate's "has always required and always will" phrasing; rejected
+  because a standing licence is an escape hatch. Each future bump earns
+  its own amendment.
+
+## A.10 Decision index (added by this amendment)
+
+D-v0.4.95 — governed amendment A1: the U-W2.2 slice inventory is the
+closed nineteen-path set of §A.4; §0.3/§18/§19.22's application to the
+eleven mechanical paths and the one-PR delivery identity are superseded as
+enumerated in §A.3.1; D-v0.4.81 is extended, never reworded; no standing
+expansion authority is created.
