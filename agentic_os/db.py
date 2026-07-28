@@ -4,7 +4,7 @@ transaction helper that carries the domain-row + event-row invariant.
 Rules honored here:
 - WAL journal mode set at init.
 - PRAGMA foreign_keys=ON on EVERY connection; busy_timeout >= 3000ms.
-- meta.schema_version = "5" at init; a different version is a hard stop.
+- meta.schema_version = "6" at init; a different version is a hard stop.
   Normal commands NEVER auto-migrate: an older database is refused here and
   the human is pointed at `migrate status/plan/apply` (U-M2 M2.5; U-M3 M3.1).
 """
@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .utils import DB_FILENAME, AosError
 
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 
 #: The v3 memory claim (U-M2 M2.2; U-M3 M3.2). The table name is parameterized
 #: for exactly one reason: the 1→2 and 2→3 migrations build the new table
@@ -406,6 +406,233 @@ AGENT_HANDOFF_TRANSITIONS_DDL = """CREATE TABLE {table}(
   FOREIGN KEY(handoff_id) REFERENCES agent_handoffs(id)
 )"""
 
+#: The v6 derived snapshot PROJECTION (U-W2.2 §5.1, D-v0.4.85). Not the
+#: snapshot: the reducer's `aos.workflow-snapshot/v1` value is rebuilt by
+#: `fold(workflow_events)` plus the two stored bodies on every command, and
+#: `content_sha256` — the snapshot RECORD digest, not a row hash — is the
+#: agreement gate. Seven derived snapshot fields therefore need no column.
+#:
+#: `id` is the integer of the reducer's DERIVED `WF-<n>` identity, never an
+#: allocated sequence, so re-admitting the same artifact lands on the same
+#: primary key and `UNIQUE(work_spec_sha256)` agrees by construction.
+#:
+#: `revision` is the compare-and-swap column and `content_sha256` the record
+#: digest; neither carries a default, like every hashed record in this schema —
+#: a row without them must be impossible to insert.
+#:
+#: The three structural CHECKs mirror the reducer's own `_verify_snapshot`
+#: cross-field rules, so a projection the reducer would refuse cannot be
+#: stored: a pending dispatch pointer only in `validated`, a pending cancel
+#: pointer only post-dispatch, and no runtime task before the queue accepted.
+#:
+#: The table name is parameterized like every other DDL here — and the 5→6
+#: migration creates it DIRECTLY under its real name (no temp-table rename),
+#: so a migrated schema is BYTE-identical to a fresh one (the D-v0.4.22 rule,
+#: applied a third time).
+WORKFLOWS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY CHECK (id >= 1),
+  task_id INTEGER NOT NULL,
+  work_spec_sha256 TEXT NOT NULL UNIQUE,
+  report_sha256 TEXT NOT NULL,
+  snapshot_sha256 TEXT NOT NULL,
+  registry_version INTEGER NOT NULL CHECK (registry_version >= 1),
+  compile_status TEXT NOT NULL
+    CHECK (compile_status IN ('valid','warning','requires_external_authority')),
+  work_spec_document TEXT NOT NULL,
+  report_document TEXT NOT NULL,
+  state TEXT NOT NULL
+    CHECK (state IN ('compiled','validated','awaiting_approval','scheduled',
+                     'running','waiting_input','waiting_approval','paused',
+                     'compensating','succeeded','failed','cancelled',
+                     'compensated')),
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  policy_version INTEGER NOT NULL CHECK (policy_version >= 1),
+  approval_required INTEGER NOT NULL CHECK (approval_required IN (0,1)),
+  dispatch_intent_id TEXT,
+  cancel_intent_id TEXT,
+  runtime_task_uuid TEXT,
+  queue_route TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  CHECK (dispatch_intent_id IS NULL OR state = 'validated'),
+  CHECK (cancel_intent_id IS NULL OR state IN
+         ('scheduled','running','waiting_input','waiting_approval','paused')),
+  CHECK (runtime_task_uuid IS NULL
+      OR state NOT IN ('compiled','validated','awaiting_approval')),
+  FOREIGN KEY(task_id) REFERENCES tasks(id)
+)"""
+
+#: The AUTHORITATIVE append-only workflow history (U-W2.2 §5.2, D-v0.4.86).
+#: Immutable in full: no code path in this slice or any other issues UPDATE or
+#: DELETE against this table (the `agent_handoff_transitions` discipline).
+#:
+#: The record's fields are stored as columns rather than the record stored
+#: twice; `content_sha256` is the EVENT RECORD digest the reducer sealed, and
+#: recomputing it from the reconstituted columns is the proof the
+#: reconstitution is faithful.
+#:
+#: The two biconditional CHECKs close two U-W2 §7 rules storage-side:
+#: `from_state` is null exactly on `workflow_admitted` (the creation
+#: pseudo-edge), and no event may claim a self-edge. The self-edge guard is
+#: written with explicit NULL guards; under SQLite's NULL-CHECK rule they are
+#: redundant, and they are written anyway so the intent is readable rather
+#: than inferred.
+#:
+#: The `event` CHECK makes `history_unknown_event` unreachable through
+#: storage — deliberately: the code stays in the reducer's vocabulary because
+#: `verify_history` is also callable on a caller-supplied list.
+WORKFLOW_EVENTS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  workflow_id INTEGER NOT NULL,
+  seq INTEGER NOT NULL CHECK (seq >= 1),
+  event TEXT NOT NULL
+    CHECK (event IN ('workflow_admitted','workflow_validated',
+                     'approval_requested','approval_recorded',
+                     'dispatch_requested','dispatch_rejected',
+                     'dispatch_revoked','dispatch_accepted','run_started',
+                     'run_waiting_input','run_waiting_approval','run_paused',
+                     'run_resumed','cancel_requested','workflow_succeeded',
+                     'workflow_failed','workflow_cancelled')),
+  from_state TEXT
+    CHECK (from_state IS NULL OR from_state IN
+           ('compiled','validated','awaiting_approval','scheduled','running',
+            'waiting_input','waiting_approval','paused','compensating',
+            'succeeded','failed','cancelled','compensated')),
+  to_state TEXT
+    CHECK (to_state IS NULL OR to_state IN
+           ('compiled','validated','awaiting_approval','scheduled','running',
+            'waiting_input','waiting_approval','paused','compensating',
+            'succeeded','failed','cancelled','compensated')),
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  policy_version INTEGER NOT NULL CHECK (policy_version >= 1),
+  command_id TEXT NOT NULL,
+  command_sha256 TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  UNIQUE(workflow_id, seq),
+  CHECK (from_state IS NULL OR to_state IS NULL OR from_state <> to_state),
+  CHECK ((event = 'workflow_admitted') = (from_state IS NULL)),
+  FOREIGN KEY(workflow_id) REFERENCES workflows(id)
+)"""
+
+#: Accepted-command dedupe and replay (U-W2.2 §5.3, D-v0.4.90). ACCEPTED
+#: commands only: a refused command stores nothing here or anywhere else, and
+#: the NOT NULL `event_seq_*` pair makes a zero-event command row
+#: unrepresentable — the storage-side proof that every accepted command
+#: appends at least one event.
+#:
+#: `CHECK (resulting_revision = expected_revision + 1)` is U-W2 §10's "+1 per
+#: accepted command", closed storage-side for every verb including the
+#: stateless ones. `CHECK ((command='admit_work_spec') = (expected_revision =
+#: 0))` is the creation rule: admission asserts 0, and a non-admit command
+#: carrying 0 can never be accepted because `revision` starts at 1 and only
+#: grows.
+#:
+#: `command_id UNIQUE` carries the dedupe index; no explicit index exists.
+WORKFLOW_COMMANDS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  workflow_id INTEGER NOT NULL,
+  command_id TEXT NOT NULL UNIQUE,
+  command TEXT NOT NULL
+    CHECK (command IN ('admit_work_spec','validate','request_approval',
+                       'record_approval','request_dispatch','revoke_dispatch',
+                       'request_cancel','record_queue_receipt','record_result')),
+  command_sha256 TEXT NOT NULL,
+  expected_revision INTEGER NOT NULL CHECK (expected_revision >= 0),
+  resulting_revision INTEGER NOT NULL CHECK (resulting_revision >= 1),
+  event_seq_first INTEGER NOT NULL CHECK (event_seq_first >= 1),
+  event_seq_last INTEGER NOT NULL CHECK (event_seq_last >= event_seq_first),
+  created_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  CHECK (resulting_revision = expected_revision + 1),
+  CHECK ((command = 'admit_work_spec') = (expected_revision = 0)),
+  FOREIGN KEY(workflow_id) REFERENCES workflows(id)
+)"""
+
+#: The outbox (U-W2.2 §5.4): the record of what AOS asked the queue for.
+#: `workflows.dispatch_intent_id`/`cancel_intent_id` are pending POINTERS;
+#: this table is the record, and every intent ever emitted stays here with its
+#: status. There is no `delivered_at`, no `attempts`, no `next_visible_at` and
+#: no worker column, because every one of those is the private runtime's or
+#: U-W3's — the store claims no transport authority.
+#:
+#: The biconditional CHECK pins that `resolved` means "a receipt closed it";
+#: `revoked` means a revocation withdrew it and no receipt will ever come.
+WORKFLOW_INTENTS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  workflow_id INTEGER NOT NULL,
+  intent_id TEXT NOT NULL UNIQUE,
+  intent_kind TEXT NOT NULL CHECK (intent_kind IN ('dispatch','cancel')),
+  idempotency_key TEXT NOT NULL,
+  queue_route TEXT NOT NULL,
+  document TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('outstanding','resolved','revoked')),
+  resolved_receipt_id TEXT,
+  created_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  CHECK ((status = 'resolved') = (resolved_receipt_id IS NOT NULL)),
+  FOREIGN KEY(workflow_id) REFERENCES workflows(id)
+)"""
+
+#: The inbox (U-W2.2 §5.5): the verbatim record of what the runtime reported,
+#: so even a runtime that misreports is auditable. INSERT-ONCE — a stored
+#: receipt IS an applied receipt, because a refused receipt stores nothing;
+#: that is what makes the receipt dedupe axis sound.
+#:
+#: The four CHECKs mirror `workflow_engine._RECEIPT_INTENT_REQUIRED`,
+#: `_RECEIPT_INTENT_ALLOWED`, `_RECEIPT_UUID_REQUIRED` and
+#: `_RECEIPT_UUID_FORBIDDEN` exactly, so the storage boundary and the
+#: reducer's closed vocabulary cannot disagree (the MEMORY_STATUSES
+#: domain-plus-storage rule).
+WORKFLOW_RECEIPTS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  workflow_id INTEGER NOT NULL,
+  receipt_id TEXT NOT NULL UNIQUE,
+  receipt_kind TEXT NOT NULL
+    CHECK (receipt_kind IN ('accepted','rejected','started','waiting_input',
+                            'waiting_approval','paused','resumed','cancelled',
+                            'failed')),
+  intent_id TEXT,
+  runtime_task_uuid TEXT,
+  document TEXT NOT NULL,
+  receipt_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  CHECK (intent_id IS NOT NULL
+      OR receipt_kind NOT IN ('accepted','rejected')),
+  CHECK (intent_id IS NULL
+      OR receipt_kind IN ('accepted','rejected','cancelled')),
+  CHECK (runtime_task_uuid IS NOT NULL
+      OR receipt_kind NOT IN ('accepted','started','waiting_input',
+                              'waiting_approval','paused','resumed')),
+  CHECK (runtime_task_uuid IS NULL OR receipt_kind <> 'rejected'),
+  FOREIGN KEY(workflow_id) REFERENCES workflows(id)
+)"""
+
+#: The verbatim external facts a success or approval claim rests on (U-W2.2
+#: §5.6). The EVENT is the authoritative fact that it happened; this table
+#: holds the body the event records only by digest. Identity is
+#: `(workflow_id, fact_kind, document_sha256)` with the digest RECOMPUTED from
+#: the stored bytes, so an exact duplicate is a no-op insert while the command
+#: that carried it still appends its event and consumes its revision.
+WORKFLOW_FACTS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  workflow_id INTEGER NOT NULL,
+  fact_kind TEXT NOT NULL CHECK (fact_kind IN ('approval','result')),
+  fact_scope TEXT
+    CHECK (fact_scope IS NULL OR fact_scope IN ('admission','runtime')),
+  document TEXT NOT NULL,
+  document_sha256 TEXT NOT NULL,
+  recorded_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  UNIQUE(workflow_id, fact_kind, document_sha256),
+  CHECK ((fact_kind = 'approval') = (fact_scope IS NOT NULL)),
+  FOREIGN KEY(workflow_id) REFERENCES workflows(id)
+)"""
+
 MEMORY_TABLE = "memory"
 MEMORY_EVIDENCE_TABLE = "memory_evidence"
 MEMORY_SOURCES_TABLE = "memory_sources"
@@ -417,6 +644,12 @@ ROUTING_PLANS_TABLE = "routing_plans"
 ROUTING_PLAN_CANDIDATES_TABLE = "routing_plan_candidates"
 AGENT_HANDOFFS_TABLE = "agent_handoffs"
 AGENT_HANDOFF_TRANSITIONS_TABLE = "agent_handoff_transitions"
+WORKFLOWS_TABLE = "workflows"
+WORKFLOW_EVENTS_TABLE = "workflow_events"
+WORKFLOW_COMMANDS_TABLE = "workflow_commands"
+WORKFLOW_INTENTS_TABLE = "workflow_intents"
+WORKFLOW_RECEIPTS_TABLE = "workflow_receipts"
+WORKFLOW_FACTS_TABLE = "workflow_facts"
 
 #: The three tables U-M3 adds, paired with their DDL. The 2→3 migration
 #: iterates this rather than repeating the CREATEs, so a fresh v3 schema and a
@@ -437,6 +670,21 @@ ROUTING_HANDOFF_TABLES: tuple[tuple[str, str], ...] = (
     (ROUTING_PLAN_CANDIDATES_TABLE, ROUTING_PLAN_CANDIDATES_DDL),
     (AGENT_HANDOFFS_TABLE, AGENT_HANDOFFS_DDL),
     (AGENT_HANDOFF_TRANSITIONS_TABLE, AGENT_HANDOFF_TRANSITIONS_DDL),
+)
+
+#: The six tables U-W2.2 adds, paired with their DDL, in FK-parent-first order:
+#: workflows → events → commands → intents → receipts → facts. This is the ONLY
+#: enumeration — `SCHEMA_SQL` composition, the 5→6 migration step, and the three
+#: historical fixtures all iterate it, so a seventh table cannot be added in one
+#: place and forgotten in the others (the MEMORY_GRAPH_TABLES /
+#: ROUTING_HANDOFF_TABLES rule, applied a third time; D-v0.4.84).
+WORKFLOW_TABLES: tuple[tuple[str, str], ...] = (
+    (WORKFLOWS_TABLE, WORKFLOWS_DDL),
+    (WORKFLOW_EVENTS_TABLE, WORKFLOW_EVENTS_DDL),
+    (WORKFLOW_COMMANDS_TABLE, WORKFLOW_COMMANDS_DDL),
+    (WORKFLOW_INTENTS_TABLE, WORKFLOW_INTENTS_DDL),
+    (WORKFLOW_RECEIPTS_TABLE, WORKFLOW_RECEIPTS_DDL),
+    (WORKFLOW_FACTS_TABLE, WORKFLOW_FACTS_DDL),
 )
 
 _SCHEMA_HEAD = """
@@ -553,11 +801,13 @@ CREATE TABLE IF NOT EXISTS packs(
 );
 """
 
-#: The canonical v5 schema. Composed rather than typed as one literal so the
+#: The canonical v6 schema. Composed rather than typed as one literal so the
 #: memory tables have exactly ONE definition in the codebase, shared with the
 #: 1→2 (M2.3) and 2→3 (M3.11) migrations; the agent tables have exactly one,
 #: shared with the 3→4 migration (U-A1); and the four routing/handoff tables
-#: have exactly one, shared with the 4→5 migration (U-A3, D-v0.4.22).
+#: have exactly one, shared with the 4→5 migration (U-A3, D-v0.4.22); and the
+#: six workflow tables have exactly one, shared with the 5→6 migration and the
+#: three historical fixtures (U-W2.2, D-v0.4.84).
 SCHEMA_SQL = (
     _SCHEMA_HEAD
     + MEMORY_CLAIM_DDL.format(table=MEMORY_TABLE)
@@ -576,6 +826,11 @@ SCHEMA_SQL = (
     + ";\n\n"
     + ";\n\n".join(
         ddl.format(table=table) for table, ddl in ROUTING_HANDOFF_TABLES
+    )
+    + ";\n"
+    + "\n"
+    + ";\n\n".join(
+        ddl.format(table=table) for table, ddl in WORKFLOW_TABLES
     )
     + ";\n"
 )

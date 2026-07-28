@@ -8,6 +8,15 @@ Render: prefix + zero-padded integer, minimum width 4, growing naturally
 past 9999. Parse: strict — correct prefix for the command (case-insensitive),
 ASCII digits only, value between 1 and MAX_ID; anything else is a domain
 error (exit code 1) refused before any DB lookup.
+
+Workflows (U-W2.2) are the one entity whose identity is NOT rendered here.
+`workflow_engine._workflow_identity` DERIVES `WF-<n>` from the admitted
+WorkSpec digest with no zero padding, and that unpadded string is sealed into
+every workflow event digest — so `render_id("workflow", 7)` would produce
+`WF-0007` where the engine minted `WF-7` and break them. `workflow_store`
+renders `"WF-" + str(id)` itself. The `workflow` prefix is registered below
+so `parse_id` accepts a human-typed identity at the U-W2.3 CLI, and for no
+other reason; `parse_id` already accepts padded and unpadded digits alike.
 """
 
 from __future__ import annotations
@@ -35,6 +44,11 @@ PREFIXES = {
     # legacy free-text handoff keeps its distinct single-letter H.
     "routing_plan": "RP",
     "agent_handoff": "AH",
+    # U-W2.2 workflow instances. Two letters, following the U-M3/U-A3
+    # precedent; WF collides with nothing (W is unused). Registered for
+    # `parse_id` only — see the module docstring on why `render_id` is never
+    # used for a workflow.
+    "workflow": "WF",
 }
 
 #: Upper bound for parsed ids (D-v0.2.2): SQLite INTEGER is a signed 64-bit

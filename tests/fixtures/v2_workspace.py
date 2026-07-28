@@ -171,6 +171,12 @@ def _install_v2_memory_schema(db_path: Path) -> None:
                     "v2 fixture: agents must be empty when the v2 schema is "
                     f"installed (found {agent_rows} rows)"
                 )
+            # U-W2.2: a "v2" workspace carrying the six workflow tables would
+            # not be one, and the 5→6 step would fail on its CREATE when this
+            # fixture was migrated forward. Newest layer first, dropped
+            # children-first via the iterated db.WORKFLOW_TABLES.
+            for table, _ddl in reversed(db.WORKFLOW_TABLES):
+                conn.execute(f"DROP TABLE {table}")
             # U-A3: a "v2" workspace with the four routing/handoff tables would
             # not be one, and the 4→5 step would fail on its CREATE when this
             # fixture was migrated forward. Dropped children-first via the
