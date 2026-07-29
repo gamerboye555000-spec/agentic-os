@@ -551,8 +551,53 @@ ROUTING_HANDOFFS_V5 = Migration(
     apply=_routing_handoffs_v5,
 )
 
-#: The canonical production registry: exactly four steps, 1 → 2 → 3 → 4 → 5, in
-#: order. Never populated by importing arbitrary files or by evaluating names
+# ---------------------------------------------------------------------------
+# Production migration 5 → 6: deterministic workflow store (U-W2.2)
+
+def _workflow_state_v6(conn: sqlite3.Connection) -> None:
+    """Create the six U-W2.2 tables EMPTY. Purely additive.
+
+    No existing table is read, rebuilt, renamed or re-stamped; no row is
+    carried, parsed or invented; NO CLOCK IS READ, because no row is stamped.
+    There are no legacy workflow facts anywhere in the ledger — `workflow_store`
+    did not exist and no table modelled a workflow — so the step has nothing to
+    derive from and derives nothing. A pre-existing task or run gets no
+    workflow, no admission event and no synthetic snapshot: a workflow exists
+    only because a human ran `admit_work_spec` against a real WorkSpec artifact
+    after this migration.
+
+    Built from the same db.py constants a fresh v6 init uses (the D-v0.3.42
+    shared-DDL rule, applied a fifth time), created in FK-parent-first order
+    (workflows → events → commands → intents → receipts → facts) under their
+    real names — so there is no ALTER TABLE RENAME quoting artifact and a
+    migrated schema is BYTE-identical to a fresh one for these six tables.
+
+    This step does NOT freeze any historical DDL: U-W2.2 changes none of the
+    constants a shipped step builds from (`db.MEMORY_CLAIM_DDL`,
+    `db.MEMORY_GRAPH_TABLES`, `db.AGENTS_DDL`, `db.AGENT_PASSPORTS_DDL`,
+    `db.ROUTING_HANDOFF_TABLES`, `passports.agent_identity_payload`), so
+    D-v0.4.29's transfer clause does not fire. A future unit that edits
+    `db.WORKFLOW_TABLES` inherits the obligation to freeze a `_V6_WORKFLOW_*`
+    copy here, exactly as `_V2_MEMORY_CLAIM_DDL` did.
+
+    Runs inside U-M1's already-open transaction: no COMMIT, no ROLLBACK, no
+    touching meta.schema_version — all three belong to apply_migrations. Six
+    empty tables contribute zero foreign-key violations to the per-step
+    whole-database foreign_key_check.
+    """
+    for table, ddl in db.WORKFLOW_TABLES:
+        conn.execute(ddl.format(table=table))
+
+
+WORKFLOW_STATE_V6 = Migration(
+    from_version=5,
+    to_version=6,
+    migration_id="u-w2-workflow-state-v6",
+    apply=_workflow_state_v6,
+)
+
+#: The canonical production registry: exactly five steps, 1 → 2 → 3 → 4 → 5 → 6,
+#: in order. Never populated by importing arbitrary files or by evaluating names
 #: read from the database — a literal tuple in source is the whole discovery
 #: mechanism.
 MIGRATIONS: tuple[Migration, ...] = (
@@ -560,6 +605,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     MEMORY_GRAPH_V3,
     AGENT_PASSPORTS_V4,
     ROUTING_HANDOFFS_V5,
+    WORKFLOW_STATE_V6,
 )
 
 

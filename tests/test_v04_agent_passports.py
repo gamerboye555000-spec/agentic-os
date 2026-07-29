@@ -202,10 +202,10 @@ class V4WorkspaceTestCase(unittest.TestCase):
 # (1) Schema and registry shape
 
 class SchemaTests(V4WorkspaceTestCase):
-    def test_fresh_init_is_version_five_with_both_agent_tables(self):
+    def test_fresh_init_is_version_six_with_both_agent_tables(self):
         self.assertEqual(
             self.query("SELECT value FROM meta WHERE key='schema_version'")[0][0],
-            "5",
+            "6",
         )
         names = {
             r[0]
@@ -216,7 +216,7 @@ class SchemaTests(V4WorkspaceTestCase):
         self.assertIn("agents", names)
         self.assertIn("agent_passports", names)
 
-    def test_registry_is_exactly_the_four_steps_in_order(self):
+    def test_registry_is_exactly_the_five_steps_in_order(self):
         self.assertEqual(
             [
                 (m.from_version, m.to_version, m.migration_id)
@@ -227,6 +227,7 @@ class SchemaTests(V4WorkspaceTestCase):
                 (2, 3, "u-m3-memory-graph-v3"),
                 (3, 4, "u-a1-agent-passports-v4"),
                 (4, 5, "u-a3-routing-handoffs-v5"),
+                (5, 6, "u-w2-workflow-state-v6"),
             ],
         )
 
@@ -254,12 +255,17 @@ def _normalize_table_sql(sql: str) -> str:
 class MigrationTests(V3FixtureTestCase):
     def test_status_shows_the_pending_steps(self):
         # A v3 fixture had exactly one pending step at U-A1; U-A3 appended the
-        # 4→5 step, so a to-current plan from v3 now lists both.
+        # 4→5 step and U-W2.2 the 5→6 step, so a to-current plan from v3 now
+        # lists all three.
         report = migrations.status(self.db_path)
         self.assertEqual(report["current_version"], 3)
         self.assertEqual(
             [s["migration_id"] for s in report["plan"]],
-            ["u-a1-agent-passports-v4", "u-a3-routing-handoffs-v5"],
+            [
+                "u-a1-agent-passports-v4",
+                "u-a3-routing-handoffs-v5",
+                "u-w2-workflow-state-v6",
+            ],
         )
 
     def test_migration_preserves_everything_and_governs_nothing(self):
@@ -429,15 +435,16 @@ class MigrationTests(V3FixtureTestCase):
         self.assertTrue(caught.exception.snapshot.is_file())
 
         # Corrected retry applies every remaining step exactly once — the
-        # rolled-back 3→4 is not double-applied. To-current now spans two steps
-        # (3→4 then the additive 4→5), so exactly two migrate events exist.
+        # rolled-back 3→4 is not double-applied. To-current now spans three
+        # steps (3→4, then the additive 4→5 and 5→6), so exactly three
+        # migrate events exist.
         self.migrate()
         self.assertEqual(
             self.query(
                 "SELECT COUNT(*) FROM events WHERE entity='system' "
                 "AND action='migrate'"
             )[0][0],
-            2,
+            3,
         )
 
     def test_damaged_legacy_row_refuses_safely_and_rolls_back(self):
