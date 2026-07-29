@@ -1,3 +1,304 @@
+# DECISIONS — Agentic OS v0.4 U-W2.3 workflow CLI, power policy, and docs (Wave 0)
+
+This section continues the `D-v0.4.*` series for the U-W2.3 Wave 0 architecture
+freeze and the governed U-W2 contract amendment it required: one `aos workflow`
+command group over the landed reducer and store, thirteen power-policy entries,
+one observability row for a refused command, and one README section. Architecture
+only — no production code, tests, CLI handlers, power entries, or README prose
+ship in this commit. Branch `v0.4-u-w2-3-workflow-cli`, worktree
+`/home/daksh/Projects/agentic-os-u-w2-3`, baseline
+`de10deaf181b99a05415370d65149b83685af979` (= HEAD = `origin/main` = the
+merge-base = `milestone/v0.4-u-w2-2-workflow-store^{}`). Prepended per the
+established precedent (D-W0.4, reaffirmed in D-v0.2.7, D-v0.4.4); everything
+below stays byte-identical, including D-v0.4.1 … D-v0.4.96, which D-v0.4.97
+supersedes only where it quotes them and never rewords.
+
+## D-v0.4 decisions (U-W2.3 Wave 0)
+
+- **D-v0.4.97 — governed amendment A3 to the landed U-W2 contract: the U-W2.3
+  slice inventory is the closed EIGHT-path set; six clauses are superseded and
+  four silences are closed; the delivery is two ordered commits; no standing
+  authority of any kind is created.**
+
+  **The contradiction.** Five landed statements are jointly unsatisfiable, and
+  the impossibility lives in the contract rather than in any candidate. (1) U-W2
+  §16 freezes thirteen `aos workflow` leaves and their power classes — nine
+  `authoritative_write, ledger`, three `read_only`, one `derived_write` — and A1
+  §A.2 preserved §16 unchanged. Ten of the thirteen therefore carry a class
+  outside `power.RECOVERY_ALLOWED_KINDS`, which is
+  `frozenset({READ_ONLY, RECOVERY_SAFE})`. (2)
+  `tests/test_v02_power_modes.py::RecoveryTests.BLOCKED` is a HAND-KEPT tuple of
+  51 `(command_path, argv)` pairs, and
+  `test_every_blockable_command_is_covered_by_the_block_list` asserts BOTH
+  directions of coverage against the LIVE parser, so the thirteen leaves
+  mechanically force exactly ten new rows in an existing test file. Measured with
+  the leaves and their policy entries present in memory only:
+  `should_block - covered` is exactly the nine writers plus `export-intents`, and
+  `covered - should_block` is empty — ten rows forced, nothing to remove, and
+  every other leaf-set-dependent predicate in the tree still passing
+  (`len(leaves) > 40` → 108, bidirectional classification coverage, the
+  ledger-flag rule, and every prefix-scoped count). (3) §0.3 declares every
+  existing test and fixture untouched; A1 §A.3.1 item 3 superseded that clause for
+  exactly eleven files and exactly their edit classes, and A1 §A.5 states the
+  licence is not standing, naming this unit: "A future mechanical necessity —
+  including the same class of version-pin edit **in U-W2.3** or any later unit —
+  requires its own governed amendment through this same mechanism."
+  `tests/test_v02_power_modes.py` is one of A1's eleven, but only for the
+  schema-version literal and only for that one delivery. (4) §19 row 22 as
+  rewritten by A1 §A.3.1 item 4 requires every existing test file outside A1's
+  eleven to be byte-unchanged. (5) §18's U-W2.3 table names four implementation
+  paths and §18's closing rule makes a fifth `FAIL — REPLAN REQUIRED`. Items 3–5
+  forbid exactly the edit item 1 forces. This is A1 §A.1's pattern one wave later,
+  and the lawful resolution is the same mechanism.
+
+  Two further defects are folded into the same amendment rather than
+  reinterpreted silently. §16's closing sentence — "`expected_revision` is read
+  from the live row by the CLI shell immediately before deciding, **inside the
+  same transaction as the CAS**" — is unimplementable: `workflow_store.submit`
+  owns the ONLY transaction (`with db.transaction(conn):` then
+  `conn.execute("BEGIN IMMEDIATE")` as its first statement, pinned by U-W2.2 §20
+  row S12), `db.transaction` is the sqlite3 connection context manager, and a
+  caller-opened transaction around `submit` makes that statement raise
+  `cannot start a transaction within a transaction`, which `submit` maps to
+  `store_unavailable`; `expected_revision` is moreover sealed under the envelope
+  digest, so it must be chosen BEFORE `submit`. By U-W2's own closing rule that
+  sentence is a defect. And U-W2.3 had no authorised path for its own Wave-0
+  documents at all: A1 §A.6 defers U-W2.3's branch, PR title, tag and commit
+  identity to "its own Wave 0 against this amended contract — not silently, and
+  not here", and explicitly discharges the §18 two-Wave-0-documents clause, while
+  A1 §A.5 authorises no documentation file beyond A1's own named paths.
+
+  **The supersession set**, exactly and no others. S1 — §0.3's "every existing
+  test, and every existing fixture", superseded for EXACTLY ONE further file,
+  `tests/test_v02_power_modes.py`, and EXACTLY ONE edit class: one contiguous
+  insertion of ten `RecoveryTests.BLOCKED` rows plus their comment header, at a
+  named position, and nothing else in that file; for every other existing test
+  and fixture §0.3 stands verbatim. S2 — §19 row 22's byte-unchanged clause, as
+  already rewritten by A1, extended to name that one further file, with no test
+  deleted, skipped, renamed or weakened and no assertion's meaning rebased. S3 —
+  §18 slice U-W2.3's "Paths:" list, superseded by the closed eight-path
+  inventory; the four implementation paths remain unchanged in content and
+  responsibility, and the trailing two-Wave-0-documents clause stays discharged.
+  S4 — §18's closing rule, superseded ONLY in what "the tables above" denotes
+  (the §18 tables as amended by A1 §A.4 and by A3); the rule itself is preserved
+  verbatim and keeps firing. S5 — D-v0.4.81's "the exact file table in §18 is
+  exhaustive", re-read as "…, as amended by A1 §A.4 and A3, is exhaustive"; the
+  landed D-v0.4.81, D-v0.4.95 and D-v0.4.96 entries stay byte-identical history
+  and this decision extends them without rewording. S6 — §16's transaction claim,
+  superseded by the only implementable shape: the CLI reads the live revision
+  with `workflow_store.read_workflow` IMMEDIATELY BEFORE `workflow_store.submit`,
+  and the compare-and-swap runs inside `submit`'s single `BEGIN IMMEDIATE`
+  transaction; a writer that advances the revision in between makes the command
+  refuse `revision_mismatch` and write nothing. The clause's intent — the CLI is
+  a convenience wrapper and the engine still enforces the guard — is preserved
+  exactly; only the impossible transaction claim is withdrawn, and nothing else
+  in §16 is touched. S7 — U-W2.3's delivery identity, which is a RESOLUTION
+  exercising the authority A1 §A.6 granted rather than the supersession of a
+  clause still in force; §18's own commit subject for this slice was never
+  superseded (A1 §A.3.1 item 6 superseded U-W2.2's subject only) and is adopted
+  verbatim.
+
+  **Four silences closed**, because an unlicensed behavior is a defect by U-W2's
+  own closing sentence: the refusal-journal row's `entity`, `entity_id`, `action`
+  and payload members (C-A); the CLI's command-envelope assembly discipline,
+  since U-W2.1 shipped no public record-builder (C-B); the accepted workflow-ID
+  form family and its canonical rendering at the CLI edge (C-C); and
+  `export-intents`' filename scheme, idempotence rule and unreadable-row
+  behaviour (C-D). Their frozen content is the subordinate U-W2.3 contract.
+
+  **The closed inventory**: `DECISIONS.md`,
+  `agentic-os-v0.4-u-w2-workflow-state-engine-contract.md` and
+  `agentic-os-v0.4-u-w2-3-workflow-cli-contract.md` in commit 1; `agentic_os/cli.py`,
+  `agentic_os/power.py`, `README.md`, `tests/test_v04_workflow_cli.py` and
+  `tests/test_v02_power_modes.py` in commit 2. Eight paths, two commits, and a
+  ninth path is `FAIL — REPLAN REQUIRED`.
+
+  **Rejected**: extending §18's README scope to also rebase the file's stale
+  global schema-version paragraph (it predates U-W2, §18 scopes the edit to one
+  new section word for word, and an amendment that reaches beyond its forcing
+  cause is the escape hatch A1 §A.9 already rejected); a general mechanical-edit
+  licence for future CLI additions (a standing licence is an escape hatch — each
+  future necessity earns its own amendment); deriving `RecoveryTests.BLOCKED`
+  from the parser instead of adding ten rows (it would rewrite an existing
+  assertion's meaning and make the guard vacuous, since the row exists to be an
+  independent hand-kept cross-check of the parser-derived predicate); folding the
+  per-command detail into A3 and shipping seven paths (per-path detail belongs in
+  a subordinate contract, the A1 §A.4 precedent); reinterpreting §16's
+  transaction sentence charitably in the implementation (that is the
+  self-amendment A1 §A.1 found unlawful); adding a store or engine function so
+  the CLI could read the revision inside the transaction (U-W2.2 §8 makes that a
+  replan trigger and the reducer is byte-frozen); rewriting the landed contract
+  or this file in place; a sibling amendment document (a ninth path); and
+  deferring the matter to a later unit (U-W2.3 cannot land at all under the
+  contradiction).
+
+  A3 adds no state, command, event, receipt kind, intent kind, refusal reason,
+  matrix edge, policy version, table, column, CHECK, index, migration, store or
+  engine API function, transaction step, record schema, or registry identity, and
+  removes none. A1's nineteen-path U-W2.2 inventory, §A.5's no-expansion rule, A2
+  and B1 are unchanged. No standing authority of any kind is created.
+
+- **D-v0.4.98 — the U-W2.3 CLI surface: thirteen leaves under one `aos workflow`
+  group, mapped onto SIX landed public store functions; `workflow_store.rebuild`
+  is deliberately never called; the CLI assembles the command envelope itself;
+  the workflow identity is normalised exactly once at the CLI edge.**
+
+  The group registers two levels — `workflow` then the verb — so
+  `power._PATH_DESTS` resolves the classification key to exactly
+  `("workflow", <verb>)`. The thirteen leaves, their arguments, and their entire
+  option surface are U-W2 §16's, unchanged: `--route` on `dispatch`, `--json` on
+  `show` and `list`, `--state` on `list`, and nothing else. `--state`'s choices
+  are `workflow_engine.WORKFLOW_STATES` read through the module, the live
+  `_retrieval_candidate_choices` idiom, so a state cannot exist that `--state`
+  refuses and vice versa.
+
+  Six store functions carry all thirteen leaves: `submit`, `read_workflow`,
+  `read_history`, `list_workflows`, `list_outstanding_intents` and `verify`. The
+  seventh, `rebuild`, is **deliberately never called**, and that is a security
+  boundary rather than a preference: `RebuildResult.snapshot` embeds
+  `work_spec_document` and `report_document` VERBATIM, so calling it would put
+  untrusted stored bodies on a surface `show` prints.
+  `StoreOutcome.snapshot` is read for its `state` member only and is never
+  emitted. No store function is added, so U-W2.2 §8's replan trigger does not
+  fire.
+
+  U-W2.1 shipped no public record-builder — the engine's only public functions
+  are `decide`, `fold` and `verify_history` — so the CLI assembles the
+  `aos.workflow-command/v1` record itself from public constants plus
+  `protocols.content_digest`. This is licensed: §6 defines the envelope,
+  `COMMAND_SOURCES` contains `"cli"` precisely so the CLI can be its source, and
+  §16 calls the CLI a convenience wrapper. The assembly is frozen: `schema` from
+  the constant and never a literal; `command_id` a fresh `uuid.uuid4()` per
+  invocation, so re-running a verb is a NEW command and not a forced replay;
+  `actor` the constant `"human"`; `source` the constant `"cli"` and never
+  `"runtime_adapter"`, so the ledger's account of who submitted a command stays
+  truthful even when the payload came from the runtime; `created_at` from
+  `utils.utc_now_iso()`; `trace` OMITTED, because the CLI mints no trace it did
+  not receive; `workflow_id` present except on `admit`; and `content_sha256`
+  recomputed over the body, never copied.
+
+  The workflow identity is normalised ONCE, at the CLI edge, to A2 §A2.2's
+  canonical `"WF-" + str(ids.parse_id(text, "workflow"))`. That is mandatory, not
+  cosmetic: the store's READERS accept every spelling `ids.parse_id` accepts,
+  while `submit`'s envelope gate is the strict `^WF-[0-9]{1,19}$`, so an
+  un-normalised zero-padded or lower-cased argument would succeed on `show` and
+  refuse `command_malformed` on every write verb — the same identity behaving
+  differently on two leaves of one group. `ids.render_id` is NEVER used for a
+  workflow: it zero-pads to width 4 and would produce `WF-0007` where the engine
+  minted `WF-7`, breaking every event digest.
+
+- **D-v0.4.99 — the refusal journal: `action = "workflow_command_refused"`,
+  deliberately outside the seventeen workflow events; emitted on `refused` and
+  `conflict` only, in its own transaction, and never for a `WorkflowStoreError`.**
+
+  U-W2 §8 assigns the row to the CLI shell and U-W2.2 §9.4 places it outside the
+  transaction that declined the work, stating that until U-W2.3 ships "a refusal
+  leaves no trace in `aos.db` at all". No document froze its shape. Frozen here:
+  `actor="human"`, `entity="workflow"`, `entity_id` the INTEGER `workflows.id`
+  (matching the store's own `_journal`) or `None` when no identity exists,
+  `action="workflow_command_refused"`, and a payload of exactly
+  `{workflow_id, command, command_id, command_sha256, status, reason, where,
+  expected_revision, revision, diagnostics}`.
+
+  `action` is deliberately OUTSIDE `workflow_engine.WORKFLOW_EVENTS`: U-W2 §8
+  says the workflow history records accepted transitions only, and a journal row
+  whose `action` were one of the seventeen event names could be mistaken for a
+  transition that never happened. The row is emitted on `refused` and `conflict`
+  ONLY — never on `accepted`, because the store already journals one row per
+  appended event, and never on `replay`, because nothing was declined. A
+  `WorkflowStoreError` out of `submit` is NOT journaled: it is an infrastructure
+  fact about the ledger, not a fact about a workflow, and a workflow-scoped row
+  for it would state something untrue. The write takes its own
+  `db.transaction`, outside the one that declined the work, so a journalled
+  refusal can never be rolled back with the work it declined. Every payload
+  member is a closed code, a validated identifier, a digest, a bounded integer,
+  or the store's own bounded `diagnostics`; there is no free-text member at all,
+  so `events.emit`'s `secretscan.redact_tree` choke point is a second line of
+  defence rather than the only one.
+
+- **D-v0.4.100 — output and integrity scope: `show` and `list` state the
+  read-verdict caveat; `--json` exists on `show` and `list` only; `verify` exits
+  0 iff every report is `ok`; no stored body is ever printed.**
+
+  B1 §B1.14 names an explicit U-W2.3 obligation: the readers' verdict "is the
+  snapshot-and-history one … what is lost is prompt DETECTION, until someone runs
+  `workflow verify` … and U-W2.3's CLI is expected to say so where it displays a
+  read verdict." One fixed sentence, held in a single module constant, is emitted
+  by `show` and by `list` in human mode and carried as `integrity_scope` in both
+  `--json` documents — including when the list is empty, because the caveat is
+  about the verdict's scope and not about the rows.
+
+  §16 grants `--json` to `show` and `list` and to nothing else, so `verify` and
+  `export-intents` have none. `verify` exits 0 iff every `VerifyReport.integrity`
+  is `ok` and 1 otherwise, with the problem lines on stderr — the live
+  `agent route verify` precedent — so it is usable as a gate. `show` exits 0
+  whenever the row exists, INCLUDING when integrity is not `ok`, because U-W2.2
+  §15.3 keeps read paths total and `verify` carries the verdict.
+
+  Nothing the CLI prints can carry a stored document body, a receipt
+  `reason.message`, an `approval_ref`, or an evidence `ref`/`claim`: `show`
+  renders only `WorkflowRecord` fields and reconstituted `aos.workflow-event/v1`
+  records, whose payloads U-W2 §7 closes to enum members, validated identifiers,
+  bounded integers and digests. A refusal is exactly one line on stderr,
+  BYTE-EQUAL to `str(StoreOutcome.refusal)`, with nothing on stdout and no
+  CLI-authored prefix or suffix — the store already builds the house-format
+  bounded, value-free line. Because no stored free text is printed, no terminal
+  control byte from an untrusted document can reach a terminal.
+
+- **D-v0.4.101 — `export-intents` is `derived_write`, content-addressed and
+  idempotent, and reports an unreadable outbox row rather than dropping it.**
+
+  §16 says "idempotent, content-addressed filenames" and no document said what
+  the name is, what happens when it already exists, or what happens to an
+  unreadable row. Frozen: DIR must ALREADY exist and be a directory — the CLI
+  creates neither it nor its parents, because writing records into a directory
+  presupposes the directory. The filename is
+  `f"{intent_kind}-{content_digest(document)}.json"`, matching
+  `^(dispatch|cancel)-[0-9a-f]{64}\.json$` BY CONSTRUCTION, so no byte of any
+  stored document can influence it and traversal, absolute paths, NUL bytes and
+  `..` segments are structurally unrepresentable. The address is computed by the
+  CLI from the bytes it is about to write, never read from the stored
+  `content_sha256` column, so a tampered column cannot redirect a write.
+  Creation is `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW`; on `FileExistsError` the
+  existing file is opened `O_RDONLY|O_NOFOLLOW`, `fstat`ed for regular-file and
+  exact size, read and byte-compared — identical reports `unchanged`, and
+  anything else refuses naming only the safe basename. A content-addressed name
+  whose bytes differ is a foreign or tampered file and is never overwritten or
+  truncated.
+
+  An unreadable outbox row (`IntentView.readable is False`) is reported on stderr
+  and forces exit 1 after the readable rows are written, never silently dropped;
+  re-running after repair completes the job, because the write is idempotent.
+  `export-intents` is `derived_write` and therefore blocked in recovery: it
+  writes no ledger row and emits no event, but it does write files that hand work
+  to the runtime, and a damaged workspace must not dispatch.
+
+- **D-v0.4.102 — the README edit is exactly one new unit section; the file's
+  pre-existing stale global schema-version paragraph is a declared limitation,
+  not U-W2.3's to repair.**
+
+  U-W2 §18 scopes `README.md` to "one new unit section", word for word. The new
+  section sits after the U-W1 section and before `## Weekend commands`, covers
+  all thirteen commands in three frozen bash blocks, states that the wave-1
+  transport is explicit file exchange with no network and no queue, carries the
+  B1 §B1.14 integrity-scope caveat and the U-W2.R / U-W3 / U-W4 / U-W5 / U-W6
+  boundaries and the no-shared-database rule, declares the five known limitations
+  (post-dispatch cancellation is dormant; revocation before observed acceptance
+  is advisory; a WorkSpec may declare zero required evidence; cancel intents can
+  remain outstanding forever; three receipt kinds have no live source), and
+  points at the two frozen contract files.
+
+  The file's existing global schema-version paragraph is NOT edited. It was
+  introduced at `d06df1b` (U-A1) and was already false after U-A3 shipped schema
+  5, before U-W2 existed, so it is neither U-W2's creation nor U-W2.3's
+  responsibility; extending A3 to reach it would be exactly the escape hatch A1
+  §A.9 rejected, and U-W2.2 §22's description of the live bytes is itself
+  inaccurate, which makes it a weak basis for authority over them. The new
+  section makes no global current-version claim, so U-W2.3 introduces no
+  contradiction; the pre-existing one is carried as a declared known limitation
+  and named as work for a future documentation unit. Editing any other region of
+  `README.md` is a stop condition, not a judgment call.
+
 # DECISIONS — Agentic OS v0.4 U-W2.2 governed identity-binding amendment
 
 This section continues the `D-v0.4.*` series for the governed amendment the

@@ -2545,3 +2545,582 @@ contract silences are closed; commit `91075d7…` is preserved and the
 delivery becomes three ordered commits; the closed nineteen-path inventory
 and §A.5's no-expansion rule are unchanged; no standing authority is
 created.
+
+# Agentic OS v0.4 — U-W2 governed contract amendment A3 (U-W2.3 CLI path closure)
+
+Appended, not merged. Every byte above this line — the landed U-W2 contract and
+governed amendments A1 and A2 — is preserved verbatim as this file's exact
+prefix, exactly as A2 preserved A1 and A1 preserved the landed body. A3
+supersedes only the clauses it quotes, and only for the U-W2.3 delivery.
+
+Baseline this amendment is written against:
+
+```text
+base                 de10deaf181b99a05415370d65149b83685af979
+                     (= HEAD = origin/main = the merge-base
+                      = milestone/v0.4-u-w2-2-workflow-store^{})
+this file (prefix)   530ece7f37c5777897c0f0021efc83dde83a19954dfd1f96e7d8a7bab8820354
+                     147,457 bytes, preserved as bytes 1–147,457
+DECISIONS.md         ea0fcb2ded26e604065bd6a5272cf9312cf1c13000b73bfe62ac36ea49797f58
+                     336,809 bytes, preserved as the file's exact SUFFIX
+U-W2.2 contract      26204a6b11baa9facf4283a94e15ac537479f34750c64c53a9a1d1cb38386935
+                     unchanged by this delivery; not a U-W2.3 path
+```
+
+The commits that carry A1 and A2 (`91075d7cb3b94013242b36c777baa59ee37500f9`,
+`d0f00df`) and the U-W2.2 implementation commit (`93df1ef`) are NOT rewritten,
+amended, squashed, reset, or rebased. A3 lands as its own independently visible
+documentation-only commit, which is the U-P2 D-v0.4.50 landing model A1 and A2
+both used, applied a third time.
+
+The subordinate application of this amendment — the per-command contract, the
+per-entry power map, the exact output schemas, the exact test and mutation
+matrix, and the exact README scope — is
+`agentic-os-v0.4-u-w2-3-workflow-cli-contract.md`, this wave's own Wave 0
+contract. That contract is subordinate to A3 and may add nothing A3 does not
+authorise, exactly as §19 is subordinate to §A.4 and B1 is subordinate to A2.
+
+## A3.1 The finding this amendment resolves
+
+Five landed statements are jointly unsatisfiable, and the impossibility lives in
+this contract, not in the U-W2.3 candidate. Each was reproduced mechanically
+against the tree at the baseline before it was accepted.
+
+1. **§16 freezes thirteen leaves and their power classes** — nine
+   `authoritative_write, ledger`, three `read_only`, one `derived_write` — and
+   A1 §A.2 preserved §16 unchanged ("the CLI table (§16, U-W2.3's) … stand
+   unchanged"). Ten of the thirteen therefore carry a class outside
+   `power.RECOVERY_ALLOWED_KINDS`, which is
+   `frozenset({READ_ONLY, RECOVERY_SAFE})` in `agentic_os/power.py`.
+
+2. **That mechanically forces ten new rows in an existing test file.**
+   `tests/test_v02_power_modes.py::RecoveryTests.BLOCKED` is a HAND-KEPT tuple
+   of `(command_path, argv)` pairs — 51 rows at this baseline, a literal tuple,
+   not derived from the parser — and
+   `test_every_blockable_command_is_covered_by_the_block_list` asserts BOTH
+   directions against the LIVE parser:
+
+   ```python
+   leaves = set(power.iter_command_paths(cli.build_parser()))
+   should_block = {p for p in leaves
+                   if power.COMMAND_POLICY[p].kind not in power.RECOVERY_ALLOWED_KINDS}
+   covered = {path for path, _argv in self.BLOCKED}
+   self.assertEqual(sorted(should_block - covered), [], …)
+   self.assertEqual(sorted(covered - should_block), [], …)
+   ```
+
+   Measured with the thirteen §16 leaves and their thirteen §16 policy entries
+   present, in memory only:
+
+   ```text
+   new leaves: 13                    BLOCKED rows parsed: 51
+   should_block - covered = [('workflow','admit'), ('workflow','approve'),
+     ('workflow','cancel'), ('workflow','dispatch'), ('workflow','export-intents'),
+     ('workflow','receipt'), ('workflow','request-approval'), ('workflow','result'),
+     ('workflow','revoke-dispatch'), ('workflow','validate')]
+   covered - should_block = []
+   ```
+
+   Exactly TEN rows are forced and NOTHING must be removed; `show`, `list` and
+   `verify` correctly do not appear. Every other leaf-set-dependent predicate in
+   the tree passes under the same simulation (bidirectional classification
+   coverage, `len(leaves) > 40` → 108, the ledger-flag rule, and every
+   prefix-scoped count in the other test modules).
+
+3. **§0.3 declares "…`pyproject.toml`, every existing test, and every existing
+   fixture" untouched.** A1 §A.3.1 item 3 superseded that clause for EXACTLY the
+   eleven §A.4.3 files and EXACTLY their enumerated edit classes, and A1 §A.5
+   states the licence is not standing, naming this unit: "A future mechanical
+   necessity — including the same class of version-pin edit **in U-W2.3** or any
+   later unit — requires its own governed amendment through this same
+   mechanism." `tests/test_v02_power_modes.py` is one of A1's eleven, but only
+   for edit class (a), the schema-version literal, and only for that one
+   delivery. For U-W2.3 the licence is spent and the edit class is different.
+
+4. **§19 row 22, as rewritten by A1 §A.3.1 item 4**, requires every existing
+   test and fixture file outside A1's eleven to be byte-unchanged. For the
+   U-W2.3 delivery the operative obligation is that EVERY existing test file is
+   byte-unchanged.
+
+5. **§18's U-W2.3 table names four implementation paths**, and §18's closing
+   rule — preserved in effect by A1 §A.5 — makes a fifth
+   `FAIL — REPLAN REQUIRED`.
+
+Items 3–5 forbid exactly the edit item 1 forces. This is A1 §A.1's pattern one
+wave later, and the lawful resolution is the same mechanism: a governed
+amendment to the landed contract itself.
+
+Two further defects are folded into the same amendment rather than left for the
+implementation to reinterpret silently:
+
+**§16's transaction claim is unimplementable.** §16 closes with
+"`expected_revision` is read from the live row by the CLI shell immediately
+before deciding, **inside the same transaction as the CAS** — the CLI is a
+convenience wrapper; the engine still enforces the guard." Reproduced against
+the landed tree: `workflow_store.submit` owns the ONLY transaction —
+`with db.transaction(conn): conn.execute("BEGIN IMMEDIATE")` as its first
+statement — `db.transaction(conn)` is `with conn: yield conn`, and U-W2.2 §20
+row S12 pins that there is exactly one `BEGIN IMMEDIATE` in the module. A
+caller-opened transaction wrapping `submit` makes that statement raise
+`sqlite3.OperationalError: cannot start a transaction within a transaction`,
+which `submit` maps to `WorkflowStoreError("store_unavailable")`. And
+`expected_revision` is sealed under the envelope's `content_sha256`, so it must
+be chosen BEFORE `submit` is called. By this contract's own closing rule — "a
+sentence here that the code cannot demonstrate is a defect in one of the two" —
+that sentence is a defect.
+
+**U-W2.3 has no authorised path for its own Wave-0 documents.** A1 §A.6 defers
+U-W2.3's "branch, PR title, tag, and commit identity" to "its own Wave 0 against
+this amended contract — not silently, and not here", and explicitly discharges
+the §18 U-W2.3 paragraph's two-Wave-0-documents clause (those two documents in
+fact landed with U-W2.1 in `aedbc49…`). A1 §A.5 authorises no documentation file
+beyond its own named paths. So this wave can write neither `DECISIONS.md`, nor
+this file, nor a subordinate contract, without saying so here.
+
+## A3.2 What this amendment changes, and what it does not
+
+A3 changes PATH AUTHORITY, ONE UNIMPLEMENTABLE SENTENCE, and DELIVERY IDENTITY.
+It adds no state, command, event, receipt kind, intent kind, refusal reason,
+matrix edge, transition-policy version, table, column, CHECK, index, migration,
+store or engine API function, transaction step, record schema, or registry
+identity, and it removes none. The lifecycle vocabulary and the 13×13 matrix
+(§5), the commands (§6), the events (§7), the refusal reasons (§8), the reducer
+boundary (§9), revision and dedupe semantics (§10), admission (§11), approval
+and evidence facts (§12), the queue handshake (§13), persistence and crash
+points (§14), updateability (§15), **the §16 leaf table and its thirteen policy
+classes**, the exclusions (§0.2, §17), the test matrix (§19) apart from row 22's
+one clause, the verification commands (§20), and the known limitations (§22) all
+stand unchanged. A1 and A2 stand in full apart from the one D-v0.4.81 re-reading
+named below; B1 is untouched.
+
+Ownership is preserved exactly: U-W2.1 (landed) owns the pure kernel; U-W2.2
+(landed) owns local persistence; **U-W2.3 owns the CLI group, the power-policy
+entries, the README section, and the refusal journal, and nothing else**;
+U-W2.R owns the private-runtime adapter in its own repository against its own
+database; U-W3 owns retry, checkpoint, resume and compensation; U-W4/U-W5/U-W6
+as frozen. The no-shared-database rule stands. Nothing here authorises any
+queue, worker, retry, checkpoint, monitor, interrupt, schema, migration,
+packaging, protocol, delivery-control, or private-runtime work.
+
+The distinction this amendment draws, and the whole of its new authority:
+
+- A **semantic implementation path** carries new behaviour — the four §18
+  U-W2.3 slice-table paths, unchanged here in content and responsibility.
+- A **mechanical power-test edit** is a forced consequence of §16's frozen
+  thirteen leaves and their frozen classes inside an EXISTING test: one
+  contiguous insertion of exactly ten `RecoveryTests.BLOCKED` rows plus their
+  comment header. It adds no assertion, changes no assertion, renames no method,
+  deletes no test, skips nothing, and weakens nothing.
+- An **architecture document** is the wave's own decision record and contract
+  text, which every prior unit landed with its delivery.
+
+Only the second and third categories are added to the closed U-W2.3 path set,
+each by name in §A3.4.
+
+## A3.3 Exact supersession scope
+
+A3 supersedes the following clauses, and no others. Each is quoted with its
+replacement. The enumeration is exactly **S1–S7**; four further items are
+CLOSED rather than superseded, because they were silent and silence in this unit
+is a defect by this contract's own closing sentence.
+
+### A3.3.1 Superseded clauses
+
+**S1 — §0.3, the closing clause of the untouched list.**
+
+> …`pyproject.toml`, every existing test, and every existing fixture.
+
+Already superseded by A1 §A.3.1 item 3 for exactly the eleven §A.4.3 files and
+exactly their edit classes. **Further superseded by §A3.4.2 for EXACTLY ONE
+further file, `tests/test_v02_power_modes.py`, and EXACTLY ONE edit class: one
+contiguous insertion of ten `RecoveryTests.BLOCKED` rows plus their comment
+header, at the position §A3.4.2 names, and nothing else in that file.** For
+every other existing test and fixture — and for every other path §0.3 names —
+§0.3 remains in force verbatim, including "Existing artifacts remain valid
+without edits."
+
+**S2 — §19 row 22, the final clause, as already rewritten by A1 §A.3.1 item 4.**
+
+> the full existing suite passes byte-unchanged.
+
+Superseded by: the full existing suite passes; every existing test and fixture
+file OUTSIDE A1's eleven §A.4.3 paths and OUTSIDE
+`tests/test_v02_power_modes.py` is byte-unchanged; that one file receives
+exactly the §A3.4.2 edit; no test is deleted, skipped, renamed or weakened, and
+no assertion's meaning is rebased. Every other clause of row 22 stands, and row
+22's compatibility obligations are discharged by the rows §A3.4.5 names.
+
+**S3 — §18, slice U-W2.3, the "Paths:" list.**
+
+> Paths: `agentic_os/cli.py` (modified: the `workflow` group, §16);
+> `agentic_os/power.py` (modified: thirteen `COMMAND_POLICY` entries);
+> `README.md` (modified: one new unit section);
+> `tests/test_v04_workflow_cli.py` (new); and the two Wave-0 documents this
+> freeze already wrote — `DECISIONS.md` (modified: the prepended D-v0.4.71–82
+> section) and `agentic-os-v0.4-u-w2-workflow-state-engine-contract.md` (new).
+
+Superseded by §A3.4: those four implementation paths remain, unchanged in
+content and responsibility, and the closed slice inventory is the EIGHT paths of
+§A3.4. The trailing two-Wave-0-documents clause was already discharged by A1
+§A.6 and is not revived; the three architecture paths of §A3.4.3 are this wave's
+own documents, authorised here for the first time.
+
+**S4 — §18, the closing rule.**
+
+> Any path outside the tables above appearing in any later U-W2 wave is
+> `FAIL — REPLAN REQUIRED`, not a quiet extension.
+
+Superseded by §A3.5 ONLY in what "the tables above" denotes: the §18 tables as
+amended by A1 §A.4 and by this §A3.4. The rule itself is preserved verbatim and
+continues to fire on every path outside the amended tables.
+
+**S5 — §1, the D-v0.4.81 index entry's closing claim.**
+
+> the exact file table in §18 is exhaustive.
+
+Already re-read by A1 §A.3.1 item 5. Superseded by: the exact file table in §18,
+AS AMENDED BY A1 §A.4 AND BY A3 §A3.4, is exhaustive. The landed D-v0.4.81,
+D-v0.4.95 and D-v0.4.96 ledger entries stay byte-identical history in
+`DECISIONS.md`; D-v0.4.97 extends them and never rewords them (the
+D-v0.4.44 → D-v0.4.50 precedent, applied a third time).
+
+**S6 — §16, the final sentence's transaction claim.**
+
+> `expected_revision` is read from the live row by the CLI shell immediately
+> before deciding, inside the same transaction as the CAS — the CLI is a
+> convenience wrapper; the engine still enforces the guard.
+
+Superseded by: **the CLI shell reads the live revision with
+`workflow_store.read_workflow` IMMEDIATELY BEFORE calling
+`workflow_store.submit`, and the compare-and-swap runs inside `submit`'s single
+`BEGIN IMMEDIATE` transaction — the only transaction the landed U-W2.2 boundary
+permits (U-W2.2 §10.1, §8.3, §20 row S12). A writer that advances the revision
+between the read and the submit makes the command refuse `revision_mismatch` and
+write nothing.** The clause's intent — the CLI is a convenience wrapper and the
+engine still enforces the guard — is preserved exactly; only the impossible
+transaction claim is withdrawn. `admit_work_spec` has no row to read and asserts
+`expected_revision = 0`, exactly as §10 already freezes.
+
+Everything else in §16 — the thirteen leaves, their arguments, their options,
+their effects, their policy classes, and the wave-1 file-exchange transport
+sentence — is NOT superseded and stands verbatim.
+
+**S7 — §18, slice U-W2.3's delivery identity, together with A1 §A.6's
+deferral.**
+
+A1 §A.3.1 item 6 already superseded the one-PR delivery identity "as applied to
+slices U-W2.2 and U-W2.3", and superseded U-W2.2's commit subject only. A1 §A.6
+then GRANTED that U-W2.3's "branch, PR title, tag, and commit identity are
+frozen at its own Wave 0 against this amended contract — not silently, and not
+here." **S7 is therefore a RESOLUTION exercising that granted authority, not the
+supersession of a clause still in force**; the only thing it supersedes is A1
+§A.6's residual deferral language, which §A3.6 now discharges by exercising it.
+§18's own commit subject for this slice —
+`feat(v0.4): U-W2.3 — workflow CLI, power policy, and docs` — was NEVER
+superseded (A1 §A.3.1 item 6 superseded U-W2.2's subject only) and is **ADOPTED
+VERBATIM** for the implementation commit.
+
+### A3.3.2 Closed silences (C-A … C-D)
+
+Four behaviours the governing documents assign to U-W2.3 without freezing their
+shape. Silence is a defect by this contract's closing sentence, so they are
+closed here in outline and frozen in full by the subordinate U-W2.3 contract.
+
+```text
+C-A  the refusal-journal row's entity, entity_id, action and payload members
+     (§8 assigns the row to "the CLI shell"; U-W2.2 §9.4 / D-v0.4.87 place it
+     OUTSIDE the declining transaction and state that until U-W2.3 ships "a
+     refusal leaves no trace in aos.db at all"; no document froze its shape)
+C-B  the CLI's command-envelope assembly discipline (U-W2.1 shipped no public
+     record-builder; §6 defines the envelope and COMMAND_SOURCES contains "cli"
+     precisely so the CLI can be its source, but nothing froze how the CLI
+     mints command_id, created_at, actor, source and trace)
+C-C  the accepted workflow-identity form family and its canonical rendering at
+     the CLI edge (the store's readers accept every ids.parse_id spelling while
+     submit's envelope gate is the strict ^WF-[0-9]{1,19}$, so an
+     un-normalised identity would succeed on a read verb and refuse
+     command_malformed on a write verb)
+C-D  `export-intents`' filename scheme, idempotence rule and unreadable-row
+     behaviour (§16 says "idempotent, content-addressed filenames" and no
+     document says what the name is, what happens when it already exists, or
+     what happens to an unreadable outbox row)
+```
+
+Their frozen content is `agentic-os-v0.4-u-w2-3-workflow-cli-contract.md` §6,
+§4, §3 and §7 respectively. The closures add no behaviour outside the four
+implementation paths.
+
+### A3.3.3 Explicitly NOT superseded
+
+```text
+the thirteen states, nine commands, seventeen events, forty-three refusal
+reasons, nine receipt kinds, two intent kinds, the 13x13 transition matrix,
+TRANSITION_POLICY_VERSION and SUPPORTED_POLICY_VERSIONS
+
+§0.1 in full; §0.2's not-in-scope list in full; §0.3 for every path outside the
+one named in S1; §2-§15 in full; §16 apart from its final sentence's transaction
+claim; §17 in full; §18's slice definitions for U-W2.1, U-W2.2 (as amended by
+A1 §A.4) and U-W2.R; §19 rows 1-21 and every clause of row 22 except the one
+named in S2; §20; §21 as historical record; §22 in full; the closing
+audit-surface sentence
+
+A1 in full, including the closed nineteen-path U-W2.2 inventory of §A.4 and the
+no-expansion rule of §A.5, apart from the D-v0.4.81 re-reading named in S5
+
+A2 in full, including the canonical identity representation of §A2.2, and U-W2.2
+addendum B1 in full
+
+D-v0.4.1 through D-v0.4.96, byte-identical
+```
+
+## A3.4 The closed U-W2.3 path inventory (EIGHT paths)
+
+This table REPLACES the four-path slice list as the complete, closed, exhaustive
+U-W2.3 inventory. Per-path and per-command detail is frozen in
+`agentic-os-v0.4-u-w2-3-workflow-cli-contract.md`, which is subordinate to this
+amendment and must enumerate exactly these paths.
+
+### A3.4.1 Implementation (4) — semantic; unchanged from §18
+
+```text
+agentic_os/cli.py               modified  ONE new `workflow` group, thirteen
+                                          handlers, the shared write shell, and
+                                          the refusal journal — and no other
+                                          region of the file
+agentic_os/power.py             modified  exactly thirteen COMMAND_POLICY
+                                          entries as one contiguous block; no
+                                          existing entry, kind, constant or
+                                          helper changes
+README.md                       modified  exactly ONE new unit section, placed
+                                          after "## Deterministic WorkSpec
+                                          compiler (U-W1)" and before
+                                          "## Weekend commands"; no other region
+                                          of the file
+tests/test_v04_workflow_cli.py  new       the U-W2.3 contract's §9 matrix, rows
+                                          C1-C26
+```
+
+### A3.4.2 Mechanical power-test edit (1) — forced by §16's frozen classes
+
+```text
+tests/test_v02_power_modes.py   modified  ONE contiguous insertion of exactly
+                                          ten RecoveryTests.BLOCKED rows plus
+                                          their comment header, placed after the
+                                          U-A3 governed-handoff rows (the row
+                                          ending `("agent","handoff","cancel")`)
+                                          and before the
+                                          `(("ingest","dropfile"), …)` row, and
+                                          NOTHING else in that file
+```
+
+The ten rows, exhaustively — this list is the whole of the authorised edit:
+
+```python
+        (("workflow", "admit"), ("workflow", "admit", "SELF", "SELF")),
+        (("workflow", "validate"), ("workflow", "validate", "WF-1")),
+        (("workflow", "request-approval"), ("workflow", "request-approval", "WF-1")),
+        (("workflow", "approve"), ("workflow", "approve", "WF-1", "SELF")),
+        (("workflow", "dispatch"), ("workflow", "dispatch", "WF-1")),
+        (("workflow", "revoke-dispatch"), ("workflow", "revoke-dispatch", "WF-1")),
+        (("workflow", "cancel"), ("workflow", "cancel", "WF-1")),
+        (("workflow", "receipt"), ("workflow", "receipt", "WF-1", "SELF")),
+        (("workflow", "result"), ("workflow", "result", "WF-1", "SELF")),
+        (("workflow", "export-intents"), ("workflow", "export-intents", "SELF")),
+```
+
+`SELF` is the file's existing workspace-root substitution token. The argv values
+only have to reach the power gate, which fires BEFORE `args.func` runs, so no
+workflow fixture is needed — the shape the existing
+`(("agent","import"), ("agent","import","nonexistent.json"))` row already uses.
+**No assertion is added or changed, no method is renamed, no test is deleted,
+skipped or weakened, and no other line of that file is touched.** This is
+narrower than A1 §A.4.3's authority, which permitted six edit classes across
+eleven files; A3 permits one class in one file.
+
+### A3.4.3 Architecture documents (3)
+
+```text
+DECISIONS.md                                              modified  the prepended
+    U-W2.3 Wave 0 section, decisions D-v0.4.97 … D-v0.4.102; everything below
+    the prepend stays byte-identical, including D-v0.4.1 … D-v0.4.96
+agentic-os-v0.4-u-w2-workflow-state-engine-contract.md    modified  THIS amendment,
+    appended; bytes 1-147,457 preserved as the file's exact prefix
+agentic-os-v0.4-u-w2-3-workflow-cli-contract.md           new       the U-W2.3
+    Wave 0 architecture contract, subordinate to this amendment
+```
+
+The landed §18 already settled that a wave's documents belong in its
+implementation inventory ("naming them is not optional bookkeeping — … the
+exhaustiveness rule below would otherwise declare this unit's own delivery a
+replan"), and A1 §A.4.4 and A2 §A2.9 applied that settled rule to their own
+waves' documents. A3 applies it to U-W2.3's.
+
+### A3.4.4 Completeness
+
+No NINTH path exists. Verified at the baseline:
+
+- The only hand-kept blockable-command list in the tree is
+  `RecoveryTests.BLOCKED`; every other leaf-set-dependent assertion is a
+  membership, subset, monotone-count, or prefix-scoped test that thirteen added
+  leaves cannot break — measured, not assumed.
+- No schema, migration, fixture or version pin changes, so none of A1 §A.4.3's
+  eleven files is touched except the one named in §A3.4.2, and that for an
+  entirely different reason.
+- `agentic_os/ids.py` already carries `PREFIXES["workflow"] = "WF"`, registered
+  by U-W2.2 explicitly "so `ids.parse_id` accepts a human-typed identity at the
+  U-W2.3 CLI, and for no other reason".
+- `pyproject.toml` packages `agentic_os` by allowlist and the zipapp builder
+  globs `agentic_os/**/*.py`, so adding parser leaves to an existing module
+  needs no packaging edit and keeps all three entrypoints identical.
+- CI discovers tests by pattern, so a new `tests/test_v04_*.py` module needs no
+  delivery-control edit.
+- No production module outside §A3.4.1, no tool, and no documentation file
+  outside §A3.4.3 requires any change.
+
+## A3.5 Closure — this amendment is not an expansion mechanism
+
+The §18 rule continues in force over the amended tables, verbatim in effect: any
+path outside the tables above, as amended by A1 §A.4 and by §A3.4, appearing in
+any later U-W2 wave is `FAIL — REPLAN REQUIRED`, not a quiet extension.
+
+This amendment authorises exactly one delivery: the U-W2.3 implementation
+described by `agentic-os-v0.4-u-w2-3-workflow-cli-contract.md` at this baseline,
+over exactly the eight §A3.4 paths, in exactly the two §A3.6 commits. It grants
+no standing authority of any kind: no future schema-version bump, no future CLI
+addition, no later U-W2 wave, no other unit, and no further amendment inherits
+any path permission from it. A future mechanical necessity — including another
+`RecoveryTests.BLOCKED` insertion when a later unit adds a leaf — requires its
+own governed amendment through this same mechanism. No production, packaging,
+protocol, store, engine, migration, delivery-control, or unrelated documentation
+file is authorised beyond the eight named paths, and within
+`tests/test_v02_power_modes.py` nothing beyond the single edit class of §A3.4.2
+is authorised.
+
+A3 contains no open path category, no "related files" or "as needed" phrasing,
+no non-exhaustive enumeration marker, and no licence for a future quiet
+extension of §16, of the path set, of the power classes, or of anything else.
+
+## A3.6 Delivery identity (resolving A1 §A.6's deferral)
+
+Exercising the authority A1 §A.6 granted, U-W2.3's delivery identity is frozen
+here:
+
+```text
+branch     v0.4-u-w2-3-workflow-cli
+worktree   /home/daksh/Projects/agentic-os-u-w2-3
+base       de10deaf181b99a05415370d65149b83685af979
+PR title   feat(v0.4): U-W2.3 — workflow CLI, power policy, and docs
+tag        milestone/v0.4-u-w2-3-workflow-cli, at the merge commit, after the
+           merge, never before
+```
+
+Exactly TWO ordered commits on that branch, inside the one U-W2.3 PR, through
+the U-P2 protected gate:
+
+```text
+1  docs(v0.4): adopt U-W2 path amendment A3 and freeze U-W2.3 CLI architecture
+   exactly the three §A3.4.3 architecture paths
+
+2  feat(v0.4): U-W2.3 — workflow CLI, power policy, and docs
+   exactly the five §A3.4.1-§A3.4.2 implementation paths
+```
+
+No implementation path may be staged before commit 1 exists — the U-P2
+D-v0.4.50 landing model, applied a third time. No amend, squash, reset, rebase,
+or force-push touches either commit. Landing flows through the U-P2 gate: PR,
+the four required checks (`workflow-integrity`, `tests-python-3.12`,
+`tests-python-3.14`, `distribution-smoke-python-3.12`) green on the exact pushed
+head, branch up to date, merge commit only, no auto-merge, conversation
+resolution required, empty bypass list.
+
+## A3.7 Path scope — unchanged, and still closed
+
+A3 adds no path beyond the eight of §A3.4: four implementation paths (unchanged
+from §18 in content and responsibility), one mechanical test edit, and three
+architecture documents. A NINTH path appearing in the U-W2.3 delivery is
+`FAIL — REPLAN REQUIRED`, exactly as §A.5 froze it.
+
+The three architecture paths are writable in commit 1 and frozen thereafter; the
+five implementation paths are writable in commit 2 and nowhere else.
+
+## A3.8 Verification that this amendment did not become an escape hatch
+
+Checkable, and checked before landing:
+
+1. **Prefix identity** — bytes 1–147,457 of this file equal the file at
+   `de10deaf181b99a05415370d65149b83685af979`
+   (sha256 `530ece7f37c5777897c0f0021efc83dde83a19954dfd1f96e7d8a7bab8820354`).
+2. **`DECISIONS.md` suffix identity** — the working file ENDS with the exact
+   336,809 bytes at the baseline (sha256 `ea0fcb2ded26e604065bd6a5272cf9312cf1c13000b73bfe62ac36ea49797f58`);
+   D-v0.4.1 … D-v0.4.96 are byte-identical; the new decisions are exactly
+   D-v0.4.97 … D-v0.4.102, contiguous and unique.
+3. **Closed enumeration** — the supersession set is exactly S1–S7 plus the four
+   closures C-A…C-D; the subordinate U-W2.3 contract quotes no clause outside
+   them and adds nothing A3 does not authorise.
+4. **No expansion language** — §A3.5 and §A3.7; every path is named
+   individually; there is no open category, no non-exhaustive marker, and a
+   one-delivery clause is present.
+5. **Path closure** — exactly eight paths; commit 1 changes exactly three of
+   them; commit 2 changes exactly five; no ninth path exists.
+6. **Thirteen and ten** — the subordinate contract enumerates exactly thirteen
+   commands, exactly thirteen `COMMAND_POLICY` entries split 9 / 3 / 1, and
+   exactly ten `RecoveryTests.BLOCKED` rows; the ten equal the measured
+   blockable delta with nothing added and nothing removed.
+7. **No standing authority** — §A3.5.
+
+## A3.9 Rejected alternatives
+
+- **Extending §18's README scope to also rebase `README.md`'s stale global
+  schema-version paragraph.** That text was introduced at `d06df1b` (U-A1) and
+  was already false after U-A3 shipped schema 5, before U-W2 existed; §18 scopes
+  `README.md` to "one new unit section", word for word; and an amendment that
+  reaches beyond its forcing cause is the escape hatch A1 §A.9 already rejected.
+  U-W2.3's new section makes no global current-version claim, so it introduces
+  no contradiction; the pre-existing one is carried as a declared known
+  limitation and is work for a future documentation unit. Rejected.
+- **A general mechanical-edit licence for future CLI additions**, so that a
+  later unit adding leaves inherits the `tests/test_v02_power_modes.py`
+  permission. This is A1 §A.9's "has always required and always will" phrasing
+  in a new costume; a standing licence is an escape hatch. Each future necessity
+  earns its own amendment. Rejected.
+- **Deriving `RecoveryTests.BLOCKED` from the parser instead of adding ten
+  rows.** That would rewrite an existing assertion's MEANING — the row exists to
+  be an independent, hand-kept cross-check of the parser-derived predicate, and
+  deriving it from the same source would make the guard vacuous. S1's edit class
+  forbids it and S2 forbids rebasing an assertion's meaning. Rejected.
+- **Folding the per-command detail into A3 and shipping seven paths.** Per-path
+  and per-command detail belongs in a subordinate contract (the A1 §A.4
+  precedent), and the "audit surface" sentence belongs to a slice contract, not
+  to an amendment. Rejected.
+- **Reinterpreting §16's transaction sentence silently** as "the CAS is inside
+  submit's transaction, which is what the sentence must have meant." The
+  sentence says the CLI's READ is inside that transaction, which is
+  unimplementable; reading it charitably in the implementation rather than
+  superseding it here is exactly the self-amendment A1 §A.1 found unlawful.
+  Rejected.
+- **Adding a store or engine function so the CLI can read the revision inside
+  the transaction.** U-W2.2 §8 states that U-W2.3 "may add no function here;
+  needing one is a replan trigger", and the landed reducer is byte-frozen.
+  Rejected; S6 withdraws the impossible claim instead.
+- **Rewriting the landed contract or `DECISIONS.md` in place.** Frozen contracts
+  and frozen commits are immutable history; amendments append and supersede
+  (D-v0.4.33, D-v0.4.45, D-v0.4.50, A1 and A2's own precedents). Rejected.
+- **A sibling amendment document.** A ninth repository path, outside this wave's
+  authorised write set; the append-only addendum preserves the same invariant
+  machine-checkably. Rejected.
+- **Deferring the whole matter to a later unit.** U-W2.3 cannot land at all
+  under the contradiction, and deferring would either strand §16's thirteen
+  frozen leaves unimplemented or land a delivery its own contract forbids.
+  Rejected.
+
+## A3.10 Decision index (added by this amendment)
+
+D-v0.4.97 — governed amendment A3: the U-W2.3 slice inventory is the closed
+eight-path set of §A3.4; §0.3's every-existing-test clause, §19 row 22's
+byte-unchanged clause, §18's U-W2.3 path list and its closing rule's table
+binding, D-v0.4.81's exhaustiveness claim, and §16's same-transaction clause are
+superseded exactly as §A3.3.1 enumerates (S1–S6), U-W2.3's delivery identity is
+resolved under A1 §A.6 (S7), and four contract silences (C-A…C-D) are closed;
+the delivery is two ordered commits over eight paths; A1's nineteen-path
+inventory, §A.5's no-expansion rule, A2 and B1 are unchanged; no standing
+authority of any kind is created.
