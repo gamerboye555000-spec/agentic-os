@@ -2471,6 +2471,634 @@ def cmd_protocol_verify_registry(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# U-W2.3 local workflow CLI — thirteen leaves under one `workflow` group.
+#
+# Contract: agentic-os-v0.4-u-w2-3-workflow-cli-contract.md, under U-W2
+# amendment A3. The shell decides nothing the reducer has not already decided
+# and persists nothing the store has not already persisted: nine write verbs
+# assemble one `aos.workflow-command/v1` envelope each and hand it to
+# `workflow_store.submit`; three read verbs render the store's own projections;
+# `export-intents` writes the outbox out as content-addressed files.
+#
+# `workflow_store.rebuild` is NEVER called (contract §5.13): its snapshot
+# embeds both verbatim documents, and no U-W2.3 surface may carry a stored
+# body. Nothing here renders a WorkSpec, report, approval fact, receipt or
+# result envelope; every printed value is an enum member, a validated
+# identifier, a digest, an instant or a bounded integer.
+
+#: B1 §B1.14's explicit U-W2.3 obligation: `show` and `list` carry the
+#: snapshot-and-history verdict, and `verify` is the only total surface. One
+#: constant, emitted byte-identically by both human paths and carried as
+#: `integrity_scope` in both `--json` documents.
+_WORKFLOW_INTEGRITY_NOTE = (
+    "note: this verdict covers the snapshot and history; row hashes and "
+    "stored receipt and fact bodies are checked only by "
+    "`python aos.py workflow verify`."
+)
+
+
+def _workflow_state_choices() -> tuple[str, ...]:
+    """The parser's `--state` choices ARE the engine's vocabulary, so a state
+    cannot exist that `--state` refuses, and vice versa (the live
+    `_retrieval_candidate_choices` idiom)."""
+    from . import workflow_engine
+
+    return workflow_engine.WORKFLOW_STATES
+
+
+def _workflow_identity(text: str) -> str:
+    """The one accepted ID form family, normalised once at the CLI edge to
+    U-W2 amendment A2 §A2.2's canonical spelling.
+
+    `ids.render_id` is NEVER used for a workflow: it zero-pads to width 4 and
+    would produce WF-0007 where the engine minted WF-7, breaking every event
+    digest (U-W2.2 §5.1). Normalising here is what keeps one identity from
+    behaving differently on a read verb and a write verb — the store's readers
+    accept every spelling `parse_id` accepts, while `submit`'s envelope gate is
+    the strict ^WF-[0-9]{1,19}$.
+    """
+    return "WF-" + str(ids.parse_id(text, "workflow"))
+
+
+def _workflow_document(path) -> dict:
+    """One untrusted file argument, read under the U-W2 §16 / protocols §9
+    discipline and parsed canonically. The CLI adds no validation of its own:
+    a second gate could disagree with the reducer, which owns every schema
+    judgment (U-W2 §9)."""
+    from . import protocols
+
+    return protocols.parse_canonical(protocols.read_artifact_bytes(path))
+
+
+def _workflow_command(name, workflow_id, expected_revision, payload) -> dict:
+    """The `aos.workflow-command/v1` envelope (contract §4).
+
+    U-W2.1 shipped no public record-builder, so the CLI assembles the record
+    from public constants. `command_id` is fresh per invocation, so re-running
+    a verb is a NEW command rather than a forced replay; `trace` is omitted
+    because the CLI mints no trace it did not receive; `content_sha256` is
+    recomputed over the body and never copied.
+    """
+    import uuid
+
+    from . import protocols, workflow_engine
+
+    document = {
+        "schema": workflow_engine.WORKFLOW_COMMAND_SCHEMA,
+        "command": name,
+        "command_id": str(uuid.uuid4()),
+        "expected_revision": expected_revision,
+        "actor": "human",
+        "source": "cli",
+        "created_at": utils.utc_now_iso(),
+        "payload": payload,
+    }
+    if workflow_id is not None:
+        document["workflow_id"] = workflow_id
+    document[protocols.CONTENT_HASH_FIELD] = protocols.content_digest(document)
+    return document
+
+
+def _journal_workflow_refusal(conn, verb, document, outcome) -> None:
+    """U-W2.3's own observability row (contract §6, closure C-A).
+
+    `action` is deliberately OUTSIDE workflow_engine.WORKFLOW_EVENTS, so a
+    refusal can never be mistaken for one of the seventeen transitions. Its own
+    transaction, outside the one that declined the work (U-W2.2 §9.4), so a
+    journalled refusal cannot be rolled back with it. Every member is a closed
+    code, a validated identifier, a digest, a bounded integer, or the store's
+    own bounded diagnostics — there is no free-text member at all.
+    """
+    from . import events, protocols
+
+    workflow_id = outcome.workflow_id
+    with db.transaction(conn):
+        events.emit(
+            conn,
+            actor="human",
+            entity="workflow",
+            entity_id=(
+                ids.parse_id(workflow_id, "workflow") if workflow_id else None
+            ),
+            action="workflow_command_refused",
+            payload={
+                "workflow_id": workflow_id,
+                "command": verb,
+                "command_id": outcome.command_id,
+                "command_sha256": document[protocols.CONTENT_HASH_FIELD],
+                "status": outcome.status,
+                "reason": outcome.reason,
+                "where": outcome.where,
+                "expected_revision": document["expected_revision"],
+                "revision": outcome.revision,
+                "diagnostics": outcome.diagnostics,
+            },
+        )
+
+
+def _print_workflow_outcome(outcome, state) -> None:
+    """The accepted/replay block (contract §5.2)."""
+    print(
+        f"{outcome.workflow_id}  {outcome.status}  rev {outcome.revision}  "
+        f"{_dash(state)}"
+    )
+    for event in outcome.events:
+        print(
+            f"  seq {event['seq']}  {event['event']}  "
+            f"{_dash(event['from_state'])} -> {_dash(event['to_state'])}"
+        )
+    if outcome.intent is not None:
+        print(
+            f"  intent {outcome.intent['intent_id']}  "
+            f"({outcome.intent['intent_kind']}, "
+            f"route {outcome.intent['queue_route']})"
+        )
+        print("  run: python aos.py workflow export-intents DIR")
+    if outcome.replay:
+        print("  (duplicate command; nothing changed)")
+
+
+def _workflow_write(args, verb, *, payload=None, identity=True) -> int:
+    """The shared write shell for the nine state-changing verbs (contract §5.1).
+
+    `expected_revision` is read from the live row with `read_workflow`
+    IMMEDIATELY BEFORE `submit`, and the compare-and-swap runs inside `submit`'s
+    single BEGIN IMMEDIATE transaction — the only transaction the landed U-W2.2
+    boundary permits (U-W2 §16 as superseded by amendment A3 S6). A writer that
+    advances the revision in between makes the command refuse
+    `revision_mismatch` and write nothing.
+    """
+    from . import workflow_store
+
+    with _ledger(args) as (aos_dir, conn):
+        workflow_id = _workflow_identity(args.id) if identity else None
+        body = payload(args) if payload is not None else {}
+        expected = 0
+        if workflow_id is not None:
+            record = workflow_store.read_workflow(conn, workflow_id)
+            expected = record.revision if record is not None else 0
+        document = _workflow_command(verb, workflow_id, expected, body)
+        outcome = workflow_store.submit(conn, document)
+        if outcome.status in ("accepted", "replay"):
+            state = None
+            if outcome.snapshot is not None:
+                state = outcome.snapshot.get("state")
+            if state is None and outcome.workflow_id is not None:
+                current = workflow_store.read_workflow(conn, outcome.workflow_id)
+                state = current.state if current is not None else None
+            _print_workflow_outcome(outcome, state)
+            return 0
+        _journal_workflow_refusal(conn, verb, document, outcome)
+        print(str(outcome.refusal), file=sys.stderr)
+    return 1
+
+
+def cmd_workflow_admit(args) -> int:
+    return _workflow_write(
+        args, "admit_work_spec", identity=False,
+        payload=lambda a: {
+            "work_spec_document": _workflow_document(a.artifact),
+            "report_document": _workflow_document(a.report),
+        },
+    )
+
+
+def cmd_workflow_validate(args) -> int:
+    return _workflow_write(args, "validate")
+
+
+def cmd_workflow_request_approval(args) -> int:
+    return _workflow_write(args, "request_approval")
+
+
+def cmd_workflow_approve(args) -> int:
+    return _workflow_write(
+        args, "record_approval",
+        payload=lambda a: {"approval_document": _workflow_document(a.fact)},
+    )
+
+
+def cmd_workflow_dispatch(args) -> int:
+    # The `--route` default is the key's ABSENCE: workflow_engine applies its
+    # own default, so the CLI never states a route the operator did not.
+    return _workflow_write(
+        args, "request_dispatch",
+        payload=lambda a: ({} if a.route is None else {"queue_route": a.route}),
+    )
+
+
+def cmd_workflow_revoke_dispatch(args) -> int:
+    return _workflow_write(args, "revoke_dispatch")
+
+
+def cmd_workflow_cancel(args) -> int:
+    return _workflow_write(args, "request_cancel")
+
+
+def cmd_workflow_receipt(args) -> int:
+    return _workflow_write(
+        args, "record_queue_receipt",
+        payload=lambda a: {"receipt_document": _workflow_document(a.receipt)},
+    )
+
+
+def cmd_workflow_result(args) -> int:
+    return _workflow_write(
+        args, "record_result",
+        payload=lambda a: {"result_document": _workflow_document(a.envelope)},
+    )
+
+
+def _workflow_record_public(record) -> dict:
+    """The WorkflowRecord projection, in dataclass order. Enums, integers,
+    digests, instants, UUIDs and one validated slug — no document body."""
+    return {name: getattr(record, name) for name in record.__dataclass_fields__}
+
+
+def cmd_workflow_show(args) -> int:
+    from . import workflow_store
+
+    workflow_id = _workflow_identity(args.id)
+    with _ledger(args) as (aos_dir, conn):
+        record = workflow_store.read_workflow(conn, workflow_id)
+        if record is None:
+            raise AosError(
+                f"No workflow {workflow_id}. Run: python aos.py workflow list"
+            )
+        history = workflow_store.read_history(conn, workflow_id)
+        if args.json:
+            _print_json(
+                {
+                    "workflow": _workflow_record_public(record),
+                    "history": {
+                        "integrity": history.integrity,
+                        "unreadable_seq": history.unreadable_seq,
+                        "events": [dict(event) for event in history.events],
+                    },
+                    "integrity_scope": _WORKFLOW_INTEGRITY_NOTE,
+                }
+            )
+            return 0
+        print(
+            f"{record.workflow_id}  {record.state}  rev {record.revision}  "
+            f"policy {record.policy_version}"
+        )
+        for label, value in (
+            ("task", record.task_id),
+            ("compile status", record.compile_status),
+            ("approval", "required" if record.approval_required
+             else "not required"),
+            ("work spec", record.work_spec_sha256),
+            ("report", record.report_sha256),
+            ("snapshot", record.snapshot_sha256),
+            ("registry", record.registry_version),
+            ("dispatch intent", _dash(record.dispatch_intent_id)),
+            ("cancel intent", _dash(record.cancel_intent_id)),
+            ("runtime task", _dash(record.runtime_task_uuid)),
+            ("queue route", _dash(record.queue_route)),
+            ("created", record.created_at),
+            ("updated", record.updated_at),
+            ("content", record.content_sha256),
+            ("integrity", record.integrity),
+        ):
+            print(f"{label + ':':<17}{value}")
+        line = f"{'history:':<17}{len(history.events)} event(s)"
+        if history.integrity != "ok":
+            line += f"  [integrity {history.integrity}]"
+        if history.unreadable_seq is not None:
+            line += f"  [unreadable seq {history.unreadable_seq}]"
+        print(line)
+        for event in history.events:
+            print(
+                f"  {event['seq']}  {event['event']}  "
+                f"{_dash(event['from_state'])} -> {_dash(event['to_state'])}  "
+                f"rev {event['revision']}  {event['actor']}  "
+                f"{event['created_at']}  {event['content_sha256']}"
+            )
+        print(_WORKFLOW_INTEGRITY_NOTE)
+    return 0
+
+
+def cmd_workflow_list(args) -> int:
+    from . import workflow_store
+
+    with _ledger(args) as (aos_dir, conn):
+        records = workflow_store.list_workflows(conn, state=args.state)
+        if args.json:
+            _print_json(
+                {
+                    "workflows": [_workflow_record_public(r) for r in records],
+                    "integrity_scope": _WORKFLOW_INTEGRITY_NOTE,
+                }
+            )
+            return 0
+        if not records:
+            print("(no workflows)")
+        for record in records:
+            print(
+                f"{record.workflow_id}  {record.state}  rev {record.revision}  "
+                f"{record.compile_status}  {record.integrity}"
+            )
+        # The caveat is about the VERDICT's scope, not about the rows, so it
+        # is printed even when the ledger is empty.
+        print(_WORKFLOW_INTEGRITY_NOTE)
+    return 0
+
+
+def cmd_workflow_verify(args) -> int:
+    from . import workflow_store
+
+    workflow_id = _workflow_identity(args.id) if args.id is not None else None
+    with _ledger(args) as (aos_dir, conn):
+        reports = workflow_store.verify(conn, workflow_id)
+        if workflow_id is not None and not reports:
+            # B1 C1: no report is fabricated for a workflow that has no row.
+            raise AosError(
+                f"No workflow {workflow_id}. Run: python aos.py workflow list"
+            )
+        if not reports:
+            print("(no workflows)")
+            return 0
+        failed = [r for r in reports if r.integrity != "ok"]
+        for report in reports:
+            if report.integrity == "ok":
+                print(f"{report.workflow_id}: OK")
+        for report in failed:
+            print(
+                f"{report.workflow_id}: {report.integrity} at "
+                f"{_dash(report.where)}",
+                file=sys.stderr,
+            )
+            if report.divergent_fields:
+                print(
+                    "  divergent fields: "
+                    + ", ".join(report.divergent_fields),
+                    file=sys.stderr,
+                )
+            if report.divergent_rows:
+                print(
+                    "  divergent rows: "
+                    + ", ".join(
+                        f"({table}, {row_id})"
+                        for table, row_id in report.divergent_rows
+                    ),
+                    file=sys.stderr,
+                )
+        if failed:
+            print(
+                f"{len(failed)} workflow(s) failed verification",
+                file=sys.stderr,
+            )
+            return 1
+    return 0
+
+
+def _workflow_export_refusal(name: str) -> AosError:
+    return AosError(
+        f"Refused: {name} already exists with different bytes. A "
+        "content-addressed file is never overwritten; move it aside, then "
+        "re-run: python aos.py workflow export-intents DIR"
+    )
+
+
+def _compare_workflow_intent_file(path, body: bytes, name: str) -> str:
+    """An existing content-addressed file: identical bytes are `unchanged`,
+    anything else refuses. Never overwritten, never truncated."""
+    import stat as stat_module
+
+    from . import protocols  # noqa: F401  (safe_name is the caller's)
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    try:
+        handle = os.fdopen(os.open(path, flags), "rb")
+    except OSError:
+        raise _workflow_export_refusal(name) from None
+    try:
+        info = os.fstat(handle.fileno())
+        if not stat_module.S_ISREG(info.st_mode) or info.st_size != len(body):
+            raise _workflow_export_refusal(name)
+        existing = handle.read()
+    finally:
+        handle.close()
+    if existing != body:
+        raise _workflow_export_refusal(name)
+    return "unchanged"
+
+
+def _write_workflow_intent_file(path, body: bytes, name: str) -> str:
+    """O_EXCL|O_NOFOLLOW creation, so the CLI never clobbers and never follows
+    a symlink into another location (contract §5.16)."""
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    try:
+        descriptor = os.open(path, flags, 0o644)
+    except FileExistsError:
+        return _compare_workflow_intent_file(path, body, name)
+    except OSError:
+        raise AosError(
+            f"Could not write {name}. Nothing was written for it."
+        ) from None
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(body)
+    return "written"
+
+
+def cmd_workflow_export_intents(args) -> int:
+    import stat as stat_module
+
+    from . import protocols, workflow_store
+
+    # DIR is used exactly as the operator typed it: no expansion, no
+    # resolution, no normalisation. The five file arguments are read the same
+    # way, so one path discipline covers the whole group.
+    target = Path(args.dir)
+    directory = protocols.safe_name(target)
+    try:
+        info = os.lstat(target)
+    except OSError:
+        info = None
+    if info is None or not stat_module.S_ISDIR(info.st_mode):
+        # Least authority: writing records into a directory presupposes the
+        # directory. The CLI creates neither it nor its parents.
+        raise AosError(
+            f"Not an existing directory: {directory}. Create it first, then "
+            "re-run: python aos.py workflow export-intents DIR"
+        )
+
+    with _ledger(args) as (aos_dir, conn):
+        views = workflow_store.list_outstanding_intents(conn)
+    if not views:
+        print("(no outstanding intents)")
+        return 0
+
+    written = 0
+    unchanged = 0
+    unreadable = []
+    for view in views:
+        if not view.readable:
+            unreadable.append(view)
+            continue
+        # The address is computed from the bytes about to be written, never
+        # read from the stored column, so a tampered column cannot redirect a
+        # write. `intent_kind` is a closed two-member vocabulary and the digest
+        # is 64 lowercase hex, so the name matches
+        # ^(dispatch|cancel)-[0-9a-f]{64}\.json$ by construction and no byte of
+        # any stored document can influence it.
+        body = protocols.serialize_canonical_file_bytes(view.document)
+        name = f"{view.intent_kind}-{protocols.content_digest(view.document)}.json"
+        status = _write_workflow_intent_file(target / name, body, name)
+        if status == "written":
+            written += 1
+        else:
+            unchanged += 1
+        print(f"{status:<9}  {name}")
+    for view in unreadable:
+        print(
+            f"unreadable outbox row {view.intent_id} (status {view.status})",
+            file=sys.stderr,
+        )
+    print(
+        f"{len(views)} intent(s): {written} written, {unchanged} unchanged"
+    )
+    if unreadable:
+        print(
+            f"{len(unreadable)} unreadable outbox row(s); nothing was written "
+            "for them",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def _build_workflow_parser(sub) -> None:
+    """The one `workflow` group: two levels, so power._PATH_DESTS resolves the
+    classification key to exactly ("workflow", <verb>)."""
+    p_workflow = sub.add_parser(
+        "workflow",
+        help="local workflow instances (U-W2): admit, drive and inspect the "
+        "deterministic workflow ledger. Records decisions and verified "
+        "external facts; executes, schedules and grants nothing.",
+    )
+    workflow_sub = p_workflow.add_subparsers(
+        dest="subcommand", metavar="SUBCOMMAND", required=True
+    )
+
+    p_admit = workflow_sub.add_parser(
+        "admit",
+        help="admit a compiled WorkSpec and its bound compile report "
+        "(creates the instance and its derived WF-n identity)",
+    )
+    p_admit.add_argument("artifact", metavar="ARTIFACT_FILE")
+    p_admit.add_argument("report", metavar="REPORT_FILE")
+    p_admit.set_defaults(func=cmd_workflow_admit)
+
+    p_validate = workflow_sub.add_parser(
+        "validate", help="compiled → validated"
+    )
+    p_validate.add_argument("id", metavar="WF-n")
+    p_validate.set_defaults(func=cmd_workflow_validate)
+
+    p_request = workflow_sub.add_parser(
+        "request-approval",
+        help="validated → awaiting_approval (asks for authority; grants none)",
+    )
+    p_request.add_argument("id", metavar="WF-n")
+    p_request.set_defaults(func=cmd_workflow_request_approval)
+
+    p_approve = workflow_sub.add_parser(
+        "approve",
+        help="record a verified approval fact somebody else issued "
+        "(judges no approver's authority)",
+    )
+    p_approve.add_argument("id", metavar="WF-n")
+    p_approve.add_argument("fact", metavar="FACT_FILE")
+    p_approve.set_defaults(func=cmd_workflow_approve)
+
+    p_dispatch = workflow_sub.add_parser(
+        "dispatch", help="emit a dispatch intent for the queue adapter"
+    )
+    p_dispatch.add_argument("id", metavar="WF-n")
+    p_dispatch.add_argument(
+        "--route", default=None, metavar="SLUG",
+        help="queue route slug (default: default)",
+    )
+    p_dispatch.set_defaults(func=cmd_workflow_dispatch)
+
+    p_revoke = workflow_sub.add_parser(
+        "revoke-dispatch",
+        help="withdraw an outstanding dispatch intent (ADVISORY: it cannot "
+        "un-enqueue a row the queue already committed)",
+    )
+    p_revoke.add_argument("id", metavar="WF-n")
+    p_revoke.set_defaults(func=cmd_workflow_revoke_dispatch)
+
+    p_cancel = workflow_sub.add_parser(
+        "cancel",
+        help="cancel: immediate and terminal before observed acceptance; "
+        "after dispatch it records a request and nothing more",
+    )
+    p_cancel.add_argument("id", metavar="WF-n")
+    p_cancel.set_defaults(func=cmd_workflow_cancel)
+
+    p_receipt = workflow_sub.add_parser(
+        "receipt", help="record a verified queue receipt"
+    )
+    p_receipt.add_argument("id", metavar="WF-n")
+    p_receipt.add_argument("receipt", metavar="RECEIPT_FILE")
+    p_receipt.set_defaults(func=cmd_workflow_receipt)
+
+    p_result = workflow_sub.add_parser(
+        "result", help="record a verified result envelope"
+    )
+    p_result.add_argument("id", metavar="WF-n")
+    p_result.add_argument("envelope", metavar="ENVELOPE_FILE")
+    p_result.set_defaults(func=cmd_workflow_result)
+
+    p_show = workflow_sub.add_parser(
+        "show",
+        help="snapshot and history for one workflow (bounded and redacted; "
+        "never prints a stored document body)",
+    )
+    p_show.add_argument("id", metavar="WF-n")
+    p_show.add_argument("--json", action="store_true")
+    p_show.set_defaults(func=cmd_workflow_show)
+
+    p_list = workflow_sub.add_parser(
+        "list", help="list workflow instances, ordered by identity"
+    )
+    p_list.add_argument(
+        "--state", default=None, choices=list(_workflow_state_choices())
+    )
+    p_list.add_argument("--json", action="store_true")
+    p_list.set_defaults(func=cmd_workflow_list)
+
+    p_verify = workflow_sub.add_parser(
+        "verify",
+        help="fold-and-compare integrity check (writes nothing, ever; the "
+        "only total integrity surface)",
+    )
+    p_verify.add_argument("id", nargs="?", default=None, metavar="WF-n")
+    p_verify.set_defaults(func=cmd_workflow_verify)
+
+    p_export = workflow_sub.add_parser(
+        "export-intents",
+        help="write outstanding outbox records into DIR as idempotent, "
+        "content-addressed files (DIR must already exist)",
+    )
+    p_export.add_argument("dir", metavar="DIR")
+    p_export.set_defaults(func=cmd_workflow_export_intents)
+
+
+# ---------------------------------------------------------------------------
 # Parser
 
 def build_parser() -> _Parser:
@@ -3239,6 +3867,9 @@ def build_parser() -> _Parser:
         "--note", default=None, metavar="TEXT"
     )
     p_agent_handoff_cancel.set_defaults(func=cmd_agent_handoff_cancel)
+
+    # U-W2.3 local workflow CLI (contract §2). One group, thirteen leaves.
+    _build_workflow_parser(sub)
 
     p_ingest = sub.add_parser("ingest", help="ingest agent write-back artifacts")
     ingest_sub = p_ingest.add_subparsers(

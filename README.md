@@ -629,6 +629,135 @@ registry artifacts; and there is no natural-language authoring, CLI,
 persistence, or scheduling — by design. The full frozen contract is
 `agentic-os-v0.4-u-w1-workspec-compiler-contract.md`.
 
+## Deterministic workflow engine and workflow CLI (U-W2)
+
+`agentic_os/workflow_engine.py` is a pure reducer over admitted
+`beast.work-spec/v1` artifacts — thirteen states, a frozen 13×13 transition
+matrix, nine commands, seventeen events, forty-three closed refusal reasons —
+and `agentic_os/workflow_store.py` is the SQLite shell that gives it a durable
+home: an append-only history, a derived snapshot under revision
+compare-and-swap, an outbox of queue intents, an inbox of queue receipts, and
+the verbatim approval and result documents a claim rests on. `aos workflow` is
+the human half: thirteen leaves that carry your explicit decisions into that
+ledger and read them back out.
+
+It executes nothing, retries nothing, schedules nothing, compensates nothing,
+and grants nothing. Recording an approval fact is not granting approval;
+recording a result envelope is not judging the work. **The wave-1 transport is
+explicit file exchange** — intents out via `export-intents`, receipts in via
+`receipt`, one file and one command at a time. There is no network, no socket,
+no queue, no poller, no watcher, and no shared database: agentic-os never opens
+the runtime's database and the runtime never opens `aos.db`.
+
+The full journey, from a compiled WorkSpec to a recorded result:
+
+```bash
+# 1. Admit a compiled WorkSpec and its bound compile report. The instance's
+#    identity is derived from the artifact digest and is printed here first.
+python aos.py workflow admit ./ws.json ./report.json
+
+# 2. compiled -> validated.
+python aos.py workflow validate WF-…
+
+# 3. When the artifact declares external authority, ask for it and then record
+#    the fact somebody else issued. AOS judges no approver's authority.
+python aos.py workflow request-approval WF-…
+python aos.py workflow approve WF-… ./approval.json
+
+# 4. Emit a dispatch intent, then write the outbox out as files for the queue
+#    adapter. Re-running the export is idempotent by content address.
+python aos.py workflow dispatch WF-… --route default
+python aos.py workflow export-intents ./outbox
+
+# 5. Feed the queue's receipts back in, one file at a time.
+python aos.py workflow receipt WF-… ./receipt-accepted.json
+python aos.py workflow receipt WF-… ./receipt-started.json
+
+# 6. Record the verified result envelope. `succeeded` is reachable only
+#    through the artifact's own evidence predicate — there is no override.
+python aos.py workflow result WF-… ./result.json
+```
+
+The two withdrawal verbs, each honest about what it can and cannot effect:
+
+```bash
+# Withdraw an outstanding dispatch intent. ADVISORY: it cannot un-enqueue a row
+# the queue already committed. If it had, the task keeps running, its later
+# receipts land on a validated or terminal workflow and refuse, and a
+# re-dispatch mints a NEW idempotency key the queue accepts as a SECOND task
+# for the same WorkSpec. AOS neither prevents nor detects that; a human
+# reconciles.
+python aos.py workflow revoke-dispatch WF-…
+
+# Cancel. Before observed acceptance this is immediate and terminal. After
+# dispatch it records a request and NOTHING MORE: post-dispatch cancellation is
+# DORMANT, because the live runtime queue has no cancellation status, so the
+# `cancelled` receipt kind is unreachable after dispatch today. The workflow
+# stays in its pre-cancel state until the task terminates on its own.
+python aos.py workflow cancel WF-…
+```
+
+Reading the ledger. All three are pure reads: they issue no INSERT, UPDATE or
+DELETE and open no transaction.
+
+```bash
+python aos.py workflow show WF-…
+python aos.py workflow show WF-… --json
+python aos.py workflow list
+python aos.py workflow list --state succeeded
+python aos.py workflow list --json
+python aos.py workflow verify WF-…
+python aos.py workflow verify
+```
+
+`show` and `list` print an integrity verdict and then say exactly what it
+covers, in one fixed line:
+
+```text
+note: this verdict covers the snapshot and history; row hashes and stored receipt and fact bodies are checked only by `python aos.py workflow verify`.
+```
+
+That is the snapshot and the history, and not the four row hashes or the two
+stored document bodies that only `workflow verify` re-digests. A ledger whose
+only damage is a forged receipt body reads `ok` and keeps accepting commands;
+what is lost is prompt detection, until someone runs `verify`. `verify` writes
+nothing, ever, and exits 1 when any report is not `ok`, so it is usable as a
+gate.
+
+Nothing here ever prints a stored document body, a receipt reason message, an
+approval reference, or an evidence ref or claim. Every line is an enum member,
+a validated identifier, a digest, an instant or a bounded integer, so
+instruction-bearing or credential-shaped text inside an admitted document
+cannot reach your terminal.
+
+**Boundaries.** U-W2.R is the queue adapter in the private `ai-company-runtime`
+repository; it consumes the exported intent files and produces the receipt
+files, ships through that repository's own delivery process, and is not part of
+this one. U-W3 owns retry, checkpoints, resume and compensation — the
+`compensating`/`compensated` vocabulary is frozen here but refuses under
+transition policy v1. U-W4 owns loop-health monitoring, U-W5 semantic
+interrupts and approval revocation, and U-W6 is the future durable-engine
+trigger. No shared database, in either direction.
+
+**Declared limitations.** Post-dispatch cancellation is dormant (above).
+Revocation before observed acceptance is advisory (above). A WorkSpec may
+declare `min_evidence_count` of zero, and such a workflow then reaches
+`succeeded` with no evidence at all — by the author's digest-bound declaration,
+not by any engine override, and without the journaled reason the task plane's
+`done --no-evidence` demands. A cancel intent can remain outstanding forever,
+so `export-intents` keeps listing it; re-export is idempotent, so that is a
+truthful "the queue may still need to be told" rather than a leak. Three of the
+nine receipt kinds — `waiting_input`, `paused` and `cancelled` — have no live
+source in the runtime today, so `waiting_input` and `paused` are unreachable
+states in wave 1. And the task check is admission-time only: you may close a
+task while its workflow is still running, and AOS neither prevents nor detects
+that.
+
+The frozen contracts are
+`agentic-os-v0.4-u-w2-workflow-state-engine-contract.md` (the engine, the
+store's parent, and governed amendments A1-A3) and
+`agentic-os-v0.4-u-w2-3-workflow-cli-contract.md` (this CLI).
+
 ## Weekend commands
 
 Decisions, handoffs, and memory are first-class ledger rows (each mutation
