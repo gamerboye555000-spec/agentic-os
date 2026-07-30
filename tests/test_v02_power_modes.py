@@ -739,6 +739,21 @@ class RecoveryTests(PowerCase):
           "objective_unclear")),
         (("agent", "handoff", "cancel"),
          ("agent", "handoff", "cancel", "AH-0001")),
+        # U-W2.3 local workflow writers: each submits one command through
+        # workflow_store.submit, writing workflow rows, history and journal in
+        # one transaction. `export-intents` writes files that hand work to the
+        # runtime. The three read-only leaves (show/list/verify) stay available
+        # in recovery and are NOT listed here.
+        (("workflow", "admit"), ("workflow", "admit", "SELF", "SELF")),
+        (("workflow", "validate"), ("workflow", "validate", "WF-1")),
+        (("workflow", "request-approval"), ("workflow", "request-approval", "WF-1")),
+        (("workflow", "approve"), ("workflow", "approve", "WF-1", "SELF")),
+        (("workflow", "dispatch"), ("workflow", "dispatch", "WF-1")),
+        (("workflow", "revoke-dispatch"), ("workflow", "revoke-dispatch", "WF-1")),
+        (("workflow", "cancel"), ("workflow", "cancel", "WF-1")),
+        (("workflow", "receipt"), ("workflow", "receipt", "WF-1", "SELF")),
+        (("workflow", "result"), ("workflow", "result", "WF-1", "SELF")),
+        (("workflow", "export-intents"), ("workflow", "export-intents", "SELF")),
         (("ingest", "dropfile"), ("ingest", "dropfile", "SELF")),
         (("done",), ("done", "T-0002", "--no-evidence", "--reason", "because")),
         (("pack", "build"), ("pack", "build", "T-0002")),

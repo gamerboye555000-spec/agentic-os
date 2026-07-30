@@ -225,6 +225,35 @@ COMMAND_POLICY: dict[tuple[str, ...], CommandPolicy] = {
     ("agent", "handoff", "refuse"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("agent", "handoff", "clarify"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("agent", "handoff", "cancel"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    # U-W2.3 local workflow CLI. The nine writers each submit one command
+    # through workflow_store.submit, which writes workflow rows, the
+    # append-only history and one AOS journal row per appended event in a
+    # single transaction — authoritative by the same mechanical rule as
+    # everything above them, so recovery blocks all nine BEFORE they mutate,
+    # deep preflights and post-verifies each, and eco runs each immediately (an
+    # explicit operator request is never a deferrable background refresh). They
+    # also write one observability `events` row when the store REFUSES, which
+    # is U-W2.3's own obligation (U-W2 §8) and does not change the
+    # classification. `show`, `list` and `verify` read rows and recompute
+    # digests; none writes, so all three are read_only and usable in recovery —
+    # inspecting a damaged or contested workflow is exactly what recovery is
+    # for. `export-intents` writes no ledger row and emits no event, but it
+    # does write files that hand work to the runtime, so it is derived_write
+    # and is therefore blocked in recovery: a damaged workspace must not
+    # dispatch.
+    ("workflow", "admit"):            _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("workflow", "validate"):         _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("workflow", "request-approval"): _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("workflow", "approve"):          _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("workflow", "dispatch"):         _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("workflow", "revoke-dispatch"):  _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("workflow", "cancel"):           _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("workflow", "receipt"):          _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("workflow", "result"):           _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("workflow", "show"):             _p(READ_ONLY),
+    ("workflow", "list"):             _p(READ_ONLY),
+    ("workflow", "verify"):           _p(READ_ONLY),
+    ("workflow", "export-intents"):   _p(DERIVED_WRITE),
     ("ingest", "dropfile"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("done",): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("migrate", "apply"): _p(AUTHORITATIVE_WRITE, ledger=True),
