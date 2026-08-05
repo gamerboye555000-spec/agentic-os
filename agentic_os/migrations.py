@@ -12,9 +12,12 @@ production migration: 1 → 2, `u-m2-memory-claims-v2`. U-M3
 `u-a1-agent-passports-v4`. U-A3
 (agentic-os-v0.4-u-a3-routing-handoffs-contract.md) adds the fourth: 4 → 5,
 `u-a3-routing-handoffs-v5`, purely additive — four empty tables, no existing
-row read or touched. Each supplies a step body and nothing else; every
-guarantee around them (validate, lock, re-read, snapshot, verify at the
-starting version, then mutate) is U-M1's, unchanged.
+row read or touched. U-W2.2 adds the fifth: 5 → 6, `u-w2-workflow-state-v6`.
+U-W3 (agentic-os-v0.4-u-w3-runtime-recovery-contract.md) adds the sixth:
+6 → 7, `u-w3-runtime-recovery-v7` — four closed-enum table rebuilds carrying
+every row verbatim, plus two empty tables. Each supplies a step body and
+nothing else; every guarantee around them (validate, lock, re-read, snapshot,
+verify at the starting version, then mutate) is U-M1's, unchanged.
 
 One rule the second migration made explicit: a step that has shipped is
 HISTORY, and history is frozen in place rather than allowed to follow the
@@ -554,6 +557,180 @@ ROUTING_HANDOFFS_V5 = Migration(
 # ---------------------------------------------------------------------------
 # Production migration 5 → 6: deterministic workflow store (U-W2.2)
 
+#: The HISTORICAL v6 workflow tables, frozen here verbatim as of fef0c2b (the
+#: U-W3 baseline) — all SIX, not only the four U-W3 amends.
+#:
+#: `_workflow_state_v6` was written against `db.WORKFLOW_TABLES` so that a
+#: migrated v6 schema and a freshly initialized one could not drift, and its
+#: own docstring stated the consequence: "A future unit that edits
+#: `db.WORKFLOW_TABLES` inherits the obligation to freeze a `_V6_WORKFLOW_*`
+#: copy here, exactly as `_V2_MEMORY_CLAIM_DDL` did." U-W3 edits that tuple —
+#: four amended DDLs and two added tables — so the obligation fires in full.
+#:
+#: The freeze covers all six because the 5→6 step iterates the WHOLE tuple: a
+#: partial freeze would still let it build v7-shaped `receipts`/`facts` tables
+#: and stamp `schema_version = 6` on them, which is the exact drift
+#: `_V2_MEMORY_CLAIM_DDL` documents. Each step must leave a database that
+#: genuinely IS what it says it is; 6→7 then upgrades it.
+
+_V6_WORKFLOWS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY CHECK (id >= 1),
+  task_id INTEGER NOT NULL,
+  work_spec_sha256 TEXT NOT NULL UNIQUE,
+  report_sha256 TEXT NOT NULL,
+  snapshot_sha256 TEXT NOT NULL,
+  registry_version INTEGER NOT NULL CHECK (registry_version >= 1),
+  compile_status TEXT NOT NULL
+    CHECK (compile_status IN ('valid','warning','requires_external_authority')),
+  work_spec_document TEXT NOT NULL,
+  report_document TEXT NOT NULL,
+  state TEXT NOT NULL
+    CHECK (state IN ('compiled','validated','awaiting_approval','scheduled',
+                     'running','waiting_input','waiting_approval','paused',
+                     'compensating','succeeded','failed','cancelled',
+                     'compensated')),
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  policy_version INTEGER NOT NULL CHECK (policy_version >= 1),
+  approval_required INTEGER NOT NULL CHECK (approval_required IN (0,1)),
+  dispatch_intent_id TEXT,
+  cancel_intent_id TEXT,
+  runtime_task_uuid TEXT,
+  queue_route TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  CHECK (dispatch_intent_id IS NULL OR state = 'validated'),
+  CHECK (cancel_intent_id IS NULL OR state IN
+         ('scheduled','running','waiting_input','waiting_approval','paused')),
+  CHECK (runtime_task_uuid IS NULL
+      OR state NOT IN ('compiled','validated','awaiting_approval')),
+  FOREIGN KEY(task_id) REFERENCES tasks(id)
+)"""
+
+_V6_WORKFLOW_EVENTS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  workflow_id INTEGER NOT NULL,
+  seq INTEGER NOT NULL CHECK (seq >= 1),
+  event TEXT NOT NULL
+    CHECK (event IN ('workflow_admitted','workflow_validated',
+                     'approval_requested','approval_recorded',
+                     'dispatch_requested','dispatch_rejected',
+                     'dispatch_revoked','dispatch_accepted','run_started',
+                     'run_waiting_input','run_waiting_approval','run_paused',
+                     'run_resumed','cancel_requested','workflow_succeeded',
+                     'workflow_failed','workflow_cancelled')),
+  from_state TEXT
+    CHECK (from_state IS NULL OR from_state IN
+           ('compiled','validated','awaiting_approval','scheduled','running',
+            'waiting_input','waiting_approval','paused','compensating',
+            'succeeded','failed','cancelled','compensated')),
+  to_state TEXT
+    CHECK (to_state IS NULL OR to_state IN
+           ('compiled','validated','awaiting_approval','scheduled','running',
+            'waiting_input','waiting_approval','paused','compensating',
+            'succeeded','failed','cancelled','compensated')),
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  policy_version INTEGER NOT NULL CHECK (policy_version >= 1),
+  command_id TEXT NOT NULL,
+  command_sha256 TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  UNIQUE(workflow_id, seq),
+  CHECK (from_state IS NULL OR to_state IS NULL OR from_state <> to_state),
+  CHECK ((event = 'workflow_admitted') = (from_state IS NULL)),
+  FOREIGN KEY(workflow_id) REFERENCES workflows(id)
+)"""
+
+_V6_WORKFLOW_COMMANDS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  workflow_id INTEGER NOT NULL,
+  command_id TEXT NOT NULL UNIQUE,
+  command TEXT NOT NULL
+    CHECK (command IN ('admit_work_spec','validate','request_approval',
+                       'record_approval','request_dispatch','revoke_dispatch',
+                       'request_cancel','record_queue_receipt','record_result')),
+  command_sha256 TEXT NOT NULL,
+  expected_revision INTEGER NOT NULL CHECK (expected_revision >= 0),
+  resulting_revision INTEGER NOT NULL CHECK (resulting_revision >= 1),
+  event_seq_first INTEGER NOT NULL CHECK (event_seq_first >= 1),
+  event_seq_last INTEGER NOT NULL CHECK (event_seq_last >= event_seq_first),
+  created_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  CHECK (resulting_revision = expected_revision + 1),
+  CHECK ((command = 'admit_work_spec') = (expected_revision = 0)),
+  FOREIGN KEY(workflow_id) REFERENCES workflows(id)
+)"""
+
+_V6_WORKFLOW_INTENTS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  workflow_id INTEGER NOT NULL,
+  intent_id TEXT NOT NULL UNIQUE,
+  intent_kind TEXT NOT NULL CHECK (intent_kind IN ('dispatch','cancel')),
+  idempotency_key TEXT NOT NULL,
+  queue_route TEXT NOT NULL,
+  document TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('outstanding','resolved','revoked')),
+  resolved_receipt_id TEXT,
+  created_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  CHECK ((status = 'resolved') = (resolved_receipt_id IS NOT NULL)),
+  FOREIGN KEY(workflow_id) REFERENCES workflows(id)
+)"""
+
+_V6_WORKFLOW_RECEIPTS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  workflow_id INTEGER NOT NULL,
+  receipt_id TEXT NOT NULL UNIQUE,
+  receipt_kind TEXT NOT NULL
+    CHECK (receipt_kind IN ('accepted','rejected','started','waiting_input',
+                            'waiting_approval','paused','resumed','cancelled',
+                            'failed')),
+  intent_id TEXT,
+  runtime_task_uuid TEXT,
+  document TEXT NOT NULL,
+  receipt_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  CHECK (intent_id IS NOT NULL
+      OR receipt_kind NOT IN ('accepted','rejected')),
+  CHECK (intent_id IS NULL
+      OR receipt_kind IN ('accepted','rejected','cancelled')),
+  CHECK (runtime_task_uuid IS NOT NULL
+      OR receipt_kind NOT IN ('accepted','started','waiting_input',
+                              'waiting_approval','paused','resumed')),
+  CHECK (runtime_task_uuid IS NULL OR receipt_kind <> 'rejected'),
+  FOREIGN KEY(workflow_id) REFERENCES workflows(id)
+)"""
+
+_V6_WORKFLOW_FACTS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  workflow_id INTEGER NOT NULL,
+  fact_kind TEXT NOT NULL CHECK (fact_kind IN ('approval','result')),
+  fact_scope TEXT
+    CHECK (fact_scope IS NULL OR fact_scope IN ('admission','runtime')),
+  document TEXT NOT NULL,
+  document_sha256 TEXT NOT NULL,
+  recorded_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  UNIQUE(workflow_id, fact_kind, document_sha256),
+  CHECK ((fact_kind = 'approval') = (fact_scope IS NOT NULL)),
+  FOREIGN KEY(workflow_id) REFERENCES workflows(id)
+)"""
+
+#: The six v6 tables in the v6 FK-parent-first order, paired with their frozen
+#: DDL. The 5→6 step iterates THIS, never `db.WORKFLOW_TABLES`.
+_V6_WORKFLOW_TABLES: tuple[tuple[str, str], ...] = (
+    ("workflows", _V6_WORKFLOWS_DDL),
+    ("workflow_events", _V6_WORKFLOW_EVENTS_DDL),
+    ("workflow_commands", _V6_WORKFLOW_COMMANDS_DDL),
+    ("workflow_intents", _V6_WORKFLOW_INTENTS_DDL),
+    ("workflow_receipts", _V6_WORKFLOW_RECEIPTS_DDL),
+    ("workflow_facts", _V6_WORKFLOW_FACTS_DDL),
+)
+
+
 def _workflow_state_v6(conn: sqlite3.Connection) -> None:
     """Create the six U-W2.2 tables EMPTY. Purely additive.
 
@@ -566,26 +743,28 @@ def _workflow_state_v6(conn: sqlite3.Connection) -> None:
     only because a human ran `admit_work_spec` against a real WorkSpec artifact
     after this migration.
 
-    Built from the same db.py constants a fresh v6 init uses (the D-v0.3.42
-    shared-DDL rule, applied a fifth time), created in FK-parent-first order
-    (workflows → events → commands → intents → receipts → facts) under their
-    real names — so there is no ALTER TABLE RENAME quoting artifact and a
-    migrated schema is BYTE-identical to a fresh one for these six tables.
+    Built from the FROZEN v6 DDL copies above, created in the v6
+    FK-parent-first order (workflows → events → commands → intents → receipts
+    → facts) under their real names — so there is no ALTER TABLE RENAME
+    quoting artifact and a migrated v6 schema is BYTE-identical to the v6
+    schema a fresh init produced while v6 was current.
 
-    This step does NOT freeze any historical DDL: U-W2.2 changes none of the
-    constants a shipped step builds from (`db.MEMORY_CLAIM_DDL`,
-    `db.MEMORY_GRAPH_TABLES`, `db.AGENTS_DDL`, `db.AGENT_PASSPORTS_DDL`,
-    `db.ROUTING_HANDOFF_TABLES`, `passports.agent_identity_payload`), so
-    D-v0.4.29's transfer clause does not fire. A future unit that edits
-    `db.WORKFLOW_TABLES` inherits the obligation to freeze a `_V6_WORKFLOW_*`
-    copy here, exactly as `_V2_MEMORY_CLAIM_DDL` did.
+    U-W3 edits `db.WORKFLOW_TABLES`, so the obligation this docstring declared
+    — "A future unit that edits `db.WORKFLOW_TABLES` inherits the obligation
+    to freeze a `_V6_WORKFLOW_*` copy here, exactly as `_V2_MEMORY_CLAIM_DDL`
+    did" — has now FIRED, and the input constant moved from live to frozen.
+    Nothing else about the step changed. It still freezes no OTHER historical
+    DDL: U-W3 changes none of `db.MEMORY_CLAIM_DDL`, `db.MEMORY_GRAPH_TABLES`,
+    `db.AGENTS_DDL`, `db.AGENT_PASSPORTS_DDL`, `db.ROUTING_HANDOFF_TABLES` or
+    `passports.agent_identity_payload`, so D-v0.4.29's transfer clause does
+    not fire for the 1→2, 2→3, 3→4 or 4→5 steps.
 
     Runs inside U-M1's already-open transaction: no COMMIT, no ROLLBACK, no
     touching meta.schema_version — all three belong to apply_migrations. Six
     empty tables contribute zero foreign-key violations to the per-step
     whole-database foreign_key_check.
     """
-    for table, ddl in db.WORKFLOW_TABLES:
+    for table, ddl in _V6_WORKFLOW_TABLES:
         conn.execute(ddl.format(table=table))
 
 
@@ -596,16 +775,120 @@ WORKFLOW_STATE_V6 = Migration(
     apply=_workflow_state_v6,
 )
 
-#: The canonical production registry: exactly five steps, 1 → 2 → 3 → 4 → 5 → 6,
-#: in order. Never populated by importing arbitrary files or by evaluating names
-#: read from the database — a literal tuple in source is the whole discovery
-#: mechanism.
+# ---------------------------------------------------------------------------
+# Production migration 6 → 7: workflow runtime recovery (U-W3, contract §11.5)
+
+#: The temporary names the four widened v7 tables are built under. None
+#: survives the step: each is renamed inside the transaction.
+_MIGRATING_WORKFLOW_TABLES: tuple[tuple[str, str], ...] = (
+    ("workflows", "workflows_v7_migrating"),
+    ("workflow_events", "workflow_events_v7_migrating"),
+    ("workflow_commands", "workflow_commands_v7_migrating"),
+    ("workflow_intents", "workflow_intents_v7_migrating"),
+)
+
+#: The four rebuilt tables' column lists, in their v6 order, pinned here
+#: explicitly rather than trusting `SELECT *` to still mean what it meant at
+#: U-W2.2. U-W3 adds no column to any of them — every widening is a CHECK, and
+#: SQLite cannot ALTER a CHECK — so each list is BOTH the source and the
+#: destination column list and every row is copied verbatim, column for
+#: column, with `content_sha256` carried across untouched.
+_V6_REBUILD_COLUMNS = {
+    "workflows": (
+        "id, task_id, work_spec_sha256, report_sha256, snapshot_sha256, "
+        "registry_version, compile_status, work_spec_document, "
+        "report_document, state, revision, policy_version, approval_required, "
+        "dispatch_intent_id, cancel_intent_id, runtime_task_uuid, "
+        "queue_route, created_at, updated_at, content_sha256"
+    ),
+    "workflow_events": (
+        "id, workflow_id, seq, event, from_state, to_state, revision, "
+        "policy_version, command_id, command_sha256, actor, payload_json, "
+        "created_at, content_sha256"
+    ),
+    "workflow_commands": (
+        "id, workflow_id, command_id, command, command_sha256, "
+        "expected_revision, resulting_revision, event_seq_first, "
+        "event_seq_last, created_at, content_sha256"
+    ),
+    "workflow_intents": (
+        "id, workflow_id, intent_id, intent_kind, idempotency_key, "
+        "queue_route, document, status, resolved_receipt_id, created_at, "
+        "content_sha256"
+    ),
+}
+
+
+def _runtime_recovery_v7(conn: sqlite3.Connection) -> None:
+    """Widen four workflow tables' closed enums and add U-W3's two.
+
+    Four REBUILDS rather than ALTER, for one mechanical reason: every widening
+    is a CHECK constraint (`workflows.state` gains `retrying` and its dispatch
+    pointer CHECK gains it too, `workflow_events` gains `retrying` and seven
+    event names, `workflow_commands` gains four verbs, `workflow_intents`
+    gains the `compensate` kind), and SQLite cannot ALTER a CHECK. The
+    D-v0.3.43 recipe applies: build under a temporary name from the LIVE v7
+    DDL, copy every column verbatim ordered by `id`, DROP, RENAME.
+
+    Rows are copied VERBATIM, column for column, with `content_sha256` carried
+    across untouched. No hash is recomputed, no timestamp re-stamped, no value
+    normalized, NO CLOCK IS READ. Every landed row hash and every sealed event
+    digest therefore stays valid by construction, and a migrated database
+    re-verifies identically to the one it was made from.
+
+    Nothing is derived, invented or interpreted. There are no legacy attempt,
+    checkpoint or compensation facts anywhere in the ledger, so the step has
+    nothing to derive from and derives nothing: a pre-existing workflow gets
+    NO attempt row. A `workflow_attempts` row exists only because U-W3
+    observed an `accepted` receipt AFTER this migration — which is exactly
+    what U-W3 §5.2.1's adoption predicate reads the absence of.
+
+    The two new tables are created EMPTY, directly under their real names, so
+    a migrated schema is BYTE-identical to a fresh one for them; the four
+    rebuilt ones go through `ALTER TABLE … RENAME`, which may add identifier
+    quoting the original `CREATE TABLE` lacked, so for those four the
+    requirement is STRUCTURAL equivalence (D-v0.3.51's documented storage
+    mechanic, U-W3 §11.5).
+
+    Runs inside U-M1's already-open transaction: no COMMIT, no ROLLBACK, no
+    touching meta.schema_version — all three belong to apply_migrations. The
+    framework's `PRAGMA foreign_keys=OFF` plus its whole-database
+    `foreign_key_check` before the step's commit is what makes the four
+    DROP/RENAMEs legal while sibling tables hold foreign keys into
+    `workflows` — the 2→3 precedent, applied a second time.
+    """
+    live = dict(db.WORKFLOW_TABLES)
+    for table, temporary in _MIGRATING_WORKFLOW_TABLES:
+        columns = _V6_REBUILD_COLUMNS[table]
+        conn.execute(live[table].format(table=temporary))
+        conn.execute(
+            f"INSERT INTO {temporary} ({columns}) "
+            f"SELECT {columns} FROM {table} ORDER BY id"
+        )
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {temporary} RENAME TO {table}")
+    for table in (db.WORKFLOW_ATTEMPTS_TABLE, db.WORKFLOW_CHECKPOINTS_TABLE):
+        conn.execute(live[table].format(table=table))
+
+
+RUNTIME_RECOVERY_V7 = Migration(
+    from_version=6,
+    to_version=7,
+    migration_id="u-w3-runtime-recovery-v7",
+    apply=_runtime_recovery_v7,
+)
+
+#: The canonical production registry: exactly six steps,
+#: 1 → 2 → 3 → 4 → 5 → 6 → 7, in order. Never populated by importing arbitrary
+#: files or by evaluating names read from the database — a literal tuple in
+#: source is the whole discovery mechanism.
 MIGRATIONS: tuple[Migration, ...] = (
     MEMORY_CLAIMS_V2,
     MEMORY_GRAPH_V3,
     AGENT_PASSPORTS_V4,
     ROUTING_HANDOFFS_V5,
     WORKFLOW_STATE_V6,
+    RUNTIME_RECOVERY_V7,
 )
 
 

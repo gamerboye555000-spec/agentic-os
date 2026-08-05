@@ -1,3 +1,963 @@
+# DECISIONS — Agentic OS v0.4 U-W3 workflow runtime recovery (Wave 0)
+
+This section continues the `D-v0.4.*` series for the U-W3 Wave 0 architecture
+freeze: bounded workflow retry, checkpoint persistence, state-restoration
+resume, and compensation under transition-policy version 2. Architecture only —
+no production code, tests, DDL, migrations, fixtures, CLI handlers, power
+entries, protocol schemas or README prose ship in this commit. Branch
+`v0.4-u-w3-runtime-recovery`, worktree `/home/daksh/Projects/agentic-os-u-w3`,
+baseline `fef0c2b3fd8e881776b33e7a2c5d204f8e8d34c1` (= HEAD = the merge-base =
+`milestone/v0.4-u-w2-3-workflow-cli^{}`). Prepended per the established
+precedent (D-W0.4, reaffirmed in D-v0.2.7, D-v0.4.4); everything below stays
+byte-identical, including D-v0.4.1 … D-v0.4.102, which the decisions here
+supersede only where they quote them and never reword.
+
+Unlike U-W2.2's A1 and U-W2.3's A3, this freeze writes **no amendment into any
+landed contract file**. U-W3 is a different unit, not a later U-W2 wave, and the
+U-W3 session is authorized to write exactly two repository paths — `DECISIONS.md`
+and `agentic-os-v0.4-u-w3-runtime-recovery-contract.md`. Every supersession U-W3
+needs is therefore declared inside its own contract's §1.2, and the superseded
+documents are left byte-identical. That is not a weaker mechanism: U-W2 §5.3 and
+§15 already pre-authorised transition-policy version 2, its state additions and
+its storage widening, so U-W3 is exercising a licence rather than overriding a
+clause.
+
+## D-v0.4 decisions (U-W3 Wave 0)
+
+- **D-v0.4.103 — U-W3's authority is a pre-granted licence, and the three
+  attempt namespaces are separated by name, by source of truth, and by owner
+  before anything else is decided.**
+
+  Three landed clauses grant the whole unit: U-W2 §5.3 ("Transitions reserved
+  for U-W3: the three `R` edges, plus reinterpreting `partial`/`unknown`
+  outcomes — all activate only via transition-policy version 2"), U-W2 §15
+  (policy version 2 is U-W3's, state additions are additive under a new policy
+  version plus a widened storage CHECK plus frozen retention of every prior
+  version's table), and U-W2 §12.2 gate 4 (a failing envelope "is stored
+  verbatim as a fact and NOT acted on (compensation is U-W3's)"). U-W3 ships
+  what those clauses reserved and nothing else.
+
+  Three attempt concepts were previously one word. Frozen apart: a
+  **runtime task attempt** is a row in the private runtime's `task_attempts`,
+  numbered by `attempt_number`, produced by its `QueueWorker`, retried by
+  `_is_retryable_failure` and delayed by `retry_backoff_seconds` (30 s doubling,
+  capped at 300 s) — none of which AOS counts, bounds, mirrors or models. A
+  **workflow attempt** is one AOS-decided, AOS-recorded execution of the
+  admitted WorkSpec, ordinal `attempt_no`, whose source of truth is
+  `workflow_events` and whose projection is the new `workflow_attempts` table.
+  The **attempt budget** is `work_spec_document.retry.max_attempts`, digest-bound
+  and admission-immutable, defaulting to 1 — the landed `_handle_record_result`
+  default, unchanged.
+
+  The rule that resolves every collision between them: **AOS counts what AOS
+  observed.** A runtime requeue on a transient failure or a lease expiry moves
+  `running → pending → running` inside the runtime's plane, emits no AOS receipt,
+  and consumes no workflow attempt. U-W3 therefore adds no `attempts`,
+  `next_visible_at`, `lease`, `worker`, `locked_by` or `backoff` column anywhere
+  in `aos.db`, and duplicates nothing the private runtime already owns.
+
+  The private-runtime facts were reproduced directly against
+  `d6f4a82aeb3e08d8067250489343e4242b35d07d`, not assumed: a production
+  `QueueWorker` exists; `task_queue`/`task_attempts` persistence, lease ownership
+  (`locked_by`, `locked_at`, `lease_expires_at`) and fencing
+  (`claim_next_task`, `finalize_task`, `schedule_task_retry`,
+  `requeue_expired_tasks`, `fail_exhausted_tasks`) exist; task-attempt retry and
+  backoff exist; approval (`park_task_for_approval`, `resume_approved_task`,
+  `reject_task_for_rejected_approval`) and spend planes exist; and there is **no
+  AOS intent reader, no AOS receipt writer, no U-W2.R adapter, no checkpoint
+  machinery, no compensation machinery and no cancellation implementation** —
+  zero matches for `work_spec`, `agentic_os`, `checkpoint` or `cancel` across
+  `libs/`, `services/` and `agents/`, and `TASK_STATUSES` is
+  `pending, running, succeeded, failed, rejected, requires_approval` with
+  `ck_task_queue_status` admitting nothing else. **What is absent is the AOS
+  intent/receipt translation adapter — not the worker.** The superseded
+  "no worker" claim is not repeated anywhere in this freeze.
+
+- **D-v0.4.104 — transition-policy version 2 is a fourteen-state matrix with
+  thirty-five active edges and zero reserved edges; policy v1's thirteen-state
+  tuple and 13×13 table are frozen verbatim as history; `partial`/`unknown` are
+  deliberately NOT activated; and adoption of v2 is GATED, never unconditional.**
+
+  `TRANSITION_POLICY_VERSION = 2`, `SUPPORTED_POLICY_VERSIONS = (1, 2)`.
+  `_POLICY_MATRICES` carries `(version, state tuple, matrix)` triples so every
+  lookup indexes with its own version's states and a v1 event can never
+  re-derive under v2 rules — the `_V2_MEMORY_CLAIM_DDL` frozen-history trade,
+  applied to policy data exactly as U-W2 §15 requires.
+
+  All **three** reserved edges activate, and the count is three, not two:
+  `running → compensating` (`res:compensable`), `compensating → compensated`
+  (`cmp:applied`), and `compensating → failed` (`cmp:failed` / `rcp:failed`) —
+  the last being the one edge a v1 caller could attempt, which is why
+  `transition_reserved` stays reachable for policy-v1 snapshots and is never
+  emitted for a v2 one. `compensating → cancelled` remains illegal in every
+  frozen version, verbatim.
+
+  Ten new edges: five `* → retrying` (from `scheduled`, `running`,
+  `waiting_input`, `waiting_approval`, `paused`), `retrying → scheduled`,
+  `retrying → cancelled`, plus the three activations. v2's active-edge set is a
+  **strict superset** of v1's — every v1 edge survives with the same driver —
+  asserted cell by cell. That property establishes exactly one thing, and the
+  earlier draft of this decision over-claimed from it: the superset makes
+  adoption **transition-safe**, meaning no move that was legal under v1 becomes
+  illegal under v2. It says **nothing** about the attempt ledger, which is a
+  second and independent obligation, so "adoption is always safe" is withdrawn
+  and replaced by the gate below.
+
+  **`partial` and `unknown` are not activated.** §5.3 reserved the
+  reinterpretation to v2; it did not require v2 to exercise it. They are honest
+  statements of ignorance, U-W3 cannot know what was partially done, and
+  retrying partial non-idempotent work is exactly the hazard U-W1's
+  `retry_idempotency_incompatible` lint exists to flag. Turning a producer's
+  uncertainty into an AOS claim about the world is the one thing this
+  architecture never does. They still refuse `result_outcome_inconclusive` and
+  mutate nothing; reinterpreting them later is a declared replan trigger.
+  U-W2 §12.2's forward-looking wording that policy v2 "will widen"
+  `partial`/`unknown` handling is explicitly and narrowly superseded (contract
+  §1.2 row S15): v2 activates neither, both remain refused, activating either
+  requires a governed replan, and no other §12.2 behavior is superseded by that
+  row.
+
+  **The fourteenth state, `retrying`, is mechanically forced, not a naming
+  preference.** A workflow whose attempt N failed retryably with attempts
+  remaining cannot be `failed` (terminal, structurally immutable), cannot be
+  `running` (it would claim a live runtime task that does not exist), and cannot
+  be `validated` — because the landed `workflows` DDL carries
+  `CHECK (runtime_task_uuid IS NULL OR state NOT IN ('compiled','validated','awaiting_approval'))`,
+  so storing it as `validated` requires destroying the only record of which
+  runtime task attempt N was. Reusing `validated` would also re-open
+  `request_approval` mid-retry and conflate "never attempted" with "attempt 1
+  failed". `retrying` is added under §15's additive rule: new policy version,
+  widened storage CHECK via a migration, frozen retention of v1's table.
+
+  A workflow's policy version is fixed at admission and is moved only by an
+  explicit, forward-only, non-terminal-only `adopt_policy_version` command that
+  changes no state, appends one `policy_version_adopted` event carrying both
+  versions, and consumes one revision. Without it every landed v1 workflow would
+  be permanently un-retryable, because the identity is derived from the WorkSpec
+  digest and re-admission refuses `workflow_exists`; with a silent upgrade
+  instead, the ledger would rewrite what a workflow was decided under. There is
+  no downgrade, no `--force`, no batch adopt and no implicit adoption inside any
+  other verb.
+
+  **Adoption is additionally gated by a three-condition safety predicate**
+  (contract §5.2.1), because policy v2 decides retry, checkpoint, restore and
+  compensation against an authoritative record of which attempt is open, which
+  runtime task it bound and how many attempts are used — a record policy v1
+  never kept. Adoption is permitted only when the workflow **(A1)** is
+  pre-dispatch **as folded** — `runtime_task_uuid` NULL, `attempts_used` 0, no
+  `workflow_attempts` row, and no outstanding `dispatch_intent_id`, so nothing is
+  reserved-and-pending, opened or consumed (a *revoked* or *rejected* dispatch
+  materialised nothing and `fold` clears the binding, so it leaves the workflow
+  pre-dispatch again); or **(A2)** is terminal and can consume no further
+  attempt; or **(A3)** already carries complete, internally consistent policy-v2
+  `workflow_attempts` history. Anything else refuses
+  `policy_version_not_upgradable` — no new code, the existing policy-adoption
+  vocabulary.
+
+  The refusal this creates is deliberate and is the point of the correction: a
+  **landed policy-v1 workflow in an active post-dispatch state must refuse
+  adoption when authoritative workflow-attempt history is absent** — `scheduled`,
+  `running`, `waiting_input`, `waiting_approval`, `paused`, and for totality
+  `retrying` and `compensating`, which no v1 workflow can reach because
+  `retrying` is not in the v1 state tuple and no v1 driver targeted
+  `compensating`. Adopting there would fold `attempts_used` to 0 for work already
+  performed, renumber the next dispatch as attempt 1, orphan the live runtime
+  task, and leave every attempt-fenced fact refusing with no honest way forward.
+  Under the shipped `SUPPORTED_POLICY_VERSIONS = (1, 2)`, A1 is the only live
+  path: A2 is stated for totality but is reached by nothing, since the landed
+  non-terminal conjunct refuses first with `workflow_terminal`; and A3 is
+  unreachable, since attempt rows exist only under v2 and there is no forward
+  step out of 2 — which is also why the predicate needs no stored-row judgment
+  and no new `ShellFacts` member.
+
+  **Nothing may be manufactured to satisfy it.** `workflow_attempts` rows are
+  never synthesized from historical events, and `attempt_no` is never inferred
+  from event sequence, receipt sequence, `runtime_task_uuid` or current workflow
+  state. A v1 history records that a dispatch was accepted; it does not record
+  which ordinal that acceptance was, and no arithmetic recovers what was never
+  written. The operator's path is `revoke-dispatch` then adopt for an outstanding
+  reservation, and — for a workflow that already consumed an attempt — running to
+  a terminal state under v1 and admitting new work as a new WorkSpec.
+
+- **D-v0.4.105 — a workflow attempt is RESERVED at an accepted dispatch and
+  CONSUMED only at an observed acceptance; the failed receipt that closes an
+  attempt must carry that attempt's own runtime-task binding; one runtime task
+  can never serve two attempts of one workflow; and the WorkSpec-vs-runtime
+  budget divergence is declared and refused, never reconciled.**
+
+  Reservation records `attempt_no = attempts_used + 1` and the budget in the
+  `dispatch_requested` payload and emits the intent, but creates no
+  `workflow_attempts` row and consumes nothing. The `accepted` receipt inserts
+  the row (`state='open'`, `runtime_task_uuid`, `opened_seq`) and sets
+  `attempts_used := attempt_no`. A `rejected` or `revoked` dispatch materialises
+  nothing, so a re-dispatch reuses the same ordinal with a new `intent_id` and a
+  new `idempotency_key`.
+
+  Two reasons, both mechanical rather than stylistic. Burning a budget slot on a
+  queue rejection would permanently strand a default-budget-1 workflow on a
+  single adapter error. And assigning at acceptance is what keeps
+  `attempt_no ≤ budget ≤ 10` always true, which is what makes the reported
+  `attempt` satisfiable against `beast.result-envelope/v1`'s
+  `{"minimum": 1, "maximum": 10}` — a monotone never-reused ordinal would not be.
+
+  The four attempt-row states are `open`, `succeeded`, `failed`, `abandoned`;
+  at most one row per workflow is `open`, and the biconditional
+  `CHECK ((state = 'open') = (closed_seq IS NULL))` makes both halves of the
+  contradiction unstorable. The row receives exactly two writes: the opening
+  INSERT and one compare-and-swap fenced on `state = 'open'` with a required
+  rowcount of 1 — the `_close_intent` discipline, so a second close is
+  impossible and no reverse transition exists.
+
+  **The budget divergence.** The WorkSpec defaults `max_attempts` to 1; the
+  private runtime's `TaskQueueRecord` defaults it to 3. With U-W2.R absent
+  nothing transports the artifact's value into `task_queue.max_attempts` — a
+  human does, or does not. Frozen: AOS's budget is the artifact's, always; the
+  v2 dispatch intent states `attempt_no` and `attempt_budget` explicitly so a
+  human enqueuer has the number in front of them; AOS never asserts, checks or
+  repairs the runtime row; a result reporting `attempt != open attempt_no`
+  refuses `attempt_mismatch` and one reporting `attempt > budget` refuses the
+  landed `result_attempt_exceeded`; nothing is recorded, no attempt is
+  renumbered, no budget is widened, and the workflow parks for a human. **No
+  automatic repair may fabricate authority or evidence.** This makes U-W2 §22's
+  declared limitation stricter under v2, not looser, and that is deliberate: an
+  attempt number that names nothing is not accounting.
+
+  Two bindings close the attempt ledger. First, a `failed` receipt participates
+  in the ledger only as the attempt it closes: whether it closes the open
+  attempt, consumes it, drives retry classification, or concludes a
+  compensation, it must carry `runtime_task_uuid` equal to the
+  `workflow_attempts.runtime_task_uuid` binding recorded for that attempt — a
+  receipt that binds no attempt of this workflow refuses `receipt_unbound`, one
+  that names a different attempt's task refuses `runtime_uuid_mismatch`, both
+  landed codes; the receipt record shape, the nine kinds and every database
+  CHECK are unchanged, and policy-v1 replay stays unchanged and permissive for
+  historical rows, because the binding is a policy-v2 acceptance gate, never a
+  replay-time re-judgment. Second, one runtime task is one workflow attempt:
+  `workflow_attempts` carries `UNIQUE(workflow_id, runtime_task_uuid)` — the
+  column is NOT NULL, a row existing only because an `accepted` receipt
+  supplied the binding, so NULL-distinct UNIQUE semantics never arise — and an
+  `accepted` receipt offering a uuid already bound to a prior attempt of the
+  same workflow refuses `runtime_uuid_mismatch` before anything is stored, the
+  check made against the folded `dispatch_accepted` history so it is
+  event-authoritative.
+
+  **`dispatch_accepted` version compatibility, frozen**, because that event is
+  the one landed name whose new member is load-bearing for this ledger. Under
+  policy v2 `attempt_no` is **mandatory**: a v2 `dispatch_accepted` that could
+  not carry it is not written at all. Under historical policy-v1 replay it may be
+  **absent**, and that absence is correct, complete history — v1 never numbered
+  workflow attempts — so the required-member set for this event is
+  policy-version conditional. `fold` therefore reads the member through an
+  explicit presence check and never `payload["attempt_no"]`: a v1
+  `dispatch_accepted` binds the runtime task, moves the state, advances no
+  counter, opens no attempt, and raises no `KeyError`, so a v1 history folds
+  forever. An **absent** `attempt_no` under policy v2 refuses, using the existing
+  policy-adoption and attempt-binding vocabulary — `receipt_unbound` for an
+  acceptance with no recorded v2 reservation to number it,
+  `policy_version_not_upgradable` for the adoption that would have created the
+  situation — and **no value is fabricated**: not from event sequence, receipt
+  sequence, `runtime_task_uuid`, current state, or a count of prior acceptances.
+  No `workflow_attempts` row is ever synthesized from historical events either.
+  A refusal that names the gap is worth more than an ordinal that names nothing.
+
+- **D-v0.4.106 — retry identity reuses every landed derivation formula
+  unchanged, and retry is distinguished from six things it is not.**
+
+  D-v0.4.91's definition governs verbatim: U-W3 retry is re-execution of work
+  that advances an attempt counter, is bounded by `retry.max_attempts`, and
+  changes what the workflow claims about the world. U-W3 introduces **no new
+  derivation formula**: `intent_id` stays
+  `uuid8(sha256(TAG_INTENT ‖ 0x00 ‖ "<work_spec_sha256>:<intent_seq>"))` and the
+  idempotency key stays `"wfd-" + sha256(TAG_DISPATCH_IDEM ‖ …).hex()[:40]`,
+  both keyed on the per-workflow `intent_seq`.
+
+  Because `intent_seq` advances, attempt 2 derives a different idempotency key
+  and the runtime's `task_queue.idempotency_key UNIQUE` therefore admits it as a
+  genuinely new task row. That is correct — a retry *is* a new runtime task —
+  and it is exactly the situation that must never become invisible. Three
+  defences: the v2 dispatch intent carries `attempt_no` and `attempt_budget` as
+  required members, so a second file announces itself as "attempt 2 of N"; it
+  carries `supersedes_runtime_task_uuid` whenever a prior attempt bound one, so
+  the chain is readable from the files alone; and `workflow_attempts` records
+  exactly one runtime task per consumed attempt, so a task AOS never accepted
+  has no attempt row and reads as an orphan. Retry classification is
+  attempt-fenced: the failing fact that parks a workflow in `retrying` — or
+  exhausts its budget — must first bind the attempt it closes, an envelope
+  through `attempt` equal to the open `attempt_no`, a `failed` receipt through
+  `runtime_task_uuid` equal to that attempt's recorded binding
+  (`receipt_unbound` / `runtime_uuid_mismatch`, per D-v0.4.105). A receipt from
+  a task AOS never accepted for the attempt can therefore neither consume a
+  budget slot nor drive a retry.
+
+  Retry is distinguished, each with an explicit "no attempt, no event, no state
+  change" row, from: SQLite lock waiting (the already-configured `timeout=5.0` +
+  `PRAGMA busy_timeout=5000`, D-v0.4.91); duplicate command replay (the
+  `command_id` axis, which re-verifies the original events under the full §7.2
+  gate before answering); intent redelivery (content-addressed, idempotent, and
+  collapsed runtime-side by `idempotency_key UNIQUE`); receipt redelivery (the
+  `receipt_id` axis); private-runtime task-attempt retry (`attempt_count` plus
+  backoff, invisible to the ledger); and `revision_mismatch`, which forces a new
+  `command_id` and therefore a fresh recorded decision.
+
+- **D-v0.4.107 — "checkpoint" is a different word from "snapshot", and a
+  checkpoint is an append-only, bounded, attempt-bound, opaque document AOS
+  never produces, never interprets and never prints.**
+
+  `aos.workflow-snapshot/v1` stays U-W2.2's derived workflow projection. U-W3's
+  artifact is `aos.workflow-checkpoint/v1`, bounded execution-restoration state
+  produced outside AOS. The two words are never interchanged and U-W3 mints no
+  second "snapshot".
+
+  Frozen: identity is a **producer-supplied** UUID, because AOS mints no
+  identity for a document it did not produce; ledger identity is
+  `(workflow_id, checkpoint_id)`. Binding is fourfold — `workflow_id`,
+  `work_spec_sha256`, the open `attempt_no`, and that attempt's
+  `runtime_task_uuid`. Producer authority is the executing side only. The
+  `payload` is an **opaque canonical object**: AOS validates canonical parse,
+  the spine's bounds, the size limit and the secret scan, and never reads a key.
+  Limits are derived rather than tuned — `MAX_CHECKPOINT_PAYLOAD_BYTES = 65536`
+  is a quarter of `protocols.MAX_ARTIFACT_BYTES`,
+  `MAX_CHECKPOINTS_PER_ATTEMPT = 8`, and `MAX_CHECKPOINTS_PER_WORKFLOW = 80` is
+  `8 × 10`, the per-attempt bound times the protocol's frozen attempt ceiling, so
+  no third number is introduced. The digest is the self-excluding
+  `content_sha256` idiom, **recomputed from stored bytes at every use**.
+
+  The table is **INSERT-ONCE**: no `UPDATE` and no `DELETE` targets it after its
+  creating transaction's own row-hash finalization. An identical redelivery is a
+  `replay`; a same-`checkpoint_id` different body refuses `checkpoint_conflict`;
+  `checkpoint_seq` is monotone from 1 within an attempt. Nothing is ever pruned.
+
+  **A secret-shaped payload is REFUSED at ingest and never stored** — not
+  redacted, because a redacted checkpoint is an unrestorable lie, and not
+  stored-then-warned, because that would put a plaintext credential in `aos.db`.
+  AOS holds no key and neither encrypts nor decrypts; whole-database protection
+  stays the operator's concern, and the scan is a prophylactic rather than a
+  cryptographic guarantee. A corrupt checkpoint is **reported** in
+  `divergent_rows` and made permanently `checkpoint_ineligible`, never repaired,
+  re-sealed or deleted. No checkpoint payload is ever printed — not by `show`,
+  not by `--json`, not in an event payload, not in a refusal, not in the
+  journal.
+
+- **D-v0.4.108 — three different things were all called "resume"; they are
+  separated by fact, by event and by owner, and a `run_resumed` event is never
+  proof that a checkpoint was restored.**
+
+  **A. Queue resumption** is U-W2's landed `resumed` receipt and its
+  `run_resumed` event: it proves the runtime left a wait state, and nothing
+  more. **B. Checkpoint restoration** is U-W3's `aos.workflow-restore-fact/v1`,
+  recorded by `record_restore`, evidenced by a `checkpoint_restored` event that
+  carries `checkpoint_id`, `checkpoint_sha256`, `from_attempt_no`,
+  `into_attempt_no` and `restored_by`. **C. The semantic resume instruction** is
+  `beast.interrupt/v1`'s `kind: "resume_instruction"` and
+  `resume_instruction_ref`, reserved to U-W5 and read by nothing in U-W3.
+
+  Frozen rules: `fold` derives no restoration member from `run_resumed`, no
+  U-W3 predicate reads it as one, and a `resumed` receipt with no preceding
+  `checkpoint_restored` is a wait exit full stop; `checkpoint_restored` changes
+  no state at all; and U-W3 reads no `beast.interrupt/v1` document, imports
+  nothing that parses one, and never dereferences `resume_instruction_ref` —
+  with `interrupt` and `resume` both staying banned tokens in the CLI region.
+
+  A restore is *requested* in the dispatch that opens the next attempt
+  (`request_dispatch`'s v2 payload key `restore_checkpoint_id`, resolved by the
+  store into `ShellFacts` because a pure reducer cannot read a stored row) and
+  *recorded* when the executing side reports it. Eligibility is five conjuncts,
+  all required: the checkpoint belongs to this workflow; its stored digest
+  recomputes; its `attempt_no` is **strictly less** than the attempt being
+  opened; the workflow is under policy v2; and the workflow is non-terminal and
+  in `retrying`, `scheduled` or `running`. Restoration is ineligible in
+  `compensating` and in every terminal state — compensation undoes, it does not
+  resume. Recording is additionally attempt-bound on both ends: the restore
+  fact's `into_attempt_no` must equal the open attempt (`attempt_mismatch`),
+  and its `from_attempt_no` must equal the stored checkpoint's own `attempt_no`
+  (`restore_fact_unbound`) — the checkpoint digest alone is insufficient,
+  because a digest proves which bytes were restored, not which attempt they
+  captured.
+
+- **D-v0.4.109 — compensation authority is a verified result envelope and
+  nothing else; descriptive manifest metadata is never execution authority; and
+  compensation has exactly two terminal outcomes, no retry and no partial
+  record.**
+
+  The reducer was structurally blind to compensation because U-W2 §12.2 gate 4
+  deliberately stored the envelope's `compensation` block verbatim and left it
+  unread. U-W3 reads it, and only it. **Explicitly and mechanically not
+  authority**: `beast.tool-manifest/v1`'s `compensation.strategy =
+  "compensating_action"` and `compensation.ref` (a reversibility *declaration*),
+  its `recovery.action = "invoke_compensation"` (a declared hint, whose sibling
+  `recovery.note` the schema itself calls "display-only prose … never parsed,
+  matched or executed"), its `cancellation`, `idempotency` and `retry`, and
+  U-W1's `retry_idempotency_incompatible` finding. No U-W3 code path reads a
+  tool manifest, a skill manifest, an agent passport, a compile-report finding
+  or a `recovery.action` to decide whether, when or how to compensate, and an
+  AST import scan proves the absence.
+
+  **Declaration versus execution.** `beast.work-spec/v1` has no `compensation`
+  property at all, so a WorkSpec cannot declare compensability; only the
+  executing side can report it. That asymmetry is declared as a known
+  limitation, not papered over by inferring a declaration from a manifest.
+
+  Trigger: `record_result` with `outcome = "fail"` and
+  `compensation.state = "pending"` drives `running → compensating`, emits
+  `compensation_started`, and emits one `compensate` intent — the third
+  `WORKFLOW_INTENT_KINDS` member — carrying the failing result's digest and the
+  envelope's own opaque `compensation.ref` when present, which AOS never
+  dereferences. Entering compensation closes the ledger behind it:
+  `res:compensable` closes the currently open attempt as `failed`, preserving
+  the failing result digest as the authoritative trigger, so `compensating`
+  never holds an open attempt. Compensation **outranks** retry: undoing a
+  partial effect before re-running is the only safe order. `success` +
+  `pending` is `result_inconsistent`; `applied`/`failed` on a first result is
+  `compensation_state_inconsistent`.
+
+  Exactly two terminal outcomes: `compensated` (`cmp:applied`, gated by the same
+  §12.2 counted-evidence predicate as `succeeded`, applied to the compensation
+  envelope — one rule, one existing code, no new vocabulary) or `failed`
+  (`cmp:failed`, or a `failed` receipt), whose event is named
+  `compensation_failed` so "the work failed" and "the undo failed" are never
+  confused in the history. The conclusion is bound to the attempt it concludes:
+  a compensation conclusion envelope's `attempt` is **mandatory and
+  authoritative** — a required property of the shipped
+  `beast.result-envelope/v1` — and must equal the attempt
+  `compensation_started` recorded, the **compensating attempt**; a mismatch
+  refuses `attempt_mismatch`, whose meaning there explicitly names the
+  compensating attempt, not an open one.
+
+  The earlier draft of this decision claimed the envelope "carries no
+  `runtime_task_uuid` member". That is factually wrong and is corrected here:
+  the **shipped** `beast.result-envelope/v1` lists `runtime_task_uuid` among its
+  `properties` and omits it from `required`, so the protocol permits it as an
+  **optional** property. Frozen semantics, reached without touching the
+  protocol: the uuid is **corroborating evidence, never a selector**. When
+  present it must equal the `workflow_attempts` binding for the compensating
+  attempt — in reducer terms the binding folded from that attempt's
+  `dispatch_accepted`, of which the row is the projection — and a present
+  mismatch refuses `runtime_uuid_mismatch`, a landed code, recording nothing.
+  When absent, nothing is refused and nothing is inferred, because an optional
+  property left out is a legal envelope, not a defect. It never selects the
+  attempt, never initiates compensation and never grants execution authority: an
+  envelope carrying a correct uuid and a wrong `attempt` still refuses. And a
+  present mismatching value is **never ignored** — silently dropping evidence
+  that contradicts the ledger is the same failure as accepting evidence
+  fabricated to agree with it. Uuid-level *binding*, the kind that closes an
+  attempt, still exists only on the receipt path (D-v0.4.105); this is a
+  contradiction check, not a second authority, and the same
+  present-must-match / absent-is-fine rule governs the execution-result path so
+  the model carries one rule rather than two.
+
+  There is **no compensation retry** (a failed
+  compensation is terminal), **no partial compensation** (the protocol's enum
+  has no `partial` member; partial undo must be reported `failed`, and a
+  producer that reports `applied` for partial work is making a false claim AOS
+  cannot detect), and **no compensation checkpoint**. Interruption recovers by
+  redelivering the same content-addressed intent file, never by emitting a
+  second intent.
+
+- **D-v0.4.110 — schema version 7 is two new tables plus four rebuilt closed
+  enums; `workflow_facts` and `workflow_receipts` are byte-untouched and U-W3
+  adds no fact kind; and the frozen-v6-DDL obligation the 5→6 step wrote down
+  fires in full.**
+
+  `workflow_attempts` and `workflow_checkpoints` are new; `workflow_attempts`
+  additionally carries `UNIQUE(workflow_id, runtime_task_uuid)`, so one runtime
+  task can never be stored as two attempts of the same workflow — the storage
+  backstop for D-v0.4.105's acceptance gate, with no NULL ambiguity because the
+  column is NOT NULL. `workflows`,
+  `workflow_events`, `workflow_commands` and `workflow_intents` are rebuilt
+  because SQLite cannot ALTER a CHECK and each carries a closed enum that must
+  widen (`retrying`; the seven new event names; the four new verbs;
+  `compensate`). Rows are copied **verbatim** with `content_sha256` carried
+  across untouched, so every landed row hash and every sealed event digest stays
+  valid by construction. `workflows`' `runtime_task_uuid` CHECK is deliberately
+  left alone — `retrying` is absent from its exclusion list, which is precisely
+  what lets a retrying workflow keep the runtime binding of its failed attempt.
+
+  **No new fact kind.** A compensation conclusion *is* a
+  `beast.result-envelope/v1`, so it is stored by the existing path as
+  `fact_kind = 'result'`, and the `compensation_applied`/`compensation_failed`
+  event's `result_sha256` identifies which stored body it is — D-v0.4.86's own
+  "the event is the authoritative fact; the table holds the body the event
+  records only by digest". `UNIQUE(workflow_id, 'result', document_sha256)`
+  admits both bodies because their digests differ. Widening `fact_kind` would
+  force a rebuild of a table U-W3 otherwise never touches and buy nothing the
+  digest join does not already give. A restore fact needs no stored body either:
+  every member the event does not already carry is a digest or a validated
+  identifier, which U-W2 §7 permits in a payload.
+
+  The 6→7 step rebuilds four tables and creates two **empty** ones directly
+  under their real names; it reads no clock, stamps no row, derives nothing, and
+  invents no attempt or checkpoint for any pre-existing workflow. The two new
+  tables are therefore **byte-identical** fresh-vs-migrated; the four rebuilt
+  ones are **structurally identical**, the same distinction D-v0.3.43 drew for
+  `memory` and `agents`.
+
+  `migrations._workflow_state_v6`'s docstring states the transfer rule — "A
+  future unit that edits `db.WORKFLOW_TABLES` inherits the obligation to freeze a
+  `_V6_WORKFLOW_*` copy here, exactly as `_V2_MEMORY_CLAIM_DDL` did" — and U-W3
+  edits that tuple, so it fires. The freeze must cover **all six** v6 DDL texts,
+  not only the four U-W3 amends, because the 5→6 step iterates the whole tuple
+  and a partial freeze would still let it build v7-shaped `receipts`/`facts`
+  tables and stamp `schema_version = 6`. `tests/fixtures/**` need **no edit**:
+  all three fixtures drop the workflow tables by iterating
+  `db.WORKFLOW_TABLES` in reverse and say so explicitly, so an eighth table is
+  picked up automatically, children first.
+
+- **D-v0.4.111 — the retry attempt ceiling of 10 remains normative in all five
+  live places, and no protocol schema widens; the intent record gets a `/v2`
+  and the private snapshot does not.**
+
+  `10` stays exactly as shipped in `beast.work-spec/v1.retry.max_attempts`,
+  `beast.result-envelope/v1.attempt`, `beast.tool-manifest/v1.retry.max_attempts`,
+  `workspecs._check_retry` and `governance.validate_execution_context`. U-W3
+  introduces **no sixth ceiling constant**: the reducer bounds `attempt_no` by
+  the artifact's own budget, which admission already proved is ≤ 10, and the
+  storage `CHECK (attempt_no BETWEEN 1 AND 10)` restates the protocol's number
+  rather than inventing one. `protocols/**` and `agentic_os/protocols.py` are
+  byte-unchanged and `tools/gen_protocols.py` must leave the tree clean.
+  Changing 10 anywhere requires an explicit protocol compatibility decision, a
+  `registry_version` bump and a new schema `/vN` — a replan trigger, never a
+  silent widening.
+
+  Among the `aos.*` internal records — which U-W2 §13.4 deliberately keeps out
+  of the U-X1 registry — `aos.workflow-queue-intent` advances to `/v2` while
+  `aos.workflow-snapshot` stays `/v1` despite gaining members. The distinction is
+  not convenience: the intent is the one record that **crosses the trust boundary
+  as a file** and that U-W2 §18 requires U-W2.R to pin by content hash, so
+  changing its accepted member set is exactly what a version number announces;
+  the snapshot never leaves the process that built it, has one producer and one
+  consumer inside this repository, and is re-derived on every command. v1 intents
+  keep being emitted for v1 workflows and keep being read forever.
+  `aos.workflow-checkpoint/v1`, `aos.workflow-restore-fact/v1` and the two new
+  `*-row/v1` hash identities are new; the nine receipt kinds stay frozen and
+  U-W3 adds none.
+
+- **D-v0.4.112 — U-W3 adds four flat leaves to the existing `aos workflow`
+  group (seventeen total) and no retry leaf; SIX U-W2.3 test rows are
+  superseded and exactly two are narrowed, with thirteen of C26's fifteen
+  tokens kept region-wide and the exemption closed at SEVEN named functions.**
+
+  Not a nested group: `power._PATH_DESTS` is
+  `("command", "subcommand", "subsubcommand")`, so a third level would change how
+  every leaf-path predicate in `tests/test_v02_power_modes.py` and U-W2.3 C1
+  reads. Not "no CLI": with U-W2.R absent the CLI is the only way a record
+  crosses the boundary, so a U-W3 with no CLI would be architecture nobody could
+  run. The four are `adopt-policy`, `checkpoint`, `restore` and `compensate`,
+  all `authoritative_write, ledger`, giving 13 / 3 / 1 across seventeen leaves
+  and four new `RecoveryTests.BLOCKED` rows.
+
+  **There is no retry leaf, deliberately**: a retry *is* `workflow dispatch`
+  issued from `retrying`, and the existing leaf gains one optional
+  `--restore CHECKPOINT_ID`. A second verb for a dispatch would create two ways
+  to do one thing and would put the token `retry` into the CLI region for no
+  gain. All four new leaves reuse the landed `_workflow_write` shell verbatim, so
+  there is still **exactly one `workflow_store.submit(` call site**, and the
+  region still calls exactly the same six store functions with `rebuild` still
+  absent — `verify` covers the two new tables internally and reports through the
+  existing `divergent_rows` tuple, so no `VerifyReport` field and no read
+  function is added.
+
+  Superseded, exactly **six** rows: C1 (thirteen leaves → seventeen), C2 (9/3/1
+  → 13/3/1), C3 (four option rows plus `--restore`), C5 (`len(WORKFLOW_STATES)`
+  13 → 14), **C10** (`len(record_fields)` 20 → **25**), and C11 (ten `BLOCKED`
+  rows → fourteen). C10 was missed in the first accounting and is added here as
+  a mechanical consequence, not a new decision: the landed CLI test pins the
+  `show --json` / `list --json` projection at twenty fields, and the five
+  already-frozen `WorkflowRecord` additions — `attempt_no`, `attempt_state`,
+  `attempts_used`, `attempt_budget`, `checkpoint_count` — make the correct total
+  twenty-five. **The `WorkflowRecord` shape itself is unchanged**; only the count
+  the landed test pinned moves, and everything else in C10 is re-asserted
+  verbatim. The supersession is carried in the contract's §1.2 row S10 and in the
+  §13.5 disposition table.
+
+  Narrowed, exactly two rows: C22, in exactly one place — its `_region_nodes()`
+  floor `>= 13` → `>= 17`, carried explicitly in the contract's supersession
+  table as row S14 — with everything else in C22 re-asserted unchanged; and C26.
+  **C26 is narrowed, not repealed**: its landed forbidden-token list is fifteen
+  tokens, of which thirteen stay banned across the whole region —
+  `ai-company-runtime`, `postgres`, `psycopg`, `lease`, `heartbeat`, `worker`,
+  `temporal`, `monitor`, `interrupt`, `.claude`, `aos.db`, **`resume`** and
+  **`retry`**; `resume` because U-W3's verb is `restore`, `retry` because there
+  is no retry leaf — and only the remaining two, `checkpoint` and `compensat`,
+  become permitted, inside exactly **seven** enumerated functions:
+  `cmd_workflow_checkpoint`, `cmd_workflow_restore`, `cmd_workflow_compensate`,
+  `cmd_workflow_adopt_policy`, `_build_workflow_parser`, and — added here to
+  close an exemption the first accounting left short — **`cmd_workflow_dispatch`**
+  and **`cmd_workflow_show`**. `cmd_workflow_dispatch` builds the
+  `request_dispatch` payload whose policy-v2 key is literally
+  `restore_checkpoint_id`, so the token is in a frozen payload key and no
+  synonym may be invented for it; `cmd_workflow_show` renders the human record,
+  one of whose five new aligned label lines reports the checkpoint count from a
+  literal tuple inside that function. Every other function in the workflow CLI
+  region — the eleven remaining landed handlers and every helper — retains both
+  prohibitions in full, and `temporal`, `worker`, `postgres`, `lease`,
+  `heartbeat`, private-runtime implementation, durable-engine implementation and
+  unrelated queue machinery stay prohibited outside their existing authorised
+  boundaries. A test asserts the exemption set is exactly those seven names, so
+  it can drift neither by addition nor by omission, and **no CLI leaf is added**
+  to reach seven — the count stays four new and seventeen total. An **eighth**
+  function needing one of the two exempted tokens is replan trigger 10.
+
+- **D-v0.4.113 — `agentic_os/governance.py` is NOT modified, so its historical
+  outer-attempt-loop docstring is superseded in place rather than retouched, and
+  the U-K1/U-T1 contract stays byte-unchanged.**
+
+  Two live sentences say the outer attempt loop "is U-W1's": the
+  `governance.invoke()` docstring and U-K1/U-T1 §0.2 / D-v0.4.56. U-W1 §2.2
+  already froze the binding meaning — "runtime looping is U-W3's" — and stated
+  the retouch rule exactly: the docstring "is prose inside
+  `agentic_os/governance.py`, which is outside this unit's file boundary; it is
+  superseded by D-v0.4.59 and **may be retouched only by a unit that already
+  modifies that file**."
+
+  U-W3 does not modify that file and has no functional need to: it executes
+  nothing, calls `governance.invoke()` nowhere, touches no `BindingRegistry` and
+  reads no `InvocationResult`. Manufacturing a reason to modify it in order to
+  unlock the edit would be exactly the escape hatch U-W2 amendment §A.9
+  rejected, and retouching the landed U-K1/U-T1 contract to fix an attribution
+  is unrelated documentation cleanup, which this unit's scope excludes.
+
+  The authoritative interpretation, recorded here and nowhere else: the outer
+  attempt loop is U-W3's, and it is not a loop at all — it is a sequence of
+  separately-decided, separately-recorded workflow attempts, each opened by an
+  accepted command and closed by a verified external fact, with no `while`
+  anywhere in the unit. `governance.invoke()` remains single-attempt and
+  byte-unchanged; its parenthetical `(U-W1)` misattributes the owner but does not
+  misstate the behavior, which is "at most one attempt, no hidden retry" — true
+  under every reading. The retouch obligation transfers unchanged to the first
+  future unit that already modifies `governance.py` for a functional reason.
+
+- **D-v0.4.114 — the crash matrix is twenty-one forced points, and no automatic
+  repair may fabricate authority or evidence.**
+
+  Every point below the commit boundary rolls back whole, because
+  `db.transaction`'s `with conn:` rolls back on any exception and U-W3 adds no
+  exception handling of its own around it. The twenty-one points cover: before
+  reservation; after reservation before dispatch; after dispatch before
+  acknowledgement; after acknowledgement before runtime completion; after failure
+  before the retry decision; after the retry decision before redispatch; after a
+  checkpoint write; checkpoint corruption; a stale checkpoint; a duplicate
+  checkpoint; a duplicate id with a different body; resume before restore;
+  restore before the resumed event; compensation start; compensation partially
+  applied; compensation completed before its record reached AOS; a duplicate
+  compensation record; attempt-budget exhaustion; projection divergence; a
+  policy-adoption crash; and a 6→7 schema-migration interruption. The
+  twenty-first is answered by ownership rather than by policy: the migration
+  runs inside the U-M1 transaction framework, which owns atomicity — a
+  mid-step crash rolls back the whole migration, `schema_version` is stamped
+  only after the complete step succeeds, and no partial v7 schema is ever
+  accepted.
+
+  Three of them are answered by refusing to invent a policy rather than by
+  machinery: a **stale** checkpoint is permitted because AOS has no clock with
+  which to judge recency and refuses to invent one; **partial compensation** is
+  undetectable and is therefore declared rather than guessed at; and a
+  **completed-but-unreported** compensation leaves the workflow waiting, because
+  inferring the act from its absence would be the fabrication this decision
+  forbids. U-W3 contains no repair path, no re-seal, no re-stamp, no `--force`
+  and no `--repair`; every recovery is a no-op, a refusal, or a human act —
+  usually restoring a verified backup, per RECOVERY.md.
+
+- **D-v0.4.115 — the exact implementation boundary is the closed twenty-one-path
+  set, eleven of which are mechanically forced existing test files; the delivery
+  identity is adopted unchanged.**
+
+  Seven production paths (`workflow_engine.py`, `workflow_store.py`, `db.py`,
+  `migrations.py`, `cli.py`, `power.py`, `README.md`), one new focused test
+  (`tests/test_v04_workflow_recovery.py`, rows W1–W30), eleven forced existing
+  test edits, and two architecture documents. The eleven were **measured, not
+  estimated**: a `SCHEMA_VERSION` bump to `"7"` mechanically forces edits in
+  `test_core.py`, `test_v02_migrations.py`, `test_v02_power_modes.py`,
+  `test_v03_memory_claims.py`, `test_v03_memory_graph.py`,
+  `test_v04_agent_catalog.py`, `test_v04_agent_passports.py` and
+  `test_v04_routing_handoffs.py`; the superseded vocabulary and CLI rows force
+  `test_v04_workflow_engine.py` and `test_v04_workflow_cli.py`; and
+  `test_v04_workflow_store.py` is forced on several axes at once. That file
+  stays **inside** the twenty-one-path boundary, and its licensed edit class is
+  closed to exactly eleven mechanically forced changes, written out rather than
+  described: the hand-transcribed **state**, **event** and **command**
+  vocabularies; its **`CONTRACT_COLUMNS`**, **`NO_DEFAULT_COLUMNS`** and
+  **tamper-corpus** entries for the two new tables; the one
+  **`AdmissionFacts`→`ShellFacts`** construction touch; the **version**,
+  **table-count** and **migration-chain** literals; **`_TABLE_CONSTANTS`
+  additions** for `workflow_attempts` and `workflow_checkpoints`, so the
+  SQL-interpolation scan keeps admitting exactly the frozen `db.py` table-name
+  constants and nothing else; the **policy-v2 updates inside
+  `test_engine_vocabularies_are_unchanged_and_unshadowed`** — intent kinds 2→3,
+  refusal reasons 43→57, policy version 1→2, supported versions `(1,)`→`(1, 2)`,
+  matrix dimension 13→14 — together with the **zero-reserved-edge** assertions
+  that replace the `("reserved",)` expectation for `running → compensating`,
+  **while policy-v1 replay coverage is preserved**: the frozen v1 tuple and
+  matrix stay asserted, and a v1 snapshot still refuses `transition_reserved` on
+  `compensating → failed`; and the **fresh-versus-migrated SQL equivalence**
+  assertions.
+
+  That last class is a **narrow supersession**, declared as contract §1.2 row
+  S16, and not a weakening of unrelated migration integrity. `workflow_facts`
+  and `workflow_receipts` stay **byte-identical** fresh-vs-migrated because U-W3
+  never rebuilds them, and so do the two new tables, created directly under
+  their real names. The four **rebuilt** tables — `workflows`,
+  `workflow_events`, `workflow_commands`, `workflow_intents` — require
+  **structural equivalence** instead, because `ALTER TABLE … RENAME` can requote
+  an identifier the original `CREATE TABLE` did not, so raw `CREATE TABLE` text
+  is not required to be byte-identical for those four. Structural equivalence is
+  not a softer synonym for the same thing: it is a seven-way comparison covering
+  table identity, columns and their ordering, defaults, CHECK behavior, foreign
+  keys, indexes and uniqueness. Exactly one landed assertion —
+  `test_fresh_and_migrated_sql_is_byte_identical_for_the_six_tables` — is
+  narrowed; every row copy, row hash, event digest, frozen-v6 byte comparison
+  and fixture assertion stands unchanged.
+
+  Nothing else in that file may be edited: no assertion deleted, no `subTest`
+  dropped, no tamper case weakened, no bound loosened. The licence does **not**
+  authorise a twelfth existing test path — that stays replan trigger 14, and the
+  forced set stays eleven files. This is the third consecutive unit to meet the
+  same class of mechanical necessity (U-W2.2's A1, U-W2.3's A3), and it is
+  declared up front here rather than discovered by an auditor. The licence is
+  **not standing**: a future unit meeting it needs its own governed decision.
+
+  There is no migration file, no `migrations/` directory and no SQL file — this
+  repository has never had one and U-W3 introduces none; the DDL lives in
+  `db.py` and the step in `migrations.py`. `tests/fixtures/**`,
+  `agentic_os/governance.py`, `agentic_os/protocols.py`, `protocols/**`,
+  `agentic_os/workspecs.py`, `agentic_os/ids.py`, `agentic_os/events.py`,
+  `tools/**`, `.github/workflows/ci.yml`, `pyproject.toml`,
+  `AGENTIC_OS_BLUEPRINT.md`, every landed contract and
+  `/home/daksh/Projects/AICompany` are all deliberately unchanged, each with a
+  stated reason. A twenty-second path is
+  `FAIL — GOVERNED REPLAN REQUIRED`, not a quiet extension, and fifteen replan
+  triggers are enumerated so the boundary is falsifiable rather than aspirational.
+
+  Every provisional delivery identity is adopted unchanged, because no
+  repository evidence proves any of them incompatible: branch
+  `v0.4-u-w3-runtime-recovery`; contract
+  `agentic-os-v0.4-u-w3-runtime-recovery-contract.md`; architecture commit
+  `docs(v0.4): freeze U-W3 runtime recovery architecture`; implementation commit
+  `feat(v0.4): add workflow retry, checkpoints, resume, and compensation`; PR
+  title `feat(v0.4): U-W3 workflow runtime recovery`; milestone
+  `milestone/v0.4-u-w3-runtime-recovery`. Two ordered commits inside one PR
+  through the U-P2 gate, documentation first (the D-v0.4.50 landing model,
+  applied a fourth time), the tag after the merge and never before. Wave 0
+  stages nothing, commits nothing and pushes nothing; it writes exactly
+  `DECISIONS.md` and the contract.
+
+- **D-v0.4.116 — the hard audit and the adversarial verification that followed
+  it found twenty-eight bounded defect groups; all twenty-eight are
+  repaired inside the two architecture paths, and the one that mattered most
+  was a documentation decision that would have bricked every pre-migration
+  workflow.**
+
+  The audit that preceded the implementation wave reproduced every U-W3 claim
+  against the live tree and against `fef0c2b`; the verification that followed
+  it attacked the shipped code. Twenty-eight corrections are recorded as §22
+  A1 … A28 of the contract — A1 … A22 from the architecture audit, A23 … A26
+  from implementing it, and A27 … A28 from attacking the result. None adds a repository path, a
+  twelfth existing test file, a state, a policy version, a table, a CLI leaf or
+  a protocol change, so none is a §21 replan trigger.
+
+  Four came out of the implementation itself and are worth naming, because
+  each was a place where the architecture had described a behavior the landed
+  code does not have. **A23**: §14 row 19 claimed a planted attempt-row hash
+  makes mutating commands refuse; it does not, because the per-command gate is
+  the snapshot-and-history comparison and row hashes are deliberately outside
+  it — which is precisely what the integrity-scope sentence `show` and `list`
+  print tells every operator. Widening that gate would have been U-W3 quietly
+  taking ownership of a landed boundary. **A24**: §6.2 made
+  `runtime_task_uuid` mandatory on a `failed` receipt, which the frozen receipt
+  shape does not require and the landed CHECK admits as NULL — the landed
+  hostile-path tests emit exactly such a receipt, and they started failing the
+  moment the rule was implemented. The fix collapses two rules into one: a
+  present corroborating uuid must match, an absent one refuses nothing,
+  everywhere in the unit. It loses nothing, because at most one attempt is ever
+  open and the LEDGER decides which attempt a receipt closes. **A25**: the
+  U-W2 README paragraph's five counts go stale and are deliberately not
+  repaired, because path 7 licenses one new section and no other region; the
+  U-W3 section states the superseding numbers and says which they supersede.
+  **A26**: §17.8's focused-gate command form never worked for seven of
+  the twelve modules, each importing a sibling under `tests/` without a path
+  insert — true at `fef0c2b` too, so U-W3 states the working form and names the
+  missing module for each, rather than editing seven test files outside their
+  licences. The first draft of this correction said five, then six; it is
+  recorded here as the MEASURED seven, because a correction that is itself
+  estimated is not a correction.
+
+  The verification round then attacked the shipped code and found six more,
+  recorded as A27. One was serious: a spliced event carrying a U-W3 name but
+  stamped `policy_version: 1` skipped its own required-payload row — the row
+  applies at version 2 and up — so `verify_history` CERTIFIED it and `fold`
+  then raised a raw `KeyError` that escaped `verify`, `read_workflow` and every
+  mutating command. The version axis had only half of itself: it said which
+  members a version requires, and not which event NAMES a version has at all.
+  An event whose name did not exist at its own stamped version is now
+  `history_corrupt`, refused before it is ever folded. The remaining five are
+  smaller and are listed in A27; the one worth repeating is that the
+  seven-function token exemption over-permits by two — only five functions
+  actually carry a narrowly exempted token — so the measured carrier set is now
+  asserted exactly in both directions while the frozen seven stay the ceiling
+  an eighth would breach.
+
+  **A28 is the one worth learning from, because the first pass created it.**
+  The eight version-literal licences name each file's literal in the singular
+  — "the one `db.SCHEMA_VERSION` literal", "the two `"6"` literals" — and four
+  files carry SIBLING occurrences of the same fact that the cells do not
+  enumerate. Eleven stale assertions survived the first pass, every one a real
+  failing test. One was worse than stale: a chain row inserted into an
+  `assertEqual(actual, expected)` call became a THIRD positional argument,
+  which `assertEqual` accepts as the failure MESSAGE — so the test passed while
+  comparing nothing about the new step. A green test that verifies less than it
+  claims is exactly what §17.3's no-weakening rule exists to prevent, and the
+  mechanism was not a deletion but a well-formed call that quietly stopped
+  comparing. The discipline that catches this class is a tree-wide sweep for
+  the FACT — every schema-shaped literal, chain row and count — run after the
+  named edits and again after the repair; reading the diff does not find it,
+  because nothing in the diff looks wrong.
+
+  **A1 is the load-bearing one.** §12.3 justified keeping the snapshot record
+  at `/v1` while widening its member set, on the true but irrelevant ground
+  that the snapshot "never leaves the process that built it". The snapshot's
+  DIGEST does leave: it is `workflows.content_sha256`, and the store compares
+  it against the rebuilt snapshot on every command and inside `verify`. Adding
+  members unconditionally would have changed that digest for every workflow
+  admitted before U-W3 existed — each would refuse `snapshot_divergence` on its
+  next command and read as tampered, with the migration forbidden to re-stamp
+  it and `verify` forbidden to repair it. That is §21 trigger 12 reached
+  through prose. The repair is the trade this architecture already makes for
+  the transition matrix: the member set is frozen per policy version, a v1
+  workflow seals over exactly U-W2's members forever, and
+  `adopt_policy_version` is the one legitimate re-seal boundary.
+
+  Four more were structural rather than cosmetic. **A2**: §11.2 widened the
+  storage CHECK to admit a dispatch pointer in `retrying` but no section
+  widened the reducer's three matching state gates, so a retrying workflow with
+  a rejected reservation could neither revoke it, nor receive the rejection,
+  nor re-dispatch — its remaining budget unreachable, which is the exact harm
+  the reserve-at-acceptance design exists to prevent. **A3**: §5.5 named
+  `_EVENT_PAYLOAD_OPTIONAL` as the mechanism for a policy-conditional required
+  member, which would have let `verify_history` certify a policy-v2 acceptance
+  carrying no ordinal — reproducing inside v2 the very state §5.2.1 refuses;
+  the table gains a version axis instead. **A5**: `beast.work-spec/v1` carries
+  an optional `runtime_task_uuid`, and the landed acceptance gate requires a
+  declared value to match, so a WorkSpec declaring one together with
+  `max_attempts > 1` could never retry at all; the declaration is frozen to
+  bind attempt 1 only. **A20**: rows W2 and W23 specified `git show fef0c2b:…`
+  parsed in-test, and CI checks out shallow with no `fetch-depth`, so both rows
+  would have failed all four required checks with a tooling error rather than
+  an assertion — they use hand-transcribed frozen sources instead.
+
+  **A22 completes three forced-edit licences that were measured against count
+  pins and missed landed token-scan guards.** `tests/test_v04_workflow_store.py`
+  bans the tokens `checkpoint`, `compensate` and `attempts` in the store U-W3
+  must extend; `tests/test_v04_workflow_engine.py` bans `compensat` in the
+  command and event vocabularies and `checkpoint` in the engine source; and
+  `tests/test_v03_memory_graph.py` carries a test whose NAME asserts that no
+  version-seven transition exists. All three fail by construction. Each is
+  narrowed rather than deleted, each narrowing is enumerated, and the eleven
+  forced files are unchanged as a set — no twelfth is forced, which the audit
+  confirmed by grepping every version, table-count and vocabulary literal in
+  the tree.
+
+  Six corrections make an unreachable path honest rather than pretending it
+  fires: `attempt_budget_exhausted` (A6) and `MAX_CHECKPOINTS_PER_WORKFLOW`
+  (A7) are structural backstops the shipped predicates and bounds can never
+  reach through a real history, and `compensation_already_concluded` (A11) is
+  unreachable because both compensation conclusions are terminal and §5.3.5
+  forbids a second terminal carve-out. Each stays implemented as a total guard
+  and is asserted as a refusal-by-construction, exactly as §8.4 already treats
+  `waiting_input` and `paused`. The alternative — a contract that claims a
+  branch fires when it cannot — is the thing this repository has consistently
+  refused, and the audit's own rule applies to the audit's own output: a test
+  that pretends an unreachable path is live is the defect, not the fix.
+
+  One correction is a token collision worth naming because it would have fired
+  a replan for a spelling: the fourteenth state is `retrying`, whose lowercase
+  form contains `retry`, which stays banned across the whole CLI region. **A16**
+  freezes that no state literal appears in that region at all — state names
+  reach the CLI only through the engine's own vocabulary — and W28 asserts the
+  absence.
+
+- **D-v0.4.117 — the CI failure that followed the implementation wave was a
+  quadratic TEST FIXTURE, not a production defect; it is repaired inside path
+  10 alone, under one new licensed edit class, and no timeout, no production
+  file and no byte of hostile-data coverage moves.**
+
+  The observed authority is GitHub Actions run 30964552253. `tests-python-3.12`
+  completed all 3,215 tests successfully in 1,796.706 s and the 30-minute job
+  timeout then cancelled the remaining steps before protocol projection and the
+  clean-tree check ever ran. `tests-python-3.14` reached the same timeout while
+  the suite was still running. `workflow-integrity` and
+  `distribution-smoke-python-3.12` passed. `unittest` reported OK: nothing
+  asserted anything false, and the two jobs died of wall clock.
+
+  The cause is `HostileRowTests::test_every_column_of_all_six_tables_tampered`
+  in `tests/test_v04_workflow_store.py`. It builds a complete six-command
+  `Journey` for **every one of its 740 hostile values**, and `StoreCase.setUp`
+  gives the whole matrix ONE in-memory database — so the fixture grew that
+  database to 740 workflows while calling `verify(conn)` and
+  `list_workflows(conn)` once per value, both of which walk every workflow
+  present. The matrix was therefore quadratic in its own scaffolding: roughly
+  274,000 workflow-verifications, of which the hostile data needed 740. A
+  measured profile puts `verify` at 63.6 % and `list_workflows` at 30.9 % of
+  the matrix; the hostile values themselves cost almost nothing.
+
+  **Three repairs were available and two are refused.** Raising
+  `timeout-minutes` moves the wall without touching the defect, and
+  `.github/workflows/ci.yml` is outside U-W3's boundary anyway (§17.7).
+  Sampling the corpus — a "representative" subset of the ten hostile values, or
+  of the 83 columns — would buy the time by deleting the coverage the row
+  exists to provide, which is the weakening §17.3 has refused since it was
+  written. The third is the one taken: keep every value and stop rebuilding the
+  scaffolding. One `Journey` is reused per **(table, column) pair**, so 740
+  constructions become 83 and the database the matrix makes `verify` walk stops
+  at 83 workflows instead of 740.
+
+  That reuse is sound only if each hostile value hands the journey back byte
+  for byte, so the licence is written as a conditional and every half of it is
+  PROVED rather than assumed: the baseline is captured before the pair's first
+  value; each value proves the baseline present before it tampers; the tamper
+  is still one `UPDATE` against the REAL persisted row; restoration runs
+  through `finally`, so a failed assertion, an escaped exception and a
+  storage-refused tamper all reach it; restoration is an unconditional rewrite
+  of the workflow row, its rows in all seven child tables and its `events`
+  journal rows, in foreign-key order, rather than a selective undo of what the
+  value was expected to change; row equality against the baseline is re-proved
+  after restoration; a whole-store comparison at the end of each pair catches
+  anything that moved outside the journey; and a restoration failure sets a
+  sticky flag that is re-raised OUTSIDE the `subTest` block, which is what
+  makes it end the matrix instead of being recorded and stepped over. A
+  restoration that only reverses what it expected is exactly the one that leaks
+  the case it did not expect, which is why the rewrite is unconditional.
+
+  The verified evidence, measured on the same machine and interpreter with
+  nothing else running: `HostileRowTests` **1,186.5 s → 238.6 s**, a **4.97×**
+  reduction; `Journey` constructions in the matrix **740 → 83**; the complete
+  repository suite **942.3 s** for the same 3,215 tests CI counts. Nothing was
+  removed to get there: the `(table, column, value, tag)` sequence and the
+  `subTest` identity sequence are both identical, 740 for 740, across the
+  change; `_exercise` is byte-identical; `HOSTILE_VALUES` and both column
+  matrices are byte-identical; the assertion census moves only upward
+  (`assertEqual` 5 → 9, every other kind unchanged, none lost). Four negative
+  controls confirm the new guards are load-bearing rather than decorative —
+  disabling restoration, omitting one table from it, corrupting one column
+  after it, and making it raise all fail, and the raising case stops the matrix
+  after exactly one value.
+
+  **The licence is S17 and E16, and the numbering is forced.** S17 narrowly
+  supersedes one statement and one only: that path 10 has exactly ELEVEN
+  licensed edit classes. It is now twelve. The twelfth is numbered E16 rather
+  than E12 because §22 A22 already added E12–E15 to the same enumeration and
+  `tests/test_v04_workflow_store.py` cites `A22/E15` by name — renumbering
+  those four would strand a live reference inside a file this amendment is
+  forbidden to touch, and two rows called E12 would be worse than a gap. Path
+  10's complete inventory is E1–E16: the twelve of §17.3 plus A22's four.
+
+  Everything else is unchanged and was checked rather than assumed: the
+  twenty-one implementation paths, the eleven forced existing test paths, W1–W30,
+  the twenty-one crash rows, the fifteen replan triggers, and every policy,
+  schema, CLI and protocol count. No production file, workflow file, protocol
+  artifact or CI file is touched, so no §21 trigger fires — in particular
+  trigger 1 (a twenty-second path) and trigger 14 (a twelfth existing test
+  file) are both untouched, because this amendment writes only paths 10, 20 and
+  21.
+
 # DECISIONS — Agentic OS v0.4 U-W2.3 workflow CLI, power policy, and docs (Wave 0)
 
 This section continues the `D-v0.4.*` series for the U-W2.3 Wave 0 architecture

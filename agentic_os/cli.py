@@ -2679,11 +2679,57 @@ def cmd_workflow_approve(args) -> int:
 
 
 def cmd_workflow_dispatch(args) -> int:
-    # The `--route` default is the key's ABSENCE: workflow_engine applies its
-    # own default, so the CLI never states a route the operator did not.
+    # Both payload keys default to ABSENCE: workflow_engine applies its own
+    # route default, so the CLI never states a route the operator did not,
+    # and the policy-v2 `restore_checkpoint_id` key appears only when the
+    # operator named one. The builder is nested rather than a module-level
+    # helper because the payload KEY carries a token the §13.5 rule permits
+    # in this function and in no other.
+    def payload(a) -> dict:
+        body: dict = {} if a.route is None else {"queue_route": a.route}
+        if a.restore is not None:
+            body["restore_checkpoint_id"] = a.restore
+        return body
+
+    return _workflow_write(args, "request_dispatch", payload=payload)
+
+
+def cmd_workflow_adopt_policy(args) -> int:
+    # There is no `--to` option, deliberately: adoption is forward-only and
+    # never automatic, and offering a version selector would invite a
+    # downgrade request the engine would only refuse. The target is this
+    # build's current transition-policy version, read from the engine so the
+    # CLI states no version of its own.
+    from . import workflow_engine
+
     return _workflow_write(
-        args, "request_dispatch",
-        payload=lambda a: ({} if a.route is None else {"queue_route": a.route}),
+        args, "adopt_policy_version",
+        payload=lambda a: {
+            "policy_version": workflow_engine.TRANSITION_POLICY_VERSION
+        },
+    )
+
+
+def cmd_workflow_checkpoint(args) -> int:
+    return _workflow_write(
+        args, "record_checkpoint",
+        payload=lambda a: {"checkpoint_document": _workflow_document(a.record)},
+    )
+
+
+def cmd_workflow_restore(args) -> int:
+    return _workflow_write(
+        args, "record_restore",
+        payload=lambda a: {"restore_document": _workflow_document(a.fact)},
+    )
+
+
+def cmd_workflow_compensate(args) -> int:
+    return _workflow_write(
+        args, "record_compensation",
+        payload=lambda a: {
+            "compensation_document": _workflow_document(a.envelope)
+        },
     )
 
 
@@ -2760,6 +2806,13 @@ def cmd_workflow_show(args) -> int:
             ("updated", record.updated_at),
             ("content", record.content_sha256),
             ("integrity", record.integrity),
+            # U-W3 §13.3's five aligned lines. Counts and ordinals only — no
+            # stored body reaches this block, and none ever will.
+            ("attempt", _dash(record.attempt_no)),
+            ("attempt state", _dash(record.attempt_state)),
+            ("attempts used", _dash(record.attempts_used)),
+            ("attempt budget", _dash(record.attempt_budget)),
+            ("checkpoints", _dash(record.checkpoint_count)),
         ):
             print(f"{label + ':':<17}{value}")
         line = f"{'history:':<17}{len(history.events)} event(s)"
@@ -2949,10 +3002,11 @@ def cmd_workflow_export_intents(args) -> int:
             continue
         # The address is computed from the bytes about to be written, never
         # read from the stored column, so a tampered column cannot redirect a
-        # write. `intent_kind` is a closed two-member vocabulary and the digest
-        # is 64 lowercase hex, so the name matches
-        # ^(dispatch|cancel)-[0-9a-f]{64}\.json$ by construction and no byte of
-        # any stored document can influence it.
+        # write. `intent_kind` is a CLOSED vocabulary and the digest is 64
+        # lowercase hex, so the file name matches
+        # ^(<kind>)-[0-9a-f]{64}\.json$ by construction, for exactly the kinds
+        # the engine declares, and no byte of any stored document can
+        # influence it.
         body = protocols.serialize_canonical_file_bytes(view.document)
         name = f"{view.intent_kind}-{protocols.content_digest(view.document)}.json"
         status = _write_workflow_intent_file(target / name, body, name)
@@ -3031,6 +3085,11 @@ def _build_workflow_parser(sub) -> None:
         "--route", default=None, metavar="SLUG",
         help="queue route slug (default: default)",
     )
+    p_dispatch.add_argument(
+        "--restore", default=None, metavar="CHECKPOINT_ID",
+        help="name a stored checkpoint for the executing side to load "
+        "(transition-policy 2 only)",
+    )
     p_dispatch.set_defaults(func=cmd_workflow_dispatch)
 
     p_revoke = workflow_sub.add_parser(
@@ -3088,6 +3147,43 @@ def _build_workflow_parser(sub) -> None:
     )
     p_verify.add_argument("id", nargs="?", default=None, metavar="WF-n")
     p_verify.set_defaults(func=cmd_workflow_verify)
+
+    p_adopt = workflow_sub.add_parser(
+        "adopt-policy",
+        help="adopt this build's transition policy on a non-terminal "
+        "instance (forward-only; unlocks the checkpoint, restoration and "
+        "compensation capabilities)",
+    )
+    p_adopt.add_argument("id", metavar="WF-n")
+    p_adopt.set_defaults(func=cmd_workflow_adopt_policy)
+
+    p_checkpoint = workflow_sub.add_parser(
+        "checkpoint",
+        help="store a verified checkpoint the executing side produced "
+        "(stored verbatim and never printed; a secret-shaped payload is "
+        "refused, not redacted)",
+    )
+    p_checkpoint.add_argument("id", metavar="WF-n")
+    p_checkpoint.add_argument("record", metavar="CHECKPOINT_FILE")
+    p_checkpoint.set_defaults(func=cmd_workflow_checkpoint)
+
+    p_restore = workflow_sub.add_parser(
+        "restore",
+        help="record a verified restoration fact (states nothing about the "
+        "workflow's own state; it is not a queue wait exit)",
+    )
+    p_restore.add_argument("id", metavar="WF-n")
+    p_restore.add_argument("fact", metavar="FACT_FILE")
+    p_restore.set_defaults(func=cmd_workflow_restore)
+
+    p_compensate = workflow_sub.add_parser(
+        "compensate",
+        help="conclude a compensation with a verified result envelope "
+        "(records the state; performs no undo and grants nothing)",
+    )
+    p_compensate.add_argument("id", metavar="WF-n")
+    p_compensate.add_argument("envelope", metavar="ENVELOPE_FILE")
+    p_compensate.set_defaults(func=cmd_workflow_compensate)
 
     p_export = workflow_sub.add_parser(
         "export-intents",

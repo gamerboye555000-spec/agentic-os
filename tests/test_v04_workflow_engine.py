@@ -308,22 +308,34 @@ def result_envelope(
 def facts(**overrides):
     values = {"task_exists": True, "task_open": True}
     values.update(overrides)
-    return workflow_engine.AdmissionFacts(**values)
+    return workflow_engine.ShellFacts(**values)
 
 
 # ---------------------------------------------------------------------------
 # The contract's §5.2 table, transcribed by hand. This literal is the pin: the
 # implementation's TRANSITION_MATRIX is compared to it cell by cell.
 
+#: The POLICY-V2 state tuple (U-W3 §5.3), hand-transcribed. `retrying` is the
+#: fourteenth and sits between `paused` and `compensating`.
 S = (
+    "compiled", "validated", "awaiting_approval", "scheduled", "running",
+    "waiting_input", "waiting_approval", "paused", "retrying", "compensating",
+    "succeeded", "failed", "cancelled", "compensated",
+)
+
+#: Policy version 1's state tuple, hand-transcribed as FROZEN HISTORY from
+#: U-W2 §5.1. It is not derived from `S`: the point of the freeze is that a v1
+#: event indexes v1's own order, which `retrying` shifts.
+V1_S = (
     "compiled", "validated", "awaiting_approval", "scheduled", "running",
     "waiting_input", "waiting_approval", "paused", "compensating",
     "succeeded", "failed", "cancelled", "compensated",
 )
 
-#: (from, to) -> drivers, exactly as the contract's table spells them.
-#: `("reserved",)` is the contract's `R`; every unnamed cell is `·`.
-CONTRACT_CELLS = {
+#: (from, to) -> drivers, exactly as U-W2 §5.2's table spells them — policy
+#: version 1, frozen. `("reserved",)` is the contract's `R`; every unnamed
+#: cell is `·`.
+V1_CONTRACT_CELLS = {
     ("compiled", "validated"): ("cmd:validate",),
     ("compiled", "cancelled"): ("cmd:request_cancel",),
     ("validated", "awaiting_approval"): ("cmd:request_approval",),
@@ -354,6 +366,52 @@ CONTRACT_CELLS = {
     ("compensating", "compensated"): ("reserved",),
 }
 
+V1_CONTRACT_MATRIX = tuple(
+    tuple(V1_CONTRACT_CELLS.get((source, target), ()) for target in V1_S)
+    for source in V1_S
+)
+
+#: (from, to) -> drivers, hand-transcribed from U-W3 §5.3's 14x14 table.
+#: Thirty-five active cells, ZERO reserved cells: all three of v1's reserved
+#: edges activate, and `compensating -> cancelled` stays illegal.
+CONTRACT_CELLS = {
+    ("compiled", "validated"): ("cmd:validate",),
+    ("compiled", "cancelled"): ("cmd:request_cancel",),
+    ("validated", "awaiting_approval"): ("cmd:request_approval",),
+    ("validated", "scheduled"): ("rcp:accepted",),
+    ("validated", "cancelled"): ("cmd:request_cancel",),
+    ("awaiting_approval", "validated"): ("apr:record_approval",),
+    ("awaiting_approval", "cancelled"): ("cmd:request_cancel",),
+    ("scheduled", "running"): ("rcp:started",),
+    ("scheduled", "retrying"): ("rcp:failed_retryable",),
+    ("scheduled", "failed"): ("rcp:failed",),
+    ("scheduled", "cancelled"): ("rcp:cancelled",),
+    ("running", "waiting_input"): ("rcp:waiting_input",),
+    ("running", "waiting_approval"): ("rcp:waiting_approval",),
+    ("running", "paused"): ("rcp:paused",),
+    ("running", "retrying"): ("res:fail_retryable", "rcp:failed_retryable"),
+    ("running", "compensating"): ("res:compensable",),
+    ("running", "succeeded"): ("res:success",),
+    ("running", "failed"): ("res:fail", "rcp:failed"),
+    ("running", "cancelled"): ("rcp:cancelled",),
+    ("waiting_input", "running"): ("rcp:resumed",),
+    ("waiting_input", "retrying"): ("rcp:failed_retryable",),
+    ("waiting_input", "failed"): ("rcp:failed",),
+    ("waiting_input", "cancelled"): ("rcp:cancelled",),
+    ("waiting_approval", "running"): ("rcp:resumed",),
+    ("waiting_approval", "retrying"): ("rcp:failed_retryable",),
+    ("waiting_approval", "failed"): ("rcp:failed",),
+    ("waiting_approval", "cancelled"): ("rcp:cancelled",),
+    ("paused", "running"): ("rcp:resumed",),
+    ("paused", "retrying"): ("rcp:failed_retryable",),
+    ("paused", "failed"): ("rcp:failed",),
+    ("paused", "cancelled"): ("rcp:cancelled",),
+    ("retrying", "scheduled"): ("rcp:accepted",),
+    ("retrying", "cancelled"): ("cmd:request_cancel",),
+    ("compensating", "failed"): ("cmp:failed", "rcp:failed"),
+    ("compensating", "compensated"): ("cmp:applied",),
+}
+
 CONTRACT_MATRIX = tuple(
     tuple(CONTRACT_CELLS.get((source, target), ()) for target in S)
     for source in S
@@ -371,6 +429,23 @@ CONTRACT_RECEIPT_EVENTS = {
     "cancelled": "workflow_cancelled",
     "failed": "workflow_failed",
 }
+
+#: Driver -> the event it appends, for the drivers whose event is NOT the
+#: receipt bijection's. Hand-transcribed from U-W3 §5.5.
+CONTRACT_DRIVER_EVENTS = {
+    "rcp:failed_retryable": "attempt_failed",
+    "res:fail_retryable": "attempt_failed",
+    "res:compensable": "compensation_started",
+    "cmp:applied": "compensation_applied",
+    "cmp:failed": "compensation_failed",
+}
+
+#: A WorkSpec with room for a second attempt, so the retry drivers are
+#: reachable at all: with the default budget of 1 the first failure is
+#: terminal by the §5.3.3 predicate, not retryable.
+def retrying_artifact() -> dict:
+    return work_spec(retry={"max_attempts": 3})
+
 
 #: §7's target state per receipt kind (`None` = the stateless kind).
 CONTRACT_RECEIPT_TARGETS = {
@@ -437,7 +512,7 @@ class Journey:
         decision = workflow_engine.decide(
             self.snapshot,
             cmd,
-            facts if facts is not None else workflow_engine.AdmissionFacts(),
+            facts if facts is not None else workflow_engine.ShellFacts(),
         )
         self.snapshot = decision.snapshot_after
         self.decisions.append(decision)
@@ -452,7 +527,7 @@ class Journey:
         return workflow_engine.decide(
             self.snapshot,
             cmd,
-            facts if facts is not None else workflow_engine.AdmissionFacts(),
+            facts if facts is not None else workflow_engine.ShellFacts(),
         )
 
     # -- shorthand drivers ------------------------------------------------
@@ -515,6 +590,29 @@ class Journey:
                 },
             )
             return self.snapshot
+        if state == "compensating":
+            self.run(
+                "record_result",
+                payload={
+                    "result_document": result_envelope(
+                        self.artifact, outcome="fail", retryable=False,
+                        compensation={"state": "pending"},
+                    )
+                },
+            )
+            return self.snapshot
+        if state == "retrying":
+            # `retrying` needs budget to be left, so this journey must have
+            # been built on a `retry.max_attempts > 1` artifact.
+            self.run(
+                "record_result",
+                payload={
+                    "result_document": result_envelope(
+                        self.artifact, outcome="fail", retryable=True
+                    )
+                },
+            )
+            return self.snapshot
         raise AssertionError(f"unreachable state {state!r}")
 
 
@@ -523,6 +621,30 @@ def synthetic(snapshot: dict, **overrides) -> dict:
     body = dict(snapshot)
     body.update(overrides)
     return _seal(body)
+
+
+#: The eight members policy v2 adds to the sealed snapshot record (U-W3
+#: §11.4), hand-transcribed so a v1-shaped fixture can be built without asking
+#: the engine what its own member set is.
+V2_SNAPSHOT_MEMBERS = (
+    "attempt_no", "attempt_state", "attempts_used", "attempt_budget",
+    "last_checkpoint_seq", "checkpoint_count", "compensation_state",
+    "restored_checkpoint_sha256",
+)
+
+
+def _v1_shaped(snapshot: dict) -> dict:
+    """A policy-v2 snapshot projected back onto policy v1's member set.
+
+    The member set is version-conditional precisely so a v1 workflow keeps
+    sealing over U-W2's members forever; this builds the v1 shape by hand so
+    the test does not read the projection out of the module under test.
+    """
+    return {
+        key: value
+        for key, value in snapshot.items()
+        if key not in V2_SNAPSHOT_MEMBERS
+    }
 
 
 def approving_journey() -> Journey:
@@ -561,11 +683,14 @@ class VocabularyTests(EngineCase):
             (
                 "compiled", "validated", "awaiting_approval", "scheduled",
                 "running", "waiting_input", "waiting_approval", "paused",
-                "compensating", "succeeded", "failed", "cancelled",
-                "compensated",
+                "retrying", "compensating", "succeeded", "failed",
+                "cancelled", "compensated",
             ),
         )
-        self.assertEqual(len(workflow_engine.WORKFLOW_STATES), 13)
+        self.assertEqual(len(workflow_engine.WORKFLOW_STATES), 14)
+        # Policy version 1's tuple is retained VERBATIM as frozen history.
+        self.assertEqual(workflow_engine._V1_WORKFLOW_STATES, V1_S)
+        self.assertEqual(len(workflow_engine._V1_WORKFLOW_STATES), 13)
         self.assertNotIn("proposed", workflow_engine.WORKFLOW_STATES)
 
     def test_exact_terminal_states(self):
@@ -581,9 +706,11 @@ class VocabularyTests(EngineCase):
                 "admit_work_spec", "validate", "request_approval",
                 "record_approval", "request_dispatch", "revoke_dispatch",
                 "request_cancel", "record_queue_receipt", "record_result",
+                "adopt_policy_version", "record_checkpoint", "record_restore",
+                "record_compensation",
             ),
         )
-        self.assertEqual(len(workflow_engine.WORKFLOW_COMMANDS), 9)
+        self.assertEqual(len(workflow_engine.WORKFLOW_COMMANDS), 13)
 
     def test_exact_events(self):
         self.assertEqual(
@@ -597,9 +724,13 @@ class VocabularyTests(EngineCase):
                 "run_paused", "run_resumed",
                 "cancel_requested",
                 "workflow_succeeded", "workflow_failed", "workflow_cancelled",
+                "policy_version_adopted", "attempt_failed",
+                "checkpoint_recorded", "checkpoint_restored",
+                "compensation_started", "compensation_applied",
+                "compensation_failed",
             ),
         )
-        self.assertEqual(len(workflow_engine.WORKFLOW_EVENTS), 17)
+        self.assertEqual(len(workflow_engine.WORKFLOW_EVENTS), 24)
 
     def test_exact_refusal_reasons(self):
         self.assertEqual(
@@ -626,16 +757,25 @@ class VocabularyTests(EngineCase):
                 "evidence_insufficient",
                 "history_corrupt", "history_unknown_event",
                 "snapshot_divergence",
+                "policy_version_not_upgradable", "attempt_budget_exhausted",
+                "attempt_mismatch",
+                "checkpoint_malformed", "checkpoint_unbound",
+                "checkpoint_conflict", "checkpoint_limit_exceeded",
+                "checkpoint_unknown", "checkpoint_ineligible",
+                "restore_fact_malformed", "restore_fact_unbound",
+                "compensation_not_required", "compensation_already_concluded",
+                "compensation_state_inconsistent",
             ),
         )
-        self.assertEqual(len(workflow_engine.WORKFLOW_REFUSAL_REASONS), 43)
+        self.assertEqual(len(workflow_engine.WORKFLOW_REFUSAL_REASONS), 57)
         self.assertEqual(
-            len(set(workflow_engine.WORKFLOW_REFUSAL_REASONS)), 43
+            len(set(workflow_engine.WORKFLOW_REFUSAL_REASONS)), 57
         )
 
     def test_exact_intent_kinds(self):
         self.assertEqual(
-            workflow_engine.WORKFLOW_INTENT_KINDS, ("dispatch", "cancel")
+            workflow_engine.WORKFLOW_INTENT_KINDS,
+            ("dispatch", "cancel", "compensate"),
         )
 
     def test_exact_receipt_kinds(self):
@@ -657,13 +797,13 @@ class VocabularyTests(EngineCase):
             workflow_engine.COMMAND_SOURCES, ("cli", "runtime_adapter")
         )
 
-    def test_policy_version_is_integer_one(self):
-        self.assertEqual(workflow_engine.TRANSITION_POLICY_VERSION, 1)
+    def test_policy_version_is_integer_two(self):
+        self.assertEqual(workflow_engine.TRANSITION_POLICY_VERSION, 2)
         self.assertIsInstance(workflow_engine.TRANSITION_POLICY_VERSION, int)
         self.assertNotIsInstance(
             workflow_engine.TRANSITION_POLICY_VERSION, bool
         )
-        self.assertEqual(workflow_engine.SUPPORTED_POLICY_VERSIONS, (1,))
+        self.assertEqual(workflow_engine.SUPPORTED_POLICY_VERSIONS, (1, 2))
 
     def test_exact_record_schema_identities(self):
         self.assertEqual(
@@ -731,9 +871,9 @@ class RegistryPinTests(EngineCase):
 class MatrixTests(EngineCase):
     def test_matrix_equals_contract_table(self):
         matrix = workflow_engine.TRANSITION_MATRIX
-        self.assertEqual(len(matrix), 13)
+        self.assertEqual(len(matrix), 14)
         for row in matrix:
-            self.assertEqual(len(row), 13)
+            self.assertEqual(len(row), 14)
         self.assertEqual(workflow_engine.WORKFLOW_STATES, S)
         for i, source in enumerate(S):
             for j, target in enumerate(S):
@@ -747,20 +887,25 @@ class MatrixTests(EngineCase):
         cells = [
             cell for row in workflow_engine.TRANSITION_MATRIX for cell in row
         ]
-        self.assertEqual(len(cells), 169)
+        self.assertEqual(len(cells), 196)
         active = [c for c in cells if c and c != ("reserved",)]
         reserved = [c for c in cells if c == ("reserved",)]
         illegal = [c for c in cells if c == ()]
-        self.assertEqual(len(active), 25)
-        self.assertEqual(len(reserved), 3)
-        self.assertEqual(len(illegal), 141)
+        self.assertEqual(len(active), 35)
+        self.assertEqual(len(reserved), 0)
+        self.assertEqual(len(illegal), 161)
+        # Policy v1's table is retained verbatim: 25 active, 3 reserved.
+        v1 = [c for row in workflow_engine._V1_TRANSITION_MATRIX for c in row]
+        self.assertEqual(len(v1), 169)
+        self.assertEqual(len([c for c in v1 if c and c != ("reserved",)]), 25)
+        self.assertEqual(len([c for c in v1 if c == ("reserved",)]), 3)
 
-    def test_reserved_edges_are_exactly_three(self):
+    def test_reserved_edges_are_exactly_three_under_v1_and_none_under_v2(self):
         reserved = {
             (source, target)
-            for i, source in enumerate(S)
-            for j, target in enumerate(S)
-            if workflow_engine.TRANSITION_MATRIX[i][j] == ("reserved",)
+            for i, source in enumerate(V1_S)
+            for j, target in enumerate(V1_S)
+            if workflow_engine._V1_TRANSITION_MATRIX[i][j] == ("reserved",)
         }
         self.assertEqual(
             reserved,
@@ -769,6 +914,16 @@ class MatrixTests(EngineCase):
                 ("compensating", "compensated"),
                 ("compensating", "failed"),
             },
+        )
+        # All three activate under v2, and no cell stays reserved.
+        self.assertEqual(
+            {
+                (source, target)
+                for i, source in enumerate(S)
+                for j, target in enumerate(S)
+                if workflow_engine.TRANSITION_MATRIX[i][j] == ("reserved",)
+            },
+            set(),
         )
 
     def test_diagonal_is_illegal(self):
@@ -788,23 +943,28 @@ class MatrixTests(EngineCase):
         ]
         self.assertEqual(cell, ())
 
-    def test_two_reserved_edges_have_no_driver(self):
-        """§5.2: no command or receipt kind targets compensating/compensated."""
+    def test_two_reserved_edges_have_no_receipt_driver(self):
+        """No receipt kind targets compensating/compensated in any version."""
         self.assertNotIn("compensating", CONTRACT_RECEIPT_TARGETS.values())
         self.assertNotIn("compensated", CONTRACT_RECEIPT_TARGETS.values())
         self.assertEqual(
             dict(workflow_engine.RECEIPT_TARGET_STATES),
             CONTRACT_RECEIPT_TARGETS,
         )
-        # No driver token anywhere in the matrix targets either state.
+        # Under v1 both columns are illegal-or-reserved; under v2 they carry
+        # only the two envelope drivers, never a receipt one.
+        for i, _source in enumerate(V1_S):
+            for target in ("compensating", "compensated"):
+                cell = workflow_engine._V1_TRANSITION_MATRIX[i][
+                    V1_S.index(target)
+                ]
+                self.assertIn(cell, ((), ("reserved",)))
         for i, _source in enumerate(S):
             for target in ("compensating", "compensated"):
-                self.assertEqual(
-                    workflow_engine.TRANSITION_MATRIX[i][S.index(target)],
-                    CONTRACT_MATRIX[i][S.index(target)],
-                )
                 cell = workflow_engine.TRANSITION_MATRIX[i][S.index(target)]
-                self.assertIn(cell, ((), ("reserved",)))
+                self.assertEqual(cell, CONTRACT_MATRIX[i][S.index(target)])
+                for driver in cell:
+                    self.assertFalse(driver.startswith("rcp:"), driver)
 
     def test_receipt_event_bijection(self):
         self.assertEqual(
@@ -826,8 +986,16 @@ class MatrixTests(EngineCase):
                 for driver in workflow_engine.TRANSITION_MATRIX[i][j]:
                     if driver.startswith("rcp:"):
                         kind = driver.split(":", 1)[1]
+                        # `rcp:failed_retryable` is the SAME receipt kind as
+                        # `rcp:failed`, discriminated by `reason.retryable`
+                        # plus the budget — so it has its own target and does
+                        # not go through the nine-kind bijection.
+                        expected = (
+                            "retrying" if kind == "failed_retryable"
+                            else CONTRACT_RECEIPT_TARGETS[kind]
+                        )
                         self.assertEqual(
-                            CONTRACT_RECEIPT_TARGETS[kind],
+                            expected,
                             target,
                             f"{source} -> {target} via {driver}",
                         )
@@ -865,24 +1033,45 @@ class MatrixDriveTests(EngineCase):
                     last = decision.events[-1]
                     self.assertEqual(last["from_state"], source)
                     self.assertEqual(last["to_state"], target)
-                    if driver.startswith("rcp:"):
+                    if driver == "rcp:failed" and source == "compensating":
+                        # The nine-kind bijection is STATE-CONDITIONAL for
+                        # exactly this cell: a `failed` receipt arriving in
+                        # `compensating` reports that the runtime task the
+                        # compensating attempt was bound to failed, so it ends
+                        # the UNDO. `RECEIPT_EVENTS` itself is unchanged.
+                        self.assertEqual(last["event"], "compensation_failed")
+                    elif driver in CONTRACT_DRIVER_EVENTS:
+                        self.assertEqual(
+                            last["event"], CONTRACT_DRIVER_EVENTS[driver]
+                        )
+                    elif driver.startswith("rcp:"):
                         kind = driver.split(":", 1)[1]
                         self.assertEqual(
                             last["event"], CONTRACT_RECEIPT_EVENTS[kind]
                         )
                     driven.add((source, target, driver))
-        self.assertEqual(len(driven), 26)
+        # 35 active cells, three of which carry two drivers each
+        # (`running -> retrying`, `running -> failed`, `compensating ->
+        # failed`), so 38 (source, target, driver) triples are driven.
+        self.assertEqual(len(driven), 38)
+
+    #: Drivers that need budget left over, so the journey is built on a
+    #: `retry.max_attempts > 1` artifact.
+    RETRY_DRIVERS = ("res:fail_retryable", "rcp:failed_retryable")
 
     def _drive(self, source: str, driver: str):
         """Drive `driver` against a fresh journey parked in `source`."""
+        budget = (
+            3 if driver in self.RETRY_DRIVERS or source == "retrying" else 1
+        )
         if driver == "cmd:request_approval":
             journey = (
                 approving_journey_at_validated()
                 if source == "validated"
-                else self._journey_in(source)
+                else self._journey_in(source, budget=budget)
             )
             return journey.attempt("request_approval")
-        journey = self._journey_in(source)
+        journey = self._journey_in(source, budget=budget)
         if driver == "apr:record_approval":
             return journey.attempt(
                 "record_approval",
@@ -892,52 +1081,103 @@ class MatrixDriveTests(EngineCase):
             )
         if driver.startswith("cmd:"):
             return journey.attempt(driver.split(":", 1)[1])
-        if driver in ("res:success", "res:fail"):
-            envelope = (
-                result_envelope(journey.artifact)
-                if driver == "res:success"
-                else result_envelope(
-                    journey.artifact, outcome="fail", retryable=True
-                )
-            )
-            return journey.attempt(
-                "record_result", payload={"result_document": envelope}
-            )
+        if driver.startswith(("res:", "cmp:")):
+            verb, kwargs = self._envelope_command(journey, driver)
+            return journey.attempt(verb, **kwargs)
         kind = driver.split(":", 1)[1]
+        if kind == "failed_retryable":
+            kind = "failed"
         return journey.attempt(
             "record_queue_receipt",
             payload={
-                "receipt_document": self._receipt_for(journey, kind, source)
+                "receipt_document": self._receipt_for(journey, kind, source,
+                                                      driver=driver)
             },
         )
 
-    def _journey_in(self, source: str) -> Journey:
+    def _envelope_command(self, journey, driver):
+        """The verb and payload for a result or compensation driver."""
+        artifact = journey.artifact
+        attempt = journey.snapshot["attempt_no"] or 1
+        if driver == "res:success":
+            return "record_result", {
+                "payload": {"result_document": result_envelope(
+                    artifact, attempt=attempt
+                )}
+            }
+        if driver == "res:fail":
+            return "record_result", {
+                "payload": {"result_document": result_envelope(
+                    artifact, outcome="fail", retryable=True, attempt=attempt
+                )}
+            }
+        if driver == "res:fail_retryable":
+            return "record_result", {
+                "payload": {"result_document": result_envelope(
+                    artifact, outcome="fail", retryable=True, attempt=attempt
+                )}
+            }
+        if driver == "res:compensable":
+            return "record_result", {
+                "payload": {"result_document": result_envelope(
+                    artifact, outcome="fail", retryable=False, attempt=attempt,
+                    compensation={"state": "pending"},
+                )}
+            }
+        state = "applied" if driver == "cmp:applied" else "failed"
+        return "record_compensation", {
+            "payload": {"compensation_document": result_envelope(
+                artifact, outcome="fail", retryable=False, attempt=attempt,
+                compensation={"state": state},
+                result_id="33333333-3333-4333-8333-333333333333",
+            )}
+        }
+
+    def _journey_in(self, source: str, *, budget: int = 1) -> Journey:
         if source == "awaiting_approval":
             return approving_journey()
-        journey = Journey()
+        journey = (
+            Journey() if budget == 1
+            else Journey(_a := retrying_artifact(), compile_report(_a))
+        )
         journey.to_state(source)
         return journey
 
-    def _receipt_for(self, journey: Journey, kind: str, source: str) -> dict:
+    def _receipt_for(self, journey: Journey, kind: str, source: str,
+                     *, driver: str = "") -> dict:
         kwargs: dict = {"artifact": journey.artifact, "receipt_id": 800}
         if kind in ("accepted", "rejected"):
             if (
-                journey.snapshot["state"] == "validated"
+                journey.snapshot["state"] in ("validated", "retrying")
                 and journey.snapshot["dispatch_intent_id"] is None
             ):
                 journey.dispatch()
             seq = max(journey.snapshot["intent_seq"], 1)
             kwargs["intent_id"] = _intent_id(journey.digest, seq)
             kwargs["idempotency_key"] = _idempotency_key(journey.digest, seq)
+            if kind == "accepted" and source == "retrying":
+                # A retry is a NEW runtime task by construction (U-W3 §7.2),
+                # so re-offering attempt 1's uuid is exactly what §6.5 refuses.
+                kwargs["runtime_task_uuid"] = (
+                    "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+                )
         if kind == "rejected":
             kwargs["runtime_task_uuid"] = None
             kwargs["reason"] = {
                 "code": "queue_full", "message": "no room", "retryable": True,
             }
         if kind == "failed":
+            # `rcp:failed_retryable` and `rcp:failed` are the SAME receipt
+            # kind discriminated by `reason.retryable` plus the budget, so the
+            # driver decides the flag rather than a second kind existing.
             kwargs["reason"] = {
-                "code": "worker_error", "message": "boom", "retryable": False,
+                "code": "worker_error",
+                "message": "boom",
+                "retryable": driver == "rcp:failed_retryable",
             }
+            kwargs.setdefault(
+                "runtime_task_uuid", journey.snapshot["runtime_task_uuid"]
+            )
         if kind == "resumed" and source == "waiting_approval":
             journey.run(
                 "record_approval",
@@ -990,8 +1230,8 @@ class MatrixDriveTests(EngineCase):
                     f"{source} via {driver}",
                 )
                 checked += 1
-        # 11 non-compensating states x 10 drivers - 20 active combinations.
-        self.assertEqual(checked, 90)
+        # 12 non-compensating states x 10 drivers - 21 active combinations.
+        self.assertEqual(checked, 99)
 
     def test_record_result_outside_running_refuses(self):
         for source in ("compiled", "validated", "scheduled", "paused"):
@@ -1005,9 +1245,15 @@ class MatrixDriveTests(EngineCase):
             )
 
     def test_reserved_edge_refuses_transition_reserved(self):
+        """`transition_reserved` stays reachable through a POLICY-V1
+        snapshot: policy v1 replays forever, and its `compensating -> failed`
+        cell is still the one attemptable reserved edge. It is never emitted
+        for a v2 snapshot, where the same cell is driven."""
         journey = Journey()
         base = journey.to_state("running")
-        journey.snapshot = synthetic(base, state="compensating")
+        journey.snapshot = synthetic(
+            _v1_shaped(base), state="compensating", policy_version=1
+        )
         self.assertRefusal(
             "transition_reserved",
             journey,
@@ -1120,7 +1366,7 @@ class CommandEnvelopeTests(EngineCase):
 
     def _decide(self, cmd):
         return workflow_engine.decide(
-            self.snapshot, cmd, workflow_engine.AdmissionFacts()
+            self.snapshot, cmd, workflow_engine.ShellFacts()
         )
 
     def test_unknown_command_schema_version(self):
@@ -1393,7 +1639,7 @@ class RevisionTests(EngineCase):
             workflow_engine.decide,
             None,
             cmd,
-            workflow_engine.AdmissionFacts(),
+            workflow_engine.ShellFacts(),
         )
 
     def test_admit_against_existing_snapshot_refuses(self):
@@ -1455,10 +1701,10 @@ class DeterminismTests(EngineCase):
             payload={},
         )
         first = workflow_engine.decide(
-            snapshot, cmd, workflow_engine.AdmissionFacts()
+            snapshot, cmd, workflow_engine.ShellFacts()
         )
         second = workflow_engine.decide(
-            snapshot, cmd, workflow_engine.AdmissionFacts()
+            snapshot, cmd, workflow_engine.ShellFacts()
         )
         self.assertEqual(_canon(first.snapshot_after), _canon(second.snapshot_after))
         self.assertEqual(
@@ -1473,7 +1719,7 @@ class DeterminismTests(EngineCase):
         for _ in range(3):
             with self.assertRaises(workflow_engine.WorkflowRefusal) as caught:
                 workflow_engine.decide(
-                    journey.snapshot, cmd, workflow_engine.AdmissionFacts()
+                    journey.snapshot, cmd, workflow_engine.ShellFacts()
                 )
             reasons.add((caught.exception.reason, caught.exception.where))
         self.assertEqual(len(reasons), 1)
@@ -1489,10 +1735,10 @@ class DeterminismTests(EngineCase):
         )
         shuffled = dict(reversed(list(cmd.items())))
         first = workflow_engine.decide(
-            journey.snapshot, cmd, workflow_engine.AdmissionFacts()
+            journey.snapshot, cmd, workflow_engine.ShellFacts()
         )
         second = workflow_engine.decide(
-            journey.snapshot, shuffled, workflow_engine.AdmissionFacts()
+            journey.snapshot, shuffled, workflow_engine.ShellFacts()
         )
         self.assertEqual(_canon(first.snapshot_after), _canon(second.snapshot_after))
         self.assertEqual(_canon(first.intent), _canon(second.intent))
@@ -2131,10 +2377,19 @@ class ResultTests(EngineCase):
         artifact = work_spec(retry={"max_attempts": 3})
         journey = Journey(artifact, compile_report(artifact))
         journey.to_state("running")
+        # Under policy v2 the reported `attempt` must EQUAL the open attempt,
+        # not merely fall inside the budget (U-W3 §1.2 row S8): an attempt
+        # number that names nothing is not accounting.
+        self.assertRefusal(
+            "attempt_mismatch",
+            journey,
+            "record_result",
+            payload={"result_document": result_envelope(artifact, attempt=3)},
+        )
         decision = journey.run(
             "record_result",
             payload={
-                "result_document": result_envelope(artifact, attempt=3)
+                "result_document": result_envelope(artifact, attempt=1)
             },
         )
         self.assertEqual(decision.snapshot_after["state"], "succeeded")
@@ -2190,7 +2445,6 @@ class ResultTests(EngineCase):
                     errors=[
                         {"code": "tool_error", "message": "no", "retryable": True}
                     ],
-                    compensation={"state": "pending"},
                 )
             },
         )
@@ -2362,9 +2616,14 @@ class IntentTests(EngineCase):
                 "snapshot_sha256", "compile_status", "idempotency_key",
                 "queue_route", "requested_at", "work_spec_document",
                 "content_sha256",
+                # U-W3 §9.2: the v2 dispatch intent STATES the ordinal and the
+                # budget, so a human enqueuer never has to infer either.
+                "attempt_no", "attempt_budget",
             },
         )
-        self.assertEqual(intent["schema"], "aos.workflow-queue-intent/v1")
+        self.assertEqual(intent["schema"], "aos.workflow-queue-intent/v2")
+        self.assertEqual(intent["attempt_no"], 1)
+        self.assertEqual(intent["attempt_budget"], 1)
         self.assertEqual(intent["intent_kind"], "dispatch")
         self.assertEqual(intent["work_spec_document"], journey.artifact)
         self.assertEqual(intent["aos_task_id"], "T-0007")
@@ -2980,12 +3239,22 @@ class HistoryTests(EngineCase):
                 "cancel_intent_id", "runtime_task_uuid", "queue_route",
                 "intent_seq", "revoked_intent_ids", "resolved_intent_ids",
                 "last_seq", "last_wait_entry_seq", "last_runtime_approval_seq",
+                *V2_SNAPSHOT_MEMBERS,
                 "content_sha256",
             },
         )
         self.assertEqual(
             journey.snapshot["schema"], "aos.workflow-snapshot/v1"
         )
+        # The member set is POLICY-VERSION CONDITIONAL: a v1 snapshot seals
+        # over exactly U-W2's members, which is what keeps a pre-migration
+        # workflow's stored `workflows.content_sha256` matching forever.
+        self.assertEqual(
+            set(journey.snapshot) - set(V2_SNAPSHOT_MEMBERS),
+            set(workflow_engine._V1_SNAPSHOT_KEYS),
+        )
+        for member in V2_SNAPSHOT_MEMBERS:
+            self.assertNotIn(member, workflow_engine._V1_SNAPSHOT_KEYS)
 
     def test_event_shape_is_closed(self):
         journey = self._journey()
@@ -3000,7 +3269,7 @@ class HistoryTests(EngineCase):
                 },
             )
             self.assertEqual(event["schema"], "aos.workflow-event/v1")
-            self.assertEqual(event["policy_version"], 1)
+            self.assertEqual(event["policy_version"], 2)
 
     def test_verify_history_accepts_every_scripted_journey(self):
         for state in ("compiled", "validated", "scheduled", "running",
@@ -3170,7 +3439,8 @@ class HistoryTests(EngineCase):
     def test_unknown_policy_version(self):
         journey = self._journey()
         broken = [dict(e) for e in journey.events]
-        broken[1] = _seal({**broken[1], "policy_version": 2})
+        # 2 is SHIPPED now; 3 is the unsupported future version.
+        broken[1] = _seal({**broken[1], "policy_version": 3})
         self.assertEqual(
             workflow_engine.verify_history(broken).reason,
             "policy_version_unsupported",
@@ -3243,7 +3513,7 @@ class HistoryTests(EngineCase):
                 workflow_engine.decide,
                 broken,
                 cmd,
-                workflow_engine.AdmissionFacts(),
+                workflow_engine.ShellFacts(),
             )
 
     def test_snapshot_digest_is_recomputed(self):
@@ -3260,12 +3530,12 @@ class HistoryTests(EngineCase):
             workflow_engine.decide,
             tampered,
             cmd,
-            workflow_engine.AdmissionFacts(),
+            workflow_engine.ShellFacts(),
         )
 
     def test_policy_version_gate_on_decide(self):
         journey = self._journey()
-        future = synthetic(journey.snapshot, policy_version=2)
+        future = synthetic(journey.snapshot, policy_version=3)
         cmd = command(
             "request_cancel",
             expected_revision=future["revision"],
@@ -3276,7 +3546,7 @@ class HistoryTests(EngineCase):
             workflow_engine.decide,
             future,
             cmd,
-            workflow_engine.AdmissionFacts(),
+            workflow_engine.ShellFacts(),
         )
 
 
@@ -3414,7 +3684,11 @@ class BoundaryTests(EngineCase):
 
     def test_no_monitor_interrupt_or_durable_engine_surface(self):
         source = self._module_source().lower()
-        for token in ("temporal", "heartbeat", "checkpoint", "resume_from",
+        # `checkpoint` leaves this list because U-W3's checkpoint verifier,
+        # command and two events live in this module (U-W3 §8, §17.1 path 1).
+        # Everything the token stood for stays banned: no monitor, no
+        # interrupt, no durable engine, no runtime worker surface.
+        for token in ("temporal", "heartbeat", "resume_from",
                       "loop_health", "semantic_interrupt", "worker"):
             self.assertNotIn(token, source, token)
 
@@ -3486,7 +3760,7 @@ class BoundaryTests(EngineCase):
             with self.assertRaises(workflow_engine.WorkflowRefusal):
                 workflow_engine.decide(
                     journey.snapshot, candidate,
-                    workflow_engine.AdmissionFacts(),
+                    workflow_engine.ShellFacts(),
                 )
 
     def test_hostile_payload_documents_refuse_not_crash(self):
@@ -3503,7 +3777,7 @@ class BoundaryTests(EngineCase):
                         command_id=60,
                         payload={"result_document": document},
                     ),
-                    workflow_engine.AdmissionFacts(),
+                    workflow_engine.ShellFacts(),
                 )
 
 
@@ -3608,12 +3882,21 @@ class ExclusionTests(EngineCase):
             self.assertNotIn("retry", event)
 
     def test_no_compensation_execution_surface(self):
-        for name in workflow_engine.WORKFLOW_COMMANDS:
-            self.assertNotIn("compensat", name)
+        # U-W3 activates the reserved edges, so `compensat` now appears in
+        # exactly one command and three events — enumerated here, so a
+        # FIFTH compensation surface cannot appear silently. No RECEIPT kind
+        # carries it: the nine kinds stay frozen (U-W3 §1.3).
+        self.assertEqual(
+            [n for n in workflow_engine.WORKFLOW_COMMANDS if "compensat" in n],
+            ["record_compensation"],
+        )
+        self.assertEqual(
+            [e for e in workflow_engine.WORKFLOW_EVENTS if "compensat" in e],
+            ["compensation_started", "compensation_applied",
+             "compensation_failed"],
+        )
         for kind in workflow_engine.WORKFLOW_RECEIPT_KINDS:
             self.assertNotIn("compensat", kind)
-        for event in workflow_engine.WORKFLOW_EVENTS:
-            self.assertNotIn("compensat", event)
         self.assertIn("compensating", workflow_engine.WORKFLOW_STATES)
         self.assertIn("compensated", workflow_engine.WORKFLOW_STATES)
 
@@ -4211,15 +4494,19 @@ class ReceiptOptionalFieldTests(EngineCase):
 
 
 class AdmissionSeamTests(EngineCase):
-    """F11: the frozen §9 AdmissionFacts shape must admit."""
+    """F11: the frozen §9 ShellFacts shape must admit."""
 
     def test_admission_facts_has_exactly_the_frozen_fields(self):
         import dataclasses
 
         names = tuple(
-            f.name for f in dataclasses.fields(workflow_engine.AdmissionFacts)
+            f.name for f in dataclasses.fields(workflow_engine.ShellFacts)
         )
-        self.assertEqual(names, ("task_exists", "task_open"))
+        self.assertEqual(
+            names,
+            ("task_exists", "task_open", "checkpoint_sha256",
+             "checkpoint_attempt_no"),
+        )
 
     def test_frozen_signature_admits(self):
         artifact = work_spec()
@@ -4233,7 +4520,7 @@ class AdmissionSeamTests(EngineCase):
             },
         )
         decision = workflow_engine.decide(
-            None, cmd, workflow_engine.AdmissionFacts(
+            None, cmd, workflow_engine.ShellFacts(
                 task_exists=True, task_open=True
             )
         )
@@ -4335,7 +4622,7 @@ class SnapshotCrossFieldTests(EngineCase):
             workflow_engine.decide,
             snapshot,
             cmd,
-            workflow_engine.AdmissionFacts(),
+            workflow_engine.ShellFacts(),
         )
 
     def test_dispatch_pointer_requires_validated(self):

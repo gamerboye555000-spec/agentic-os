@@ -753,6 +753,13 @@ class RecoveryTests(PowerCase):
         (("workflow", "cancel"), ("workflow", "cancel", "WF-1")),
         (("workflow", "receipt"), ("workflow", "receipt", "WF-1", "SELF")),
         (("workflow", "result"), ("workflow", "result", "WF-1", "SELF")),
+        # U-W3's four recovery writers: a damaged workspace must not decide a
+        # retry, store a checkpoint, claim a restoration or conclude an undo.
+        (("workflow", "adopt-policy"), ("workflow", "adopt-policy", "WF-1")),
+        (("workflow", "checkpoint"), ("workflow", "checkpoint", "WF-1", "SELF")),
+        (("workflow", "restore"), ("workflow", "restore", "WF-1", "SELF")),
+        (("workflow", "compensate"),
+         ("workflow", "compensate", "WF-1", "SELF")),
         (("workflow", "export-intents"), ("workflow", "export-intents", "SELF")),
         (("ingest", "dropfile"), ("ingest", "dropfile", "SELF")),
         (("done",), ("done", "T-0002", "--no-evidence", "--reason", "because")),
@@ -1392,7 +1399,7 @@ class ExclusionTests(PowerCase):
         """(25) U-E2 changed no schema, and must not. U-M2 owns the version:
         this pins that power modes follow it rather than declaring their own.
         """
-        self.assertEqual(db.SCHEMA_VERSION, "6")
+        self.assertEqual(db.SCHEMA_VERSION, "7")
         self.assertEqual(migrations.LATEST_VERSION, int(db.SCHEMA_VERSION))
 
     def test_power_state_lives_beside_the_ledger_not_inside_it(self):

@@ -64,6 +64,9 @@ CONTRACT_LEAVES = (
     "admit", "validate", "request-approval", "approve", "dispatch",
     "revoke-dispatch", "cancel", "receipt", "result", "show", "list",
     "verify", "export-intents",
+    # U-W3 §13.1's four. Still hand-transcribed from the contract's table,
+    # never read from `cli`.
+    "adopt-policy", "checkpoint", "restore", "compensate",
 )
 
 #: U-W2 §16's Policy column, hand-transcribed as (kind, ledger).
@@ -81,6 +84,10 @@ CONTRACT_POLICY = {
     "list": ("read_only", False),
     "verify": ("read_only", False),
     "export-intents": ("derived_write", False),
+    "adopt-policy": ("authoritative_write", True),
+    "checkpoint": ("authoritative_write", True),
+    "restore": ("authoritative_write", True),
+    "compensate": ("authoritative_write", True),
 }
 
 #: The COMPLETE option surface U-W2 §16 grants, per leaf (contract §2.2).
@@ -89,7 +96,7 @@ CONTRACT_OPTIONS = {
     "validate": frozenset(),
     "request-approval": frozenset(),
     "approve": frozenset(),
-    "dispatch": frozenset({"--route"}),
+    "dispatch": frozenset({"--route", "--restore"}),
     "revoke-dispatch": frozenset(),
     "cancel": frozenset(),
     "receipt": frozenset(),
@@ -98,6 +105,10 @@ CONTRACT_OPTIONS = {
     "list": frozenset({"--state", "--json"}),
     "verify": frozenset(),
     "export-intents": frozenset(),
+    "adopt-policy": frozenset(),
+    "checkpoint": frozenset(),
+    "restore": frozenset(),
+    "compensate": frozenset(),
 }
 
 #: Positional argument counts, hand-transcribed from §16.
@@ -105,6 +116,7 @@ CONTRACT_POSITIONALS = {
     "admit": 2, "validate": 1, "request-approval": 1, "approve": 2,
     "dispatch": 1, "revoke-dispatch": 1, "cancel": 1, "receipt": 2,
     "result": 2, "show": 1, "list": 0, "verify": 1, "export-intents": 1,
+    "adopt-policy": 1, "checkpoint": 2, "restore": 2, "compensate": 2,
 }
 
 #: U-W2.2 addendum B1 §B1.14's obligation, transcribed as a constant here so
@@ -501,12 +513,12 @@ class ParserTests(CliCase):
                   if p and p[0] == "workflow"]
         self.assertEqual(
             leaves, [("workflow", v) for v in sorted(CONTRACT_LEAVES)],
-            "the workflow group is not exactly the thirteen §16 leaves",
+            "the workflow group is not exactly the seventeen leaves",
         )
-        self.assertEqual(len(leaves), 13)
+        self.assertEqual(len(leaves), 17)
         self.assertEqual(sorted(_leaf_parsers()), sorted(CONTRACT_LEAVES))
 
-    def test_the_thirteen_leaves_have_the_contracted_kinds(self):
+    def test_the_seventeen_leaves_have_the_contracted_kinds(self):
         """C2 — kills M-15."""
         for verb, (kind, ledger) in sorted(CONTRACT_POLICY.items()):
             with self.subTest(verb=verb):
@@ -515,10 +527,10 @@ class ParserTests(CliCase):
                 self.assertEqual(policy.ledger, ledger)
         kinds = [power.COMMAND_POLICY[("workflow", v)].kind
                  for v in CONTRACT_LEAVES]
-        self.assertEqual(kinds.count(power.AUTHORITATIVE_WRITE), 9)
+        self.assertEqual(kinds.count(power.AUTHORITATIVE_WRITE), 13)
         self.assertEqual(kinds.count(power.READ_ONLY), 3)
         self.assertEqual(kinds.count(power.DERIVED_WRITE), 1)
-        self.assertEqual(len(kinds), 13)
+        self.assertEqual(len(kinds), 17)
 
     def test_only_the_frozen_options_exist(self):
         """C3 — an added --actor, --json on a write verb, or --json on verify."""
@@ -608,7 +620,7 @@ class ParserTests(CliCase):
         parser = _leaf_parsers()["list"]
         state = [a for a in parser._actions if "--state" in a.option_strings][0]
         self.assertEqual(tuple(state.choices), workflow_engine.WORKFLOW_STATES)
-        self.assertEqual(len(workflow_engine.WORKFLOW_STATES), 13)
+        self.assertEqual(len(workflow_engine.WORKFLOW_STATES), 14)
         for member in workflow_engine.WORKFLOW_STATES:
             self.assertIn(member, state.choices)
 
@@ -934,7 +946,7 @@ class OutputTests(CliCase):
         record_fields = [f.name for f in
                          workflow_store.WorkflowRecord.__dataclass_fields__.values()]
         self.assertEqual(list(document["workflow"]), record_fields)
-        self.assertEqual(len(record_fields), 20)
+        self.assertEqual(len(record_fields), 25)
         history_fields = [f.name for f in
                           workflow_store.HistoryView.__dataclass_fields__.values()]
         self.assertIn("integrity", history_fields)
@@ -1484,20 +1496,20 @@ class PowerTests(CliCase):
         self.assertEqual(sorted(should_block - covered), [])
         self.assertEqual(sorted(covered - should_block), [])
         workflow_rows = sorted(p for p in covered if p[0] == "workflow")
-        self.assertEqual(len(workflow_rows), 10)
+        self.assertEqual(len(workflow_rows), 14)
         self.assertEqual(
             workflow_rows,
             sorted(("workflow", v) for v in CONTRACT_LEAVES
                    if CONTRACT_POLICY[v][0] != "read_only"),
         )
 
-    def test_deep_mode_preflights_the_nine_ledger_writers(self):
+    def test_deep_mode_preflights_the_thirteen_ledger_writers(self):
         """C11 — the deep class split, read out of the live policy."""
         deep = [v for v in CONTRACT_LEAVES
                 if power.COMMAND_POLICY[("workflow", v)].kind
                 == power.AUTHORITATIVE_WRITE
                 and power.COMMAND_POLICY[("workflow", v)].ledger]
-        self.assertEqual(len(deep), 9)
+        self.assertEqual(len(deep), 13)
         self.ok("power", "set", "deep")
         self.admit()  # a clean deep write still runs
 
@@ -1507,6 +1519,14 @@ class PowerTests(CliCase):
         self.admit()
         self.ok("workflow", "validate", self.wf)
         self.ok("workflow", "show", self.wf)
+
+
+#: The thirteen leaves the U-W2 README section documents. U-W3's four are
+#: documented in its OWN section (C21's unchanged obligation, new content).
+U_W2_README_LEAVES = tuple(
+    v for v in CONTRACT_LEAVES
+    if v not in ("adopt-policy", "checkpoint", "restore", "compensate")
+)
 
 
 class ReadmeTests(CliCase):
@@ -1529,9 +1549,11 @@ class ReadmeTests(CliCase):
         self.assertLess(text.index("## Deterministic WorkSpec compiler (U-W1)"),
                         text.index(self.SECTION))
         self.assertLess(text.index(self.SECTION),
+                        text.index("## Workflow runtime recovery (U-W3)"))
+        self.assertLess(text.index("## Workflow runtime recovery (U-W3)"),
                         text.index("## Weekend commands"))
         section = self._section_text()
-        for verb in CONTRACT_LEAVES:
+        for verb in U_W2_README_LEAVES:
             with self.subTest(verb=verb):
                 self.assertIn(f"python aos.py workflow {verb}", section)
         # The B1 §B1.14 caveat is quoted verbatim, so the README and the CLI
@@ -1549,7 +1571,7 @@ class ReadmeTests(CliCase):
         ]
         self.assertGreaterEqual(len(lines), 18, "the frozen blocks are missing")
         documented = {line.split()[3] for line in lines}
-        self.assertEqual(documented, set(CONTRACT_LEAVES))
+        self.assertEqual(documented, set(U_W2_README_LEAVES))
 
         # A workflow for the journey block, and a second for the withdrawal
         # block, so `revoke-dispatch` and `cancel` have honest preconditions.
@@ -1635,16 +1657,48 @@ class ExclusionTests(unittest.TestCase):
         "subprocess", "socket", "eval", "exec", "compile", "__import__",
         "importlib", "system", "popen", "urlopen", "connect", "sleep",
     )
+    #: Thirteen of the landed fifteen, still banned across the ENTIRE region:
+    #: the eleven uncontested ones plus `retry` (U-W3 mints no retry leaf — a
+    #: retry IS `workflow dispatch` from `retrying`) and `resume` (U-W3's verb
+    #: is `restore`). Keeping thirteen of fifteen region-wide is what makes
+    #: U-W3 §13.5 a narrowing rather than a repeal.
     FORBIDDEN_TOKENS = (
         "ai-company-runtime", "postgres", "psycopg", "lease", "heartbeat",
-        "worker", "retry", "checkpoint", "resume", "compensat", "temporal",
+        "worker", "retry", "resume", "temporal",
         "monitor", "interrupt", ".claude", "aos.db",
     )
+
+    #: The two narrowly exempted tokens, and the EXACT set of functions that
+    #: may carry them. Asserted as an exact set in both directions, so the
+    #: exemption cannot drift by addition or by omission; an eighth function
+    #: needing either is U-W3 §21 replan trigger 10.
+    NARROW_TOKENS = ("checkpoint", "compensat")
+    #: The functions that ACTUALLY carry one, measured. `cmd_workflow_restore`
+    #: and `cmd_workflow_adopt_policy` are inside the frozen exemption but
+    #: need neither token: the restore fact's `checkpoint_id` is parsed by the
+    #: engine, and the adopt-policy help string lives in the parser builder.
+    #: Pinning the real set two ways is STRICTER than the contract's ceiling.
+    NARROW_CARRIERS = frozenset((
+        "cmd_workflow_checkpoint",
+        "cmd_workflow_compensate",
+        "_build_workflow_parser",
+        "cmd_workflow_dispatch",
+        "cmd_workflow_show",
+    ))
+    NARROW_EXEMPT = frozenset((
+        "cmd_workflow_checkpoint",
+        "cmd_workflow_restore",
+        "cmd_workflow_compensate",
+        "cmd_workflow_adopt_policy",
+        "_build_workflow_parser",
+        "cmd_workflow_dispatch",
+        "cmd_workflow_show",
+    ))
 
     def test_the_workflow_cli_region_has_no_forbidden_surface(self):
         """C22."""
         nodes = _region_nodes()
-        self.assertGreaterEqual(len(nodes), 13,
+        self.assertGreaterEqual(len(nodes), 17,
                                 "the workflow region was not found")
         source = _region_source()
         for node in nodes:
@@ -1685,11 +1739,44 @@ class ExclusionTests(unittest.TestCase):
                              f"the region normalises a path with {banned}")
 
     def test_no_private_runtime_or_future_unit_surface(self):
-        """C26."""
+        """C26, as narrowed by U-W3 §13.5."""
         source = _region_source().lower()
         for token in self.FORBIDDEN_TOKENS:
             with self.subTest(token=token):
                 self.assertNotIn(token, source)
+
+    def test_the_two_narrow_tokens_live_in_exactly_seven_functions(self):
+        """C26's narrowing, asserted as an EXACT set in both directions.
+
+        `checkpoint` and `compensat` are permitted only inside the seven
+        enumerated functions, and every other function in the region is proved
+        free of both. The MEASURED carrier set is asserted exactly, in both
+        directions, so the exemption can neither spread nor drift; the frozen
+        seven remain the ceiling an eighth would breach (§21 trigger 10).
+        """
+        text = CLI_SOURCE.read_text(encoding="utf-8")
+        carriers = {}
+        for node in _region_nodes():
+            body = (ast.get_source_segment(text, node) or "").lower()
+            carriers[node.name] = {
+                token for token in self.NARROW_TOKENS if token in body
+            }
+        # EXACT, both ways: the measured carrier set is exactly these five,
+        # so the exemption can neither spread to a sixth function nor be
+        # quietly widened by a function that stops needing its token.
+        self.assertEqual(
+            {name for name, hits in carriers.items() if hits},
+            self.NARROW_CARRIERS,
+        )
+        # The carriers stay INSIDE the frozen seven-function ceiling — an
+        # eighth is U-W3 §21 replan trigger 10 — and every one of the seven is
+        # a real function, so the list cannot be padded with absent names.
+        self.assertLessEqual(self.NARROW_CARRIERS, self.NARROW_EXEMPT)
+        self.assertEqual(self.NARROW_EXEMPT - set(carriers), set())
+        # `retrying` — the fourteenth state — contains the region-wide banned
+        # token `retry`, so no state literal may appear in the region at all;
+        # state names reach the CLI only through the engine's vocabulary.
+        self.assertNotIn("retrying", _region_source().lower())
 
     def test_the_region_calls_only_the_six_store_functions(self):
         """C22 — the store mapping, mechanically."""
