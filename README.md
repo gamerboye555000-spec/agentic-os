@@ -758,6 +758,101 @@ The frozen contracts are
 store's parent, and governed amendments A1-A3) and
 `agentic-os-v0.4-u-w2-3-workflow-cli-contract.md` (this CLI).
 
+## Workflow runtime recovery (U-W3)
+
+U-W3 adds transition-policy version 2: a fourteenth state (`retrying`), a
+14×14 matrix with thirty-five active edges, thirteen commands, twenty-four
+events and fifty-seven closed refusal reasons — superseding the thirteen /
+13×13 / nine / seventeen / forty-three the U-W2 section above describes, which
+is left as the record of what U-W2 shipped. Policy version 1's tuple and matrix
+are retained verbatim, so a workflow admitted under it keeps replaying under
+its own rules forever.
+
+What it adds on top of that vocabulary is bounded workflow retry, checkpoint
+persistence, state-restoration resume, and compensation. It still executes
+nothing. Every fact it records was produced somewhere else and verified here.
+
+**Policy adoption is explicit.** A workflow admitted under policy version 1
+cannot retry, checkpoint, restore or compensate until someone adopts the new
+policy on it. Adoption is forward-only, never automatic, and available only to
+an instance that has not yet consumed an attempt — silently upgrading one would
+rewrite what it was decided under.
+
+```bash
+python aos.py workflow adopt-policy WF-…
+```
+
+**Retry is bounded by the artifact.** The budget is the WorkSpec's own
+`retry.max_attempts`, defaulting to 1 — digest-bound, so it cannot drift, and
+never read from the queue. A failing result or a failing queue receipt that
+says `retryable` moves the instance to `retrying` when attempts remain, and to
+terminal `failed` when they do not. There is no retry verb: a retry IS a
+dispatch issued from `retrying`, and the intent it emits states the attempt
+ordinal and the budget, so whoever enqueues it can read both.
+
+```bash
+python aos.py workflow dispatch WF-…
+python aos.py workflow dispatch WF-… --restore <CHECKPOINT_ID>
+```
+
+An attempt is RESERVED when you request a dispatch and only CONSUMED when the
+queue's `accepted` receipt arrives, so a rejection or a revocation costs no
+budget. One runtime task belongs to exactly one attempt; a receipt re-offering
+a task another attempt already bound is refused, not counted twice.
+
+**Checkpoints are stored, never produced.** `aos.workflow-checkpoint/v1` is
+bounded execution-restoration state the executing side writes. AOS validates
+the shape, the size (64 KiB), the count (8 per attempt), and the bindings, then
+stores the bytes verbatim. It never reads a key, never interprets a value and
+never prints one. A payload that scans secret-shaped is REFUSED and not stored
+— not redacted, because a redacted checkpoint is an unrestorable lie.
+Checkpoints are append-only: a redelivered identical record is a replay, and
+the same id with different bytes is refused.
+
+```bash
+python aos.py workflow checkpoint WF-… ./checkpoint.json
+python aos.py workflow restore WF-… ./restore-fact.json
+```
+
+Restoring is a separate fact from resuming. A `resumed` receipt means the queue
+left a wait state; it is never proof that a checkpoint was loaded. Only a
+verified `aos.workflow-restore-fact/v1` says that, it changes no state, and it
+must name the checkpoint's own digest and attempt.
+
+**Compensation is reported, not inferred.** A WorkSpec cannot declare that its
+work is compensable — the protocol has no such property. Only the executing
+side can report it, through a failing result envelope carrying
+`compensation.state: "pending"`. That envelope, bound to the admitted WorkSpec
+digest, is the only authority: no tool manifest, no compile finding and no
+`recovery.action` can start a compensation. It outranks retry, because undoing
+a partial effect before re-running is the only safe order. It concludes exactly
+twice — `compensated` or `failed` — and there is no compensation retry and no
+partial compensation.
+
+```bash
+python aos.py workflow compensate WF-… ./compensation.json
+```
+
+`workflow show` reports the attempt ordinal, the attempt state, attempts used,
+the budget and the checkpoint count. No stored body ever reaches a terminal.
+
+All four new leaves are blocked in recovery mode: a damaged workspace must not
+decide a retry, store a checkpoint, claim a restoration or conclude an undo.
+
+**Boundaries.** U-W3 adds no queue, lease, worker, backoff or heartbeat, and
+models none of the private runtime's own task retry — AOS counts what AOS
+observed, so a runtime requeue is invisible and free. It reads no
+`beast.interrupt/v1`, adds no liveness monitoring, adopts no durable engine,
+and changes no protocol schema. Declared limitations: a v1 workflow that has
+already consumed an attempt can never adopt policy v2 and must run out under v1
+(synthesizing the missing attempt history would be exactly the fabrication this
+architecture refuses); `waiting_input` and `paused` remain unreachable; and a
+WorkSpec whose budget disagrees with the queue row it was enqueued into is
+refused rather than reconciled.
+
+The frozen contract is
+`agentic-os-v0.4-u-w3-runtime-recovery-contract.md`.
+
 ## Weekend commands
 
 Decisions, handoffs, and memory are first-class ledger rows (each mutation

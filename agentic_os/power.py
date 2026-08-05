@@ -250,6 +250,13 @@ COMMAND_POLICY: dict[tuple[str, ...], CommandPolicy] = {
     ("workflow", "cancel"):           _p(AUTHORITATIVE_WRITE, ledger=True),
     ("workflow", "receipt"):          _p(AUTHORITATIVE_WRITE, ledger=True),
     ("workflow", "result"):           _p(AUTHORITATIVE_WRITE, ledger=True),
+    # U-W3's four recovery writers. None is in RECOVERY_ALLOWED_KINDS, so all
+    # four are blocked in recovery mode: a damaged workspace must not decide a
+    # retry, store a checkpoint, claim a restoration or conclude an undo.
+    ("workflow", "adopt-policy"):     _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("workflow", "checkpoint"):       _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("workflow", "restore"):          _p(AUTHORITATIVE_WRITE, ledger=True),
+    ("workflow", "compensate"):       _p(AUTHORITATIVE_WRITE, ledger=True),
     ("workflow", "show"):             _p(READ_ONLY),
     ("workflow", "list"):             _p(READ_ONLY),
     ("workflow", "verify"):           _p(READ_ONLY),

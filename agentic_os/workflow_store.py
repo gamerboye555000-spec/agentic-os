@@ -34,7 +34,8 @@ re-derived from the admitted artifact digest, the history is re-verified before
 it is folded, and the reducer's own `_verify_snapshot` runs the stored WorkSpec
 back through the U-W1 acceptance gate on every command. Stored text is DATA:
 it never becomes SQL (every statement is parameterized and the only
-interpolated identifiers are the six frozen `db.py` table-name constants),
+interpolated identifiers are the eight frozen `db.py` table-name
+constants),
 never becomes a message (§18.5), and never becomes a path, a command, or a
 tool input — this module opens nothing, spawns nothing, and imports nothing
 dynamically.
@@ -82,7 +83,7 @@ STORE_ERROR_CODES = (
     "store_unavailable",
 )
 
-#: The four §5.8 ROW-hash identities. They are this module's own frozen
+#: The six §5.8 ROW-hash identities. They are this module's own frozen
 #: constants in the `aos.*` house style, exactly as `routing.py` and
 #: `agent_handoffs.py` define theirs — NOT document schemas, and they touch
 #: neither U-W2 §13.4's six minted record schemas nor the U-X1 registry.
@@ -90,6 +91,8 @@ COMMAND_ROW_SCHEMA = "aos.workflow-command-row/v1"
 INTENT_ROW_SCHEMA = "aos.workflow-intent-row/v1"
 RECEIPT_ROW_SCHEMA = "aos.workflow-receipt-row/v1"
 FACT_ROW_SCHEMA = "aos.workflow-fact-row/v1"
+ATTEMPT_ROW_SCHEMA = "aos.workflow-attempt-row/v1"
+CHECKPOINT_ROW_SCHEMA = "aos.workflow-checkpoint-row/v1"
 
 #: The one `tasks` status that closes a task (§10.4). Pinned by §20 row S20 to
 #: be a `models.TASK_STATUSES` member and the status `ops.mark_done` sets.
@@ -150,6 +153,11 @@ _CLOSED_DIAGNOSTIC_VALUES = frozenset(
     + workflow_engine.WORKFLOW_RECEIPT_KINDS
     + workflow_engine.WORKFLOW_INTENT_KINDS
     + workflow_engine.APPROVAL_SCOPES
+    # U-W3 §15 item 4: the fourteen new refusal codes and the third intent
+    # kind arrive automatically through the tuples above; the attempt-row
+    # states are their own closed vocabulary and are added explicitly.
+    + workflow_engine.WORKFLOW_ATTEMPT_STATES
+    + workflow_engine.WORKFLOW_COMPENSATION_STATES
     + tuple(protocols.REASON_HINTS)
     + ("valid", "warning", "requires_external_authority",
        "invalid", "unresolved", "ineligible", "success", "fail",
@@ -159,7 +167,7 @@ _CLOSED_DIAGNOSTIC_VALUES = frozenset(
 
 # ---------------------------------------------------------------------------
 # SQL. Every statement is a module-level constant; every value binds through a
-# `?` placeholder; the ONLY interpolated identifiers are the six frozen
+# `?` placeholder; the ONLY interpolated identifiers are the eight frozen
 # table-name constants from `db.py` (§18.5, pinned by §20 row S18).
 
 _SQL_SCHEMA_VERSION = "SELECT value FROM meta WHERE key = 'schema_version'"
@@ -309,6 +317,76 @@ _SQL_FINALIZE_FACT = (
     f"UPDATE {db.WORKFLOW_FACTS_TABLE} SET content_sha256 = ? WHERE id = ?"
 )
 
+_ATTEMPT_COLUMNS = (
+    "id, workflow_id, attempt_no, state, runtime_task_uuid, "
+    "dispatch_intent_id, idempotency_key, result_sha256, opened_seq, "
+    "closed_seq, created_at, updated_at, content_sha256"
+)
+_SQL_SELECT_ATTEMPT_ROWS = (
+    f"SELECT {_ATTEMPT_COLUMNS} FROM {db.WORKFLOW_ATTEMPTS_TABLE} "
+    "WHERE workflow_id = ? ORDER BY id ASC"
+)
+_SQL_SELECT_ATTEMPT_ROW = (
+    f"SELECT {_ATTEMPT_COLUMNS} FROM {db.WORKFLOW_ATTEMPTS_TABLE} WHERE id = ?"
+)
+_SQL_SELECT_OPEN_ATTEMPT = (
+    f"SELECT {_ATTEMPT_COLUMNS} FROM {db.WORKFLOW_ATTEMPTS_TABLE} "
+    "WHERE workflow_id = ? AND state = 'open'"
+)
+_SQL_INSERT_ATTEMPT = (
+    f"INSERT INTO {db.WORKFLOW_ATTEMPTS_TABLE} ("
+    "workflow_id, attempt_no, state, runtime_task_uuid, dispatch_intent_id, "
+    "idempotency_key, result_sha256, opened_seq, closed_seq, created_at, "
+    "updated_at, content_sha256"
+    ") VALUES (?, ?, 'open', ?, ?, ?, NULL, ?, NULL, ?, ?, ?)"
+)
+_SQL_FINALIZE_ATTEMPT = (
+    f"UPDATE {db.WORKFLOW_ATTEMPTS_TABLE} SET content_sha256 = ? WHERE id = ?"
+)
+#: The ONE compare-and-swap that closes an attempt, fenced on `state='open'`
+#: with a required rowcount of 1 — the `_close_intent` discipline, so a second
+#: close is impossible and no reverse transition exists.
+_SQL_CLOSE_ATTEMPT = (
+    f"UPDATE {db.WORKFLOW_ATTEMPTS_TABLE} SET state = ?, closed_seq = ?, "
+    "result_sha256 = ?, updated_at = ?, content_sha256 = ? "
+    "WHERE id = ? AND state = 'open'"
+)
+
+_CHECKPOINT_COLUMNS = (
+    "id, workflow_id, attempt_no, checkpoint_id, checkpoint_seq, "
+    "runtime_task_uuid, document, document_sha256, payload_bytes, "
+    "recorded_at, content_sha256"
+)
+_SQL_SELECT_CHECKPOINT_ROWS = (
+    f"SELECT {_CHECKPOINT_COLUMNS} FROM {db.WORKFLOW_CHECKPOINTS_TABLE} "
+    "WHERE workflow_id = ? ORDER BY id ASC"
+)
+_SQL_SELECT_CHECKPOINT_ROW = (
+    f"SELECT {_CHECKPOINT_COLUMNS} FROM {db.WORKFLOW_CHECKPOINTS_TABLE} "
+    "WHERE id = ?"
+)
+#: Ledger identity is `(workflow_id, checkpoint_id)` (§7.1), so both halves
+#: bind: the same producer-supplied id under a DIFFERENT workflow is a
+#: different checkpoint, not a conflict, and the DDL's
+#: `UNIQUE(workflow_id, checkpoint_id)` admits it.
+_SQL_SELECT_CHECKPOINT = (
+    "SELECT workflow_id, attempt_no, document, document_sha256 "
+    f"FROM {db.WORKFLOW_CHECKPOINTS_TABLE} "
+    "WHERE workflow_id = ? AND checkpoint_id = ?"
+)
+#: INSERT-ONCE. No `UPDATE` or `DELETE` targets this table anywhere after the
+#: creating transaction's own row-hash finalization.
+_SQL_INSERT_CHECKPOINT = (
+    f"INSERT INTO {db.WORKFLOW_CHECKPOINTS_TABLE} ("
+    "workflow_id, attempt_no, checkpoint_id, checkpoint_seq, "
+    "runtime_task_uuid, document, document_sha256, payload_bytes, "
+    "recorded_at, content_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+_SQL_FINALIZE_CHECKPOINT = (
+    f"UPDATE {db.WORKFLOW_CHECKPOINTS_TABLE} SET content_sha256 = ? "
+    "WHERE id = ?"
+)
+
 #: Written into a row-hash column between its INSERT and the finalization
 #: UPDATE of §5.8. It never survives the transaction: the finalization is the
 #: next statement, and any exception in between rolls the whole row away.
@@ -368,6 +446,19 @@ class WorkflowRecord:
     updated_at: str
     content_sha256: str
     integrity: str
+    # U-W3 §13.3's five additive members. Their source is the REBUILT
+    # snapshot, never a direct read of `workflow_attempts` or
+    # `workflow_checkpoints`: reporting a projection of a ledger the same call
+    # has just declared divergent is exactly what U-W2.2 §18 forbids. When
+    # `integrity != "ok"` there is no rebuilt snapshot, so all five are
+    # `None` — "unknown", never a fabricated zero. A policy-v1 workflow also
+    # reports `None` for all five, because policy v1 kept no attempt
+    # accounting and inventing one is the fabrication §14 forbids.
+    attempt_no: int | None = None
+    attempt_state: str | None = None
+    attempts_used: int | None = None
+    attempt_budget: int | None = None
+    checkpoint_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -740,7 +831,51 @@ def _fact_row_payload(row) -> dict:
     }
 
 
-#: `(table name, SELECT, payload builder, stored-hash index)` — the four
+def _attempt_row_payload(row) -> dict:
+    """The U-W3 attempt row's §5.8 hash payload, built with the live idiom:
+    `record_schema` key, text fields bound by their sha256 leaf, integers
+    bound directly, `None` passed through, `content_sha256` excluded, and the
+    workflow identity bound as `_leaf(_render(row_id))`."""
+    return {
+        "record_schema": ATTEMPT_ROW_SCHEMA,
+        "id": _req_int(row[0], "/id"),
+        "workflow_id_sha256": _leaf(_render(_req_row_id(row[1], "/workflow_id"))),
+        "attempt_no": _req_int(row[2], "/attempt_no"),
+        "state_sha256": _text_leaf(row[3], "/state"),
+        "runtime_task_uuid_sha256": _text_leaf(row[4], "/runtime_task_uuid"),
+        "dispatch_intent_id_sha256": _text_leaf(row[5], "/dispatch_intent_id"),
+        "idempotency_key_sha256": _text_leaf(row[6], "/idempotency_key"),
+        "result_sha256_sha256": _opt_leaf(row[7], "/result_sha256"),
+        "opened_seq": _req_int(row[8], "/opened_seq"),
+        "closed_seq": None if row[9] is None else _req_int(row[9], "/closed_seq"),
+        "created_at_sha256": _text_leaf(row[10], "/created_at"),
+        "updated_at_sha256": _text_leaf(row[11], "/updated_at"),
+    }
+
+
+def _checkpoint_row_payload(row) -> dict:
+    """The U-W3 checkpoint row's §5.8 hash payload.
+
+    The stored BODY is bound here only by its digest COLUMN's leaf, exactly as
+    the fact row binds `document_sha256`; `_DOCUMENT_BOUND_TABLES` re-digests
+    the body itself independently, which is what catches a forged payload
+    beside an untouched digest column.
+    """
+    return {
+        "record_schema": CHECKPOINT_ROW_SCHEMA,
+        "id": _req_int(row[0], "/id"),
+        "workflow_id_sha256": _leaf(_render(_req_row_id(row[1], "/workflow_id"))),
+        "attempt_no": _req_int(row[2], "/attempt_no"),
+        "checkpoint_id_sha256": _text_leaf(row[3], "/checkpoint_id"),
+        "checkpoint_seq": _req_int(row[4], "/checkpoint_seq"),
+        "runtime_task_uuid_sha256": _text_leaf(row[5], "/runtime_task_uuid"),
+        "document_sha256_sha256": _text_leaf(row[7], "/document_sha256"),
+        "payload_bytes": _req_int(row[8], "/payload_bytes"),
+        "recorded_at_sha256": _text_leaf(row[9], "/recorded_at"),
+    }
+
+
+#: `(table name, SELECT, payload builder, stored-hash index)` — the six
 #: row-hash tables `verify` recomputes (§15.4 step 4).
 _ROW_HASH_TABLES = (
     (db.WORKFLOW_COMMANDS_TABLE, _SQL_SELECT_COMMAND_ROWS,
@@ -750,6 +885,10 @@ _ROW_HASH_TABLES = (
     (db.WORKFLOW_RECEIPTS_TABLE, _SQL_SELECT_RECEIPT_ROWS,
      _receipt_row_payload, 9),
     (db.WORKFLOW_FACTS_TABLE, _SQL_SELECT_FACT_ROWS, _fact_row_payload, 7),
+    (db.WORKFLOW_ATTEMPTS_TABLE, _SQL_SELECT_ATTEMPT_ROWS,
+     _attempt_row_payload, 12),
+    (db.WORKFLOW_CHECKPOINTS_TABLE, _SQL_SELECT_CHECKPOINT_ROWS,
+     _checkpoint_row_payload, 10),
 )
 
 
@@ -1355,6 +1494,146 @@ def _insert_fact(conn, workflow_row_id, kind, scope, document,
               cursor.lastrowid, _fact_row_payload)
 
 
+#: Emitted event -> how it CLOSES the open workflow attempt (§6.2). The
+#: mapping is read off the EMITTED EVENT PAYLOADS, never by diffing snapshots
+#: — the `_resolve_intent` discipline, applied a second time.
+_ATTEMPT_CLOSERS = (
+    ("workflow_succeeded", "succeeded"),
+    ("attempt_failed", "failed"),
+    ("compensation_started", "failed"),
+    ("workflow_failed", "failed"),
+    ("workflow_cancelled", "abandoned"),
+)
+
+
+def _apply_attempts(conn, workflow_row_id, records, created_at) -> None:
+    """C11b: open and close workflow attempts from the emitted events.
+
+    Exactly two writes reach an attempt row: the INSERT that opens it and one
+    compare-and-swap that closes it. A policy-v1 `dispatch_accepted` carries
+    no `attempt_no` and opens NOTHING — the migration derives no attempt row
+    and neither does this, so a v1 workflow keeps the empty ledger its history
+    honestly records.
+    """
+    for record in records:
+        name = record["event"]
+        payload = record["payload"]
+        if name == "dispatch_accepted":
+            if "attempt_no" in payload:
+                _open_attempt(conn, workflow_row_id, record, created_at)
+            continue
+        for event_name, state in _ATTEMPT_CLOSERS:
+            if event_name != name:
+                continue
+            _close_attempt(
+                conn, workflow_row_id, state, record["seq"],
+                payload.get("result_sha256"), created_at,
+            )
+            break
+
+
+def _open_attempt(conn, workflow_row_id, record, created_at) -> None:
+    """The opening INSERT. `content_sha256` has no default, so the row is
+    born with its §5.8 hash inside the creating transaction."""
+    payload = record["payload"]
+    try:
+        cursor = conn.execute(
+            _SQL_INSERT_ATTEMPT,
+            (
+                workflow_row_id,
+                payload["attempt_no"],
+                payload["runtime_task_uuid"],
+                payload["intent_id"],
+                payload["idempotency_key"],
+                record["seq"],
+                created_at,
+                created_at,
+                _PENDING_HASH,
+            ),
+        )
+    except sqlite3.IntegrityError:
+        # The SECOND statement that maps an IntegrityError to a workflow
+        # refusal (`_insert_workflow` is the first); from anywhere else a
+        # constraint violation is `store_unavailable`.
+        #
+        # `UNIQUE(workflow_id, runtime_task_uuid)` is §6.5's storage backstop.
+        # The reducer's own gate compares against the FOLDED binding, which is
+        # the most recent attempt's, so an `accepted` receipt replaying an
+        # OLDER attempt's task reaches this INSERT. That is a caller error —
+        # a reused or replayed runtime task — not a damaged ledger, so it
+        # earns the same closed code the reducer would have used, is RETURNED
+        # in a `StoreOutcome` rather than raised, and is therefore journalled
+        # like every other refusal (§22 A29.3).
+        raise _refuse(
+            "runtime_uuid_mismatch", "/runtime_task_uuid"
+        ) from None
+    except sqlite3.Error:
+        raise WorkflowStoreError("store_unavailable") from None
+    _finalize(conn, _SQL_FINALIZE_ATTEMPT, _SQL_SELECT_ATTEMPT_ROW,
+              cursor.lastrowid, _attempt_row_payload)
+
+
+def _close_attempt(conn, workflow_row_id, state, closed_seq, result_sha256,
+                   created_at) -> None:
+    """The ONE closing compare-and-swap, fenced on `state = 'open'`.
+
+    No open row is not an error: a policy-v1 workflow has none, and a
+    compensation conclusion arrives after `compensation_started` already
+    closed the attempt. Silence there is the truth, not a swallowed failure —
+    the CAS below still requires exactly one row whenever there IS one.
+    """
+    row = _fetchone(conn, _SQL_SELECT_OPEN_ATTEMPT, (workflow_row_id,))
+    if row is None:
+        return
+    try:
+        payload = _attempt_row_payload(row)
+    except _RowUnreadable:
+        raise WorkflowStoreError("store_unavailable") from None
+    payload["state_sha256"] = _leaf(state)
+    payload["closed_seq"] = closed_seq
+    payload["result_sha256_sha256"] = (
+        None if result_sha256 is None else _leaf(result_sha256)
+    )
+    payload["updated_at_sha256"] = _leaf(created_at)
+    cursor = _execute(
+        conn,
+        _SQL_CLOSE_ATTEMPT,
+        (
+            state, closed_seq, result_sha256, created_at,
+            _row_digest(payload), row[0],
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise WorkflowStoreError("store_unavailable")
+
+
+def _insert_checkpoint(conn, workflow_row_id, document, created_at) -> None:
+    """C12b: the checkpoint INSERT and its §5.8 finalization.
+
+    The body is stored VERBATIM and its digest is RECOMPUTED here, never read
+    from the document. `payload_bytes` is the recomputed canonical length,
+    stored so `verify` can re-check the bound without re-serializing.
+    """
+    cursor = _execute(
+        conn,
+        _SQL_INSERT_CHECKPOINT,
+        (
+            workflow_row_id,
+            document["attempt_no"],
+            document["checkpoint_id"],
+            document["checkpoint_seq"],
+            document["runtime_task_uuid"],
+            _serialize(document),
+            protocols.content_digest(document),
+            len(protocols.serialize_canonical(document["payload"])),
+            created_at,
+            _PENDING_HASH,
+        ),
+    )
+    _finalize(conn, _SQL_FINALIZE_CHECKPOINT, _SQL_SELECT_CHECKPOINT_ROW,
+              cursor.lastrowid, _checkpoint_row_payload)
+
+
 def _cas_snapshot(conn, workflow_row_id, snapshot, expected_revision,
                   created_at) -> None:
     """C14. Under `BEGIN IMMEDIATE` a rowcount of 0 is unreachable from
@@ -1577,11 +1856,150 @@ def _receipt_dedupe(conn, workflow_row_id, work_spec_sha256, identity):
     raise WorkflowStoreError("store_unavailable")
 
 
+def _checkpoint_identity(payload):
+    """(checkpoint_id, digest, document) or `None` (the R1 shape, applied to
+    checkpoints). A payload that is not a canonically serializable object
+    carrying a UUID `checkpoint_id` SKIPS the dedupe and lets `decide` refuse
+    `checkpoint_malformed`: the store adds no checkpoint validation of its own
+    and duplicates none."""
+    if not isinstance(payload, dict):
+        return None
+    document = payload.get("checkpoint_document")
+    if not isinstance(document, dict):
+        return None
+    checkpoint_id = document.get("checkpoint_id")
+    if not isinstance(checkpoint_id, str) or not _UUID_RE.fullmatch(
+        checkpoint_id
+    ):
+        return None
+    try:
+        digest = protocols.content_digest(document)
+    except protocols.ProtocolError:
+        return None
+    return checkpoint_id, digest, document
+
+
+def _checkpoint_dedupe(conn, workflow_row_id, work_spec_sha256, identity):
+    """K1 (§8.2): append-only means a redelivered checkpoint is answered, not
+    written twice.
+
+    Same id and an EQUAL digest is a `replay`; same id and a DIFFERENT body
+    refuses `checkpoint_conflict`, and redelivery never makes it legal. The
+    ordering is load-bearing for the same reason the receipt axis's is: a
+    redelivered checkpoint arrives when the ledger has moved on, so handing it
+    to the reducer would produce a state or sequence refusal for a checkpoint
+    that was in fact stored.
+    """
+    checkpoint_id, digest, _document = identity
+    row = _fetchone(
+        conn, _SQL_SELECT_CHECKPOINT, (workflow_row_id, checkpoint_id)
+    )
+    if row is None:
+        return
+    records, refusal, _seq = _read_history(
+        conn, workflow_row_id, work_spec_sha256
+    )
+    if refusal is not None:
+        raise _Refused(refusal)
+    verdict = workflow_engine.verify_history(records)
+    if verdict is not None:
+        raise _Refused(verdict)
+    # THREE digests must agree before `replay` is an honest answer, and none
+    # of them is the row's own `document_sha256` column — a row agreeing with
+    # itself proves nothing (§22 A29.1):
+    #   the SUBMITTED document, the SEALED EVENT's record of what was
+    #   accepted, and the STORED BYTES recomputed now.
+    # `replay` is an affirmative statement — "your checkpoint is stored" — so
+    # answering it over corrupt or forged bytes would be a false affirmation.
+    try:
+        stored = protocols.content_digest(_parse_stored(row[2], "/document"))
+    except (_RowUnreadable, protocols.ProtocolError):
+        raise _refuse("checkpoint_conflict", "/checkpoint_id") from None
+    if stored != digest:
+        raise _refuse("checkpoint_conflict", "/checkpoint_id")
+    if _recorded_checkpoint_digests(records).get(checkpoint_id) != digest:
+        raise _refuse("checkpoint_conflict", "/checkpoint_id")
+    for record in records:
+        if record["payload"].get("checkpoint_id") != checkpoint_id:
+            continue
+        if record["event"] != "checkpoint_recorded":
+            continue
+        command_id = record["command_id"]
+        group = tuple(r for r in records if r["command_id"] == command_id)
+        raise _Replay(
+            workflow_id=_render(workflow_row_id),
+            row_id=workflow_row_id,
+            revision=record["revision"],
+            events=group,
+        )
+    # A stored checkpoint is a RECORDED checkpoint, so a row with no event
+    # naming it is a damaged ledger rather than a caller error.
+    raise WorkflowStoreError("store_unavailable")
+
+
+def _named_checkpoint(payload, verb):
+    """The `checkpoint_id` a command NAMES, or `None`.
+
+    Two verbs name one: `request_dispatch` through its policy-v2
+    `restore_checkpoint_id` payload key, and `record_restore` through the
+    restore fact's own `checkpoint_id`.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if verb == "request_dispatch":
+        named = payload.get("restore_checkpoint_id")
+    elif verb == "record_restore":
+        document = payload.get("restore_document")
+        named = document.get("checkpoint_id") if isinstance(document, dict) else None
+    else:
+        return None
+    if not isinstance(named, str) or not _UUID_RE.fullmatch(named):
+        return None
+    return named
+
+
+def _resolve_checkpoint(conn, workflow_row_id, work_spec_sha256, named):
+    """C6: resolve a named checkpoint into the two `ShellFacts` members.
+
+    Whether an id names a STORED, eligible checkpoint is a stored-row
+    judgment, so the shell makes it and hands the reducer the resolved
+    `(document_sha256, attempt_no)`. The digest is RECOMPUTED from the stored
+    bytes at every use — a stored checkpoint whose digest does not recompute
+    is permanently ineligible and is never handed over.
+    """
+    row = _fetchone(conn, _SQL_SELECT_CHECKPOINT, (workflow_row_id, named))
+    if row is None:
+        raise _refuse("checkpoint_unknown", "/checkpoint_id")
+    try:
+        document = _parse_stored(row[2], "/document")
+        recomputed = protocols.content_digest(document)
+    except (_RowUnreadable, protocols.ProtocolError):
+        raise _refuse("checkpoint_ineligible", "/checkpoint_id") from None
+    if recomputed != row[3]:
+        raise _refuse("checkpoint_ineligible", "/checkpoint_id")
+    # And against the SEALED EVENT, which is the authoritative record of what
+    # was stored. The row's own digest column is the row agreeing with itself;
+    # this is the independent witness, and it is what stops a fully-rewritten
+    # row from becoming the restore authority (§22 A29.1).
+    records, refusal, _seq = _read_history(
+        conn, workflow_row_id, work_spec_sha256
+    )
+    if refusal is not None:
+        raise _Refused(refusal)
+    expected = _recorded_checkpoint_digests(records).get(named)
+    if expected is None or expected != recomputed:
+        raise _refuse("checkpoint_ineligible", "/checkpoint_id")
+    attempt_no = row[1]
+    if not isinstance(attempt_no, int) or isinstance(attempt_no, bool):
+        raise _refuse("checkpoint_ineligible", "/attempt_no")
+    return recomputed, attempt_no
+
+
 def _admission_facts(conn, payload):
     """A3. A payload that is not a well-shaped object yields
-    `AdmissionFacts(False, False)` and lets `decide` refuse with its own
+    `ShellFacts(False, False)` and lets `decide` refuse with its own
     precise code — the store never refuses admission on its own (§9.5)."""
-    empty = workflow_engine.AdmissionFacts(False, False)
+    empty = workflow_engine.ShellFacts(False, False)
     if not isinstance(payload, dict):
         return empty
     document = payload.get("work_spec_document")
@@ -1602,7 +2020,7 @@ def _admission_facts(conn, payload):
     status = row[0]
     if not isinstance(status, str):
         return empty
-    return workflow_engine.AdmissionFacts(True, status != _TASK_CLOSED_STATUS)
+    return workflow_engine.ShellFacts(True, status != _TASK_CLOSED_STATUS)
 
 
 def _decide(snapshot, command, facts):
@@ -1710,9 +2128,23 @@ def _submit_command(conn, command, verb, command_id, workflow_row_id,
         receipt = _receipt_identity(payload)
         if receipt is not None:
             _receipt_dedupe(conn, workflow_row_id, row[2], receipt)
+    checkpoint = None
+    if verb == "record_checkpoint":                                     # K1
+        checkpoint = _checkpoint_identity(payload)
+        if checkpoint is not None:
+            _checkpoint_dedupe(conn, workflow_row_id, row[2], checkpoint)
     # C5 is deliberately absent: semantic revision validation is the
     # reducer's, inside C7; the storage gate is the C14 CAS.
-    decision = _decide(snapshot, command, workflow_engine.AdmissionFacts())  # C7
+    facts = workflow_engine.ShellFacts()                                # C6
+    named = _named_checkpoint(payload, verb)
+    if named is not None:
+        digest, attempt_no = _resolve_checkpoint(
+            conn, workflow_row_id, row[2], named
+        )
+        facts = workflow_engine.ShellFacts(
+            checkpoint_sha256=digest, checkpoint_attempt_no=attempt_no
+        )
+    decision = _decide(snapshot, command, facts)                        # C7
     after = decision.snapshot_after
     created_at = command["created_at"]
     _insert_command(                                                    # C8
@@ -1724,10 +2156,15 @@ def _submit_command(conn, command, verb, command_id, workflow_row_id,
     if decision.intent is not None:                                     # C10
         _insert_intent(conn, workflow_row_id, decision.intent, created_at)
     _resolve_intent(conn, decision.events)                              # C11
+    _apply_attempts(                                                    # C11b
+        conn, workflow_row_id, decision.events, created_at
+    )
     if receipt is not None:                                             # C12
         _insert_receipt(
             conn, workflow_row_id, receipt[2], receipt[1], created_at
         )
+    if checkpoint is not None:                                          # C12b
+        _insert_checkpoint(conn, workflow_row_id, checkpoint[2], created_at)
     _insert_fact_for(conn, workflow_row_id, verb, payload, created_at)  # C13
     _cas_snapshot(                                                      # C14
         conn, workflow_row_id, after, command["expected_revision"], created_at
@@ -1752,8 +2189,18 @@ def _insert_fact_for(conn, workflow_row_id, verb, payload, created_at) -> None:
                 conn, workflow_row_id, "approval", document.get("scope"),
                 document, created_at,
             )
-    elif verb == "record_result":
-        document = payload.get("result_document")
+    elif verb in ("record_result", "record_compensation"):
+        # A compensation conclusion IS a `beast.result-envelope/v1`, so it is
+        # stored by this same path as `fact_kind = 'result'`; the
+        # `compensation_applied` / `compensation_failed` event's
+        # `result_sha256` is what identifies which stored body is the
+        # compensation one. `UNIQUE(workflow_id, 'result', document_sha256)`
+        # admits both, because their digests differ (U-W3 §11.1).
+        key = (
+            "result_document" if verb == "record_result"
+            else "compensation_document"
+        )
+        document = payload.get(key)
         if isinstance(document, dict):
             _insert_fact(
                 conn, workflow_row_id, "result", None, document, created_at
@@ -1764,8 +2211,25 @@ def _insert_fact_for(conn, workflow_row_id, verb, payload, created_at) -> None:
 # Read paths (§8.3, §15.3). Total on a damaged workflow; they open no
 # transaction and issue no write.
 
-def _record_from_row(row, integrity: str) -> WorkflowRecord:
+#: The five §13.3 members, paired with the rebuilt-snapshot member each one
+#: reports. `attempt_budget` is the artifact's own declared budget, folded
+#: from the policy-v2 `dispatch_requested` payload that stated it.
+_RECOVERY_MEMBERS = (
+    "attempt_no", "attempt_state", "attempts_used", "attempt_budget",
+    "checkpoint_count",
+)
+
+
+def _recovery_members(snapshot) -> dict:
+    """The five members, read from the rebuilt snapshot or all `None`."""
+    if not isinstance(snapshot, dict):
+        return {name: None for name in _RECOVERY_MEMBERS}
+    return {name: snapshot.get(name) for name in _RECOVERY_MEMBERS}
+
+
+def _record_from_row(row, integrity: str, snapshot=None) -> WorkflowRecord:
     return WorkflowRecord(
+        **_recovery_members(snapshot if integrity == "ok" else None),
         workflow_id=_render(row[0]),
         id=row[0],
         task_id=row[1],
@@ -1789,12 +2253,20 @@ def _record_from_row(row, integrity: str) -> WorkflowRecord:
     )
 
 
-def _integrity_of(conn, row) -> str:
+def _integrity_of(conn, row):
+    """`(verdict, rebuilt snapshot or None)`.
+
+    The snapshot comes back with the verdict rather than being discarded, so
+    the five §13.3 record members are read from the SAME rebuild that decided
+    the verdict — one pass, and no second, unverified source of truth.
+    """
     snapshot, refusal, _seq, records = _rebuild_snapshot(conn, row)
     if refusal is not None:
-        return refusal.reason
+        return refusal.reason, None
     divergent = _divergent_fields(row, snapshot, records)
-    return "snapshot_divergence" if divergent else "ok"
+    if divergent:
+        return "snapshot_divergence", None
+    return "ok", snapshot
 
 
 def read_workflow(conn, workflow_id) -> WorkflowRecord | None:
@@ -1804,7 +2276,8 @@ def read_workflow(conn, workflow_id) -> WorkflowRecord | None:
     row = _fetchone(conn, _SQL_SELECT_WORKFLOW, (row_id,))
     if row is None:
         return None
-    return _record_from_row(row, _integrity_of(conn, row))
+    integrity, snapshot = _integrity_of(conn, row)
+    return _record_from_row(row, integrity, snapshot)
 
 
 def list_workflows(conn, *, state=None) -> tuple:
@@ -1816,7 +2289,8 @@ def list_workflows(conn, *, state=None) -> tuple:
     for row in _fetchall(conn, _SQL_SELECT_WORKFLOWS):
         if state is not None and row[9] != state:
             continue
-        out.append(_record_from_row(row, _integrity_of(conn, row)))
+        integrity, snapshot = _integrity_of(conn, row)
+        out.append(_record_from_row(row, integrity, snapshot))
     return tuple(out)
 
 
@@ -1935,13 +2409,39 @@ def rebuild(conn, workflow_id) -> RebuildResult:
 _DOCUMENT_BOUND_TABLES = (
     (db.WORKFLOW_RECEIPTS_TABLE, _SQL_SELECT_RECEIPT_ROWS, 6, 7),
     (db.WORKFLOW_FACTS_TABLE, _SQL_SELECT_FACT_ROWS, 4, 5),
+    (db.WORKFLOW_CHECKPOINTS_TABLE, _SQL_SELECT_CHECKPOINT_ROWS, 6, 7),
 )
 
 
-def _divergent_rows(conn, workflow_row_id) -> tuple:
-    """§15.4 step 4: recompute all four §5.8 row hashes, and re-digest the two
-    stored documents their row hashes bind only by column (§18.1), without
-    touching a row. Anything that does not recompute is `(table, row_id)`."""
+def _recorded_checkpoint_digests(records) -> dict:
+    """`{checkpoint_id: checkpoint_sha256}` from the SEALED history.
+
+    The `checkpoint_recorded` event records the digest of the body it
+    accepted, and that record lives in `payload_json` under the event's own
+    sealed digest — so it is INDEPENDENT of the `workflow_checkpoints` row the
+    body sits in. Comparing a stored body against its own `document_sha256`
+    column is a row agreeing with itself: rewrite the body, the column and the
+    row hash together and nothing notices. Comparing it against the event is
+    what makes the check real, and it is the `_body_divergence` idiom the two
+    `workflows` bodies already use, applied a third time (§22 A29.1).
+    """
+    out = {}
+    for record in records:
+        if record["event"] != "checkpoint_recorded":
+            continue
+        payload = record["payload"]
+        identity = payload.get("checkpoint_id")
+        digest = payload.get("checkpoint_sha256")
+        if isinstance(identity, str) and isinstance(digest, str):
+            out[identity] = digest
+    return out
+
+
+def _divergent_rows(conn, workflow_row_id, recorded=None) -> tuple:
+    """§15.4 step 4: recompute all SIX §5.8 row hashes, and re-digest the
+    three stored documents their row hashes bind only by column (§18.1),
+    without touching a row. Anything that does not recompute is
+    `(table, row_id)`."""
     divergent = []
     for table, sql, payload_of, hash_index in _ROW_HASH_TABLES:
         for row in _fetchall(conn, sql, (workflow_row_id,)):
@@ -1965,6 +2465,23 @@ def _divergent_rows(conn, workflow_row_id) -> tuple:
                 continue
             if recomputed != row[digest_index]:
                 divergent.append((table, row[0]))
+    if recorded is not None:
+        for row in _fetchall(conn, _SQL_SELECT_CHECKPOINT_ROWS,
+                             (workflow_row_id,)):
+            pair = (db.WORKFLOW_CHECKPOINTS_TABLE, row[0])
+            if pair in seen or pair in divergent:
+                continue
+            try:
+                document = _parse_stored(row[6], "/document")
+                recomputed = protocols.content_digest(document)
+            except (_RowUnreadable, protocols.ProtocolError):
+                divergent.append(pair)
+                continue
+            identity = row[3] if isinstance(row[3], str) else None
+            expected = recorded.get(identity)
+            if expected is None or expected != recomputed:
+                # The stored body is not the body the sealed event accepted.
+                divergent.append(pair)
     return tuple(divergent)
 
 
@@ -1980,7 +2497,12 @@ def _verify_one(conn, row) -> VerifyReport:
             _divergent_rows(conn, row[0]), None, None,
         )
     records, refusal, _seq = _read_history(conn, row[0], work_spec_sha256)
-    rows = _divergent_rows(conn, row[0])
+    # The event-recorded digests are usable only when the history itself
+    # verifies; a corrupt history is already its own, louder finding.
+    recorded = None if refusal is not None else _recorded_checkpoint_digests(
+        records
+    )
+    rows = _divergent_rows(conn, row[0], recorded)
     revision = row[10] if isinstance(row[10], int) else None
     last_seq = records[-1]["seq"] if records else None
     if refusal is not None:

@@ -81,13 +81,66 @@ WORKFLOW_INTENT_SCHEMA = "aos.workflow-queue-intent/v1"
 WORKFLOW_RECEIPT_SCHEMA = "aos.workflow-queue-receipt/v1"
 WORKFLOW_APPROVAL_FACT_SCHEMA = "aos.workflow-approval-fact/v1"
 
-#: Thirteen authoritative states (§5.1). `proposed` is the pre-compile
-#: authoring plane and is never a workflow state.
+#: U-W3 §12.3. The intent is the ONE record that crosses the trust boundary as
+#: a file and that U-W2 §18 requires the adapter to pin by content hash, so a
+#: widened accepted member set announces itself with a version. Emitted only
+#: under transition-policy v2; policy-v1 workflows keep emitting — and every
+#: reader keeps reading — `/v1` forever.
+WORKFLOW_INTENT_V2_SCHEMA = "aos.workflow-queue-intent/v2"
+
+#: U-W3 §8.3 and §9.4. Both are produced OUTSIDE Agentic OS: a checkpoint by
+#: the executing side, a restore fact by whoever performed the restoration.
+#: AOS stores and binds them; it never creates, derives or completes one.
+WORKFLOW_CHECKPOINT_SCHEMA = "aos.workflow-checkpoint/v1"
+WORKFLOW_RESTORE_FACT_SCHEMA = "aos.workflow-restore-fact/v1"
+
+#: Fourteen authoritative states under transition-policy v2 (U-W3 §5.3).
+#: `proposed` is the pre-compile authoring plane and is never a workflow
+#: state. `retrying` is the fourteenth and is not a naming preference: a
+#: workflow whose attempt N failed retryably with attempts remaining cannot
+#: sit in any landed state — `failed` is terminal, `running` would claim a
+#: live runtime task that does not exist, and `validated` is refused by the
+#: storage CHECK that forbids a bound `runtime_task_uuid` there (§5.3.4).
 WORKFLOW_STATES = (
+    "compiled", "validated", "awaiting_approval", "scheduled", "running",
+    "waiting_input", "waiting_approval", "paused", "retrying", "compensating",
+    "succeeded", "failed", "cancelled", "compensated",
+)
+
+#: Transition-policy version 1's state tuple, FROZEN VERBATIM as history
+#: (U-W2 §15's own frozen-retention rule, the `_V2_MEMORY_CLAIM_DDL` trade
+#: applied to policy data). Every matrix lookup indexes with its OWN version's
+#: tuple, so a v1 event can never be re-derived under v2 rules.
+_V1_WORKFLOW_STATES = (
     "compiled", "validated", "awaiting_approval", "scheduled", "running",
     "waiting_input", "waiting_approval", "paused", "compensating",
     "succeeded", "failed", "cancelled", "compensated",
 )
+
+#: The four states one workflow attempt row can hold (U-W3 §6.3). `open` is
+#: the only non-final value, and at most one attempt per workflow may hold it.
+WORKFLOW_ATTEMPT_STATES = ("open", "succeeded", "failed", "abandoned")
+
+#: The compensation phase as AOS observes it, folded from the compensation
+#: events. `None` is "no compensation episode"; the three members are the
+#: subset of `beast.result-envelope/v1`'s `compensation.state` enum AOS can
+#: itself be in — `not_required` is a producer statement, never a phase.
+WORKFLOW_COMPENSATION_STATES = ("pending", "applied", "failed")
+
+#: What the eight §11.4 members are before any of them has a fact behind it.
+#: A freshly admitted instance and a folded history that recorded none of them
+#: land on exactly this, which is what makes a policy-v1 workflow fold to an
+#: HONEST `attempts_used = 0` rather than to a guess (§5.5 item 3).
+_FRESH_RECOVERY_MEMBERS = {
+    "attempt_no": None,
+    "attempt_state": None,
+    "attempts_used": 0,
+    "attempt_budget": None,
+    "last_checkpoint_seq": 0,
+    "checkpoint_count": 0,
+    "compensation_state": None,
+    "restored_checkpoint_sha256": None,
+}
 
 #: Immutable: no legal edge leaves these rows, and no command is considered.
 TERMINAL_STATES = ("succeeded", "failed", "cancelled", "compensated")
@@ -102,6 +155,10 @@ WORKFLOW_COMMANDS = (
     "admit_work_spec", "validate", "request_approval", "record_approval",
     "request_dispatch", "revoke_dispatch", "request_cancel",
     "record_queue_receipt", "record_result",
+    # U-W3 (§5.4, §8, §9, §10): the four drivers the reserved edges and the
+    # bounded-attempt ledger were reserved for.
+    "adopt_policy_version", "record_checkpoint", "record_restore",
+    "record_compensation",
 )
 
 #: The transport origin of a command (§6).
@@ -116,10 +173,18 @@ WORKFLOW_EVENTS = (
     "run_paused", "run_resumed",
     "cancel_requested",
     "workflow_succeeded", "workflow_failed", "workflow_cancelled",
+    # U-W3 (§5.5): seven names, each the sole event of exactly one driver
+    # class. `compensation_failed` is a distinct name from `workflow_failed`
+    # so "the work failed" and "the undo failed" are never confused.
+    "policy_version_adopted", "attempt_failed",
+    "checkpoint_recorded", "checkpoint_restored",
+    "compensation_started", "compensation_applied", "compensation_failed",
 )
 
-#: Forty-three codes in canonical emission order (the GOVERNANCE_REASON_CODES
-#: idiom). A refusal mutates nothing, appends no event, consumes no revision.
+#: Fifty-seven codes in canonical emission order (the GOVERNANCE_REASON_CODES
+#: idiom): U-W2's forty-three, whose spelling, meaning and order are unchanged,
+#: plus U-W3's fourteen appended (§5.4). A refusal mutates nothing, appends no
+#: event, consumes no revision.
 WORKFLOW_REFUSAL_REASONS = (
     # envelope / shape
     "command_malformed", "command_unknown", "command_schema_unsupported",
@@ -148,9 +213,21 @@ WORKFLOW_REFUSAL_REASONS = (
     "evidence_insufficient",
     # history / rebuild
     "history_corrupt", "history_unknown_event", "snapshot_divergence",
+    # U-W3 §5.4 — policy adoption and the attempt ledger
+    "policy_version_not_upgradable", "attempt_budget_exhausted",
+    "attempt_mismatch",
+    # U-W3 §5.4 — checkpoints
+    "checkpoint_malformed", "checkpoint_unbound", "checkpoint_conflict",
+    "checkpoint_limit_exceeded", "checkpoint_unknown",
+    "checkpoint_ineligible",
+    # U-W3 §5.4 — restoration
+    "restore_fact_malformed", "restore_fact_unbound",
+    # U-W3 §5.4 — compensation
+    "compensation_not_required", "compensation_already_concluded",
+    "compensation_state_inconsistent",
 )
 
-WORKFLOW_INTENT_KINDS = ("dispatch", "cancel")
+WORKFLOW_INTENT_KINDS = ("dispatch", "cancel", "compensate")
 
 WORKFLOW_RECEIPT_KINDS = (
     "accepted", "rejected", "started", "waiting_input", "waiting_approval",
@@ -187,28 +264,35 @@ RECEIPT_TARGET_STATES = (
     ("failed", "failed"),
 )
 
-#: The §5.2 matrix IS version 1 (§15). U-W3 ships version 2.
-TRANSITION_POLICY_VERSION = 1
+#: U-W2's §5.2 matrix IS version 1 (§15); U-W3 ships version 2 (§5.1).
+TRANSITION_POLICY_VERSION = 2
 
 #: Every shipped version replays forever; new decisions use the current one.
-SUPPORTED_POLICY_VERSIONS = (1,)
+#: A version outside this tuple refuses `policy_version_unsupported` and
+#: mutates nothing — a FUTURE version is refused, never guessed; a PAST
+#: version replays forever.
+SUPPORTED_POLICY_VERSIONS = (1, 2)
 
 
-def _build_matrix(cells) -> tuple:
-    """The complete 13x13 table as data, row/column order = WORKFLOW_STATES.
+def _build_matrix(cells, states) -> tuple:
+    """The complete N x N table as data, row/column order = `states`.
 
     A cell is a tuple of the drivers that may traverse it: `()` is the
     contract's `·` (illegal) and `("reserved",)` is its `R` (defined, but
-    refused under transition-policy v1). `"reserved"` is a classification,
-    never a driver.
+    refused under the version whose table carries it). `"reserved"` is a
+    classification, never a driver.
     """
     return tuple(
-        tuple(cells.get((source, target), ()) for target in WORKFLOW_STATES)
-        for source in WORKFLOW_STATES
+        tuple(cells.get((source, target), ()) for target in states)
+        for source in states
     )
 
 
-TRANSITION_MATRIX = _build_matrix({
+#: FROZEN VERBATIM as history (U-W2 §15, U-W3 §5.1): version 1's 13x13 table,
+#: 25 active and 3 reserved cells, exactly as it landed at fef0c2b. It is
+#: never regenerated from `WORKFLOW_STATES`, so a v1 event indexes v1's own
+#: state tuple and can never re-derive under v2's.
+_V1_TRANSITION_MATRIX = _build_matrix({
     ("compiled", "validated"): ("cmd:validate",),
     ("compiled", "cancelled"): ("cmd:request_cancel",),
     ("validated", "awaiting_approval"): ("cmd:request_approval",),
@@ -237,11 +321,63 @@ TRANSITION_MATRIX = _build_matrix({
     ("paused", "cancelled"): ("rcp:cancelled",),
     ("compensating", "failed"): ("reserved",),
     ("compensating", "compensated"): ("reserved",),
-})
+}, _V1_WORKFLOW_STATES)
 
-#: Frozen per-version replay (§15): version 1's table is retained verbatim
-#: when version 2 ships, so old history never re-derives under new rules.
-_POLICY_MATRICES = ((1, TRANSITION_MATRIX),)
+#: Transition policy version 2 (U-W3 §5.3): 14x14, 35 ACTIVE cells, ZERO
+#: reserved cells, 161 illegal cells, one creation pseudo-edge
+#: (`∅ → compiled`, via `admit_work_spec`).
+#:
+#: v2's active-edge set is a strict SUPERSET of v1's — every v1 edge survives
+#: with the same driver — which is what makes adoption transition-safe. All
+#: three of v1's reserved edges activate and no more; `compensating →
+#: cancelled` stays ILLEGAL in every frozen version, because abandoning a
+#: compensation mid-flight would be a silent cleanup failure.
+TRANSITION_MATRIX = _build_matrix({
+    ("compiled", "validated"): ("cmd:validate",),
+    ("compiled", "cancelled"): ("cmd:request_cancel",),
+    ("validated", "awaiting_approval"): ("cmd:request_approval",),
+    ("validated", "scheduled"): ("rcp:accepted",),
+    ("validated", "cancelled"): ("cmd:request_cancel",),
+    ("awaiting_approval", "validated"): ("apr:record_approval",),
+    ("awaiting_approval", "cancelled"): ("cmd:request_cancel",),
+    ("scheduled", "running"): ("rcp:started",),
+    ("scheduled", "retrying"): ("rcp:failed_retryable",),
+    ("scheduled", "failed"): ("rcp:failed",),
+    ("scheduled", "cancelled"): ("rcp:cancelled",),
+    ("running", "waiting_input"): ("rcp:waiting_input",),
+    ("running", "waiting_approval"): ("rcp:waiting_approval",),
+    ("running", "paused"): ("rcp:paused",),
+    ("running", "retrying"): ("res:fail_retryable", "rcp:failed_retryable"),
+    ("running", "compensating"): ("res:compensable",),
+    ("running", "succeeded"): ("res:success",),
+    ("running", "failed"): ("res:fail", "rcp:failed"),
+    ("running", "cancelled"): ("rcp:cancelled",),
+    ("waiting_input", "running"): ("rcp:resumed",),
+    ("waiting_input", "retrying"): ("rcp:failed_retryable",),
+    ("waiting_input", "failed"): ("rcp:failed",),
+    ("waiting_input", "cancelled"): ("rcp:cancelled",),
+    ("waiting_approval", "running"): ("rcp:resumed",),
+    ("waiting_approval", "retrying"): ("rcp:failed_retryable",),
+    ("waiting_approval", "failed"): ("rcp:failed",),
+    ("waiting_approval", "cancelled"): ("rcp:cancelled",),
+    ("paused", "running"): ("rcp:resumed",),
+    ("paused", "retrying"): ("rcp:failed_retryable",),
+    ("paused", "failed"): ("rcp:failed",),
+    ("paused", "cancelled"): ("rcp:cancelled",),
+    ("retrying", "scheduled"): ("rcp:accepted",),
+    ("retrying", "cancelled"): ("cmd:request_cancel",),
+    ("compensating", "failed"): ("cmp:failed", "rcp:failed"),
+    ("compensating", "compensated"): ("cmp:applied",),
+}, WORKFLOW_STATES)
+
+#: Frozen per-version replay (U-W2 §15, U-W3 §5.1): each entry is
+#: `(version, that version's state tuple, that version's matrix)`, so every
+#: lookup indexes with its OWN version's states and old history never
+#: re-derives under new rules.
+_POLICY_MATRICES = (
+    (1, _V1_WORKFLOW_STATES, _V1_TRANSITION_MATRIX),
+    (2, WORKFLOW_STATES, TRANSITION_MATRIX),
+)
 
 _RESERVED_CELL = ("reserved",)
 
@@ -374,6 +510,52 @@ _REASON_HINTS = {
     "snapshot_divergence": (
         "The snapshot does not match its closed record shape or digest."
     ),
+    "policy_version_not_upgradable": (
+        "Transition-policy adoption must be a forward step this workflow's "
+        "attempt history can support."
+    ),
+    "attempt_budget_exhausted": (
+        "The artifact's declared attempt budget is already used up."
+    ),
+    "attempt_mismatch": (
+        "The reported attempt is not the attempt this workflow has open."
+    ),
+    "checkpoint_malformed": (
+        "The checkpoint record does not match its closed record shape, its "
+        "size bound, or the secret scan."
+    ),
+    "checkpoint_unbound": (
+        "The checkpoint does not bind this workflow, WorkSpec or runtime "
+        "task."
+    ),
+    "checkpoint_conflict": (
+        "That checkpoint id is stored with a different body."
+    ),
+    "checkpoint_limit_exceeded": (
+        "The checkpoint count bound for this attempt or workflow is reached."
+    ),
+    "checkpoint_unknown": (
+        "No stored checkpoint of this workflow carries that id."
+    ),
+    "checkpoint_ineligible": (
+        "That checkpoint may not be restored in this state or attempt."
+    ),
+    "restore_fact_malformed": (
+        "The restore record does not match its closed record shape."
+    ),
+    "restore_fact_unbound": (
+        "The restore record does not bind this workflow, the named "
+        "checkpoint's digest, or its attempt."
+    ),
+    "compensation_not_required": (
+        "This workflow is not compensating; there is nothing to conclude."
+    ),
+    "compensation_already_concluded": (
+        "This compensation already reached a conclusion."
+    ),
+    "compensation_state_inconsistent": (
+        "The envelope's compensation state contradicts the phase it claims."
+    ),
 }
 
 
@@ -407,16 +589,28 @@ def _refuse(reason: str, where: str = "", **diagnostics) -> WorkflowRefusal:
 # Typed results (§9). Frozen dataclasses over fresh values.
 
 @dataclass(frozen=True)
-class AdmissionFacts:
-    """The two ledger facts of §9 — the ONLY shell-verified inputs.
+class ShellFacts:
+    """The shell-verified inputs (U-W2 §9 as widened by U-W3 §1.2 row S7).
 
-    Empty for every verb except `admit_work_spec`. The workflow identity is
-    NOT a fact: it is derived from the admitted digest (`_workflow_identity`),
-    which is what keeps this shape exactly the one §9 freezes.
+    U-W2 froze this as the two ledger booleans and nothing else, and named it
+    `ShellFacts` because admission was the only verb that needed one.
+    U-W3 adds two RESOLVED-CHECKPOINT members for the same structural reason
+    the booleans exist: a pure reducer cannot read a stored checkpoint row, so
+    whether a named `checkpoint_id` resolves — and to which digest and which
+    attempt — is a stored-row judgment the shell makes and hands in.
+
+    Both pairs are EMPTY unless the verb needs them: the booleans only for
+    `admit_work_spec`, the checkpoint fields only for a `request_dispatch`
+    that carries `restore_checkpoint_id` and for `record_restore`. Nothing
+    here is a decision; each member is an observation the reducer then judges.
+    The workflow identity is still NOT a fact — it is derived from the
+    admitted digest (`_workflow_identity`).
     """
 
     task_exists: bool = False
     task_open: bool = False
+    checkpoint_sha256: str | None = None
+    checkpoint_attempt_no: int | None = None
 
 
 @dataclass(frozen=True)
@@ -522,6 +716,11 @@ def _seal(body: dict) -> dict:
 def _seal_snapshot(body: dict) -> dict:
     """`_seal` for the §9 snapshot, refusing closed at the canonical bound.
 
+    The body is first PROJECTED onto its own policy version's member set, so a
+    policy-v1 workflow seals over exactly the members U-W2 sealed over and its
+    stored `workflows.content_sha256` keeps matching forever (see
+    `_V1_SNAPSHOT_KEYS`).
+
     `_seal` measures the body WITHOUT the digest member it then adds, so a
     record sized only by that measurement can still cross
     `MAX_ARTIFACT_BYTES` once sealed — and a snapshot that crosses it can no
@@ -530,16 +729,17 @@ def _seal_snapshot(body: dict) -> dict:
     only, so the bound is checked here, before the seal, exactly as the other
     counters and collections are checked before they are advanced.
     """
+    record = _project_snapshot(body)
     try:
         measured = len(protocols.serialize_canonical(
-            {k: v for k, v in body.items()
+            {k: v for k, v in record.items()
              if k != protocols.CONTENT_HASH_FIELD}
         ))
     except protocols.ProtocolError as refusal:
         raise _refuse("snapshot_divergence", "/", code=refusal.code) from None
     if measured + _DIGEST_MEMBER_BYTES > protocols.MAX_ARTIFACT_BYTES:
         raise _refuse("snapshot_divergence", "/")
-    return _seal(body)
+    return _seal(record)
 
 
 def _digest_matches(record: dict) -> bool:
@@ -603,6 +803,15 @@ _DIGEST_MEMBER_BYTES = (
 #: route fields at their pattern maxima, the five counters at `INT_MAX`, and
 #: the digest member above. Every term is a frozen canonical limit or a
 #: frozen pattern bound — nothing here is tuned.
+#:
+#: U-W3 §11.4 makes recomputing this an OBLIGATION, not an option: the eight
+#: additive snapshot members of §11.4 are each carried here at their frozen
+#: bound — the five counters at `INT_MAX`, the two optional state strings at
+#: their longest closed member, and the optional digest at its pattern width —
+#: so `_require_admissible_size` still guarantees that an admitted instance
+#: can reach ANY state, open every attempt its budget allows and record every
+#: checkpoint its bounds allow, without ever failing `_seal_snapshot` at
+#: `MAX_ARTIFACT_BYTES`.
 _SNAPSHOT_GROWTH_RESERVE = (
     2 * protocols.MAX_ARRAY_ITEMS * _INTENT_ID_BYTES
     + len(protocols.serialize_canonical({
@@ -615,6 +824,14 @@ _SNAPSHOT_GROWTH_RESERVE = (
         "last_seq": protocols.INT_MAX,
         "last_wait_entry_seq": protocols.INT_MAX,
         "revision": protocols.INT_MAX,
+        "attempt_no": protocols.INT_MAX,
+        "attempts_used": protocols.INT_MAX,
+        "attempt_budget": protocols.INT_MAX,
+        "last_checkpoint_seq": protocols.INT_MAX,
+        "checkpoint_count": protocols.INT_MAX,
+        "attempt_state": max(WORKFLOW_ATTEMPT_STATES, key=len),
+        "compensation_state": max(WORKFLOW_COMPENSATION_STATES, key=len),
+        "restored_checkpoint_sha256": "0" * 64,
         protocols.CONTENT_HASH_FIELD: "0" * 64,
     }))
 )
@@ -685,20 +902,33 @@ def _idempotency_key(work_spec_sha256: str, intent_seq: int) -> str:
 # ---------------------------------------------------------------------------
 # Matrix lookups. The matrix data IS the legality rule, per policy version.
 
-def _matrix_for(policy_version: int):
-    for version, matrix in _POLICY_MATRICES:
-        if version == policy_version:
-            return matrix
+def _policy_for(policy_version: int) -> tuple:
+    """`(version, states, matrix)` for a supported version, else refuse.
+
+    The states come back WITH the matrix so every lookup indexes its own
+    version's tuple: a policy-v1 snapshot is judged by v1's 13x13 table and
+    v1's 13-member order, whatever `WORKFLOW_STATES` has grown to (§5.1).
+    """
+    for entry in _POLICY_MATRICES:
+        if entry[0] == policy_version:
+            return entry
     raise _refuse("policy_version_unsupported", "/policy_version")
 
 
-def _cell(matrix, source: str, target: str) -> tuple:
-    return matrix[WORKFLOW_STATES.index(source)][WORKFLOW_STATES.index(target)]
+def _cell(policy, source: str, target: str) -> tuple:
+    _version, states, matrix = policy
+    if source not in states or target not in states:
+        # A state this version's tuple does not carry has no cell at all, and
+        # asking for one is not a lookup failure to raise through: it is an
+        # illegal transition under that version.
+        return ()
+    return matrix[states.index(source)][states.index(target)]
 
 
-def _require_edge(matrix, source: str, target: str, driver: str, *, receipt: bool):
-    """Refuse unless `driver` may traverse (source -> target) under `matrix`."""
-    cell = _cell(matrix, source, target)
+def _require_edge(policy, source: str, target: str, driver: str, *,
+                  receipt: bool):
+    """Refuse unless `driver` may traverse (source -> target) under `policy`."""
+    cell = _cell(policy, source, target)
     if driver in cell:
         return
     if cell == _RESERVED_CELL:
@@ -799,11 +1029,22 @@ _PAYLOAD_KEYS = (
     ("validate", (), ()),
     ("request_approval", (), ()),
     ("record_approval", ("approval_document",), ("approval_document",)),
-    ("request_dispatch", ("queue_route",), ()),
+    # U-W3 §9.2: the key set widens under policy v2 from `("queue_route",)`.
+    # `restore_checkpoint_id` stays OPTIONAL, so a v1 payload is byte-legal.
+    ("request_dispatch", ("queue_route", "restore_checkpoint_id"), ()),
     ("revoke_dispatch", (), ()),
     ("request_cancel", (), ()),
     ("record_queue_receipt", ("receipt_document",), ("receipt_document",)),
     ("record_result", ("result_document",), ("result_document",)),
+    # U-W3's four verbs. `policy_version` is an INTEGER, so it is declared
+    # allowed-but-not-required here (the required list is the document list,
+    # which this table type-checks as objects) and its presence and type are
+    # checked by its own handler.
+    ("adopt_policy_version", ("policy_version",), ()),
+    ("record_checkpoint", ("checkpoint_document",), ("checkpoint_document",)),
+    ("record_restore", ("restore_document",), ("restore_document",)),
+    ("record_compensation", ("compensation_document",),
+     ("compensation_document",)),
 )
 
 
@@ -826,7 +1067,25 @@ def _verify_payload(name: str, payload: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Snapshot record (§9)
 
-_SNAPSHOT_KEYS = (
+#: Policy version 1's snapshot member set, FROZEN VERBATIM as history.
+#:
+#: This freeze is not decoration; it is load-bearing, and for a reason the
+#: record's own `/v1` schema string hides: the snapshot record's digest is
+#: PERSISTED, in `workflows.content_sha256`, and `workflow_store` compares it
+#: against the rebuilt snapshot's digest on EVERY command and in `verify`.
+#: `_seal` digests the whole body, so ANY added member changes the digest of
+#: every workflow — including workflows admitted, sealed and stored before
+#: U-W3 existed. Widening the set unconditionally would make every
+#: pre-migration workflow refuse `snapshot_divergence` on its next command and
+#: read as tampered, while the 6→7 migration is forbidden to re-stamp it and
+#: `verify` is forbidden to repair it.
+#:
+#: So the member set is policy-version conditional, exactly as the transition
+#: matrix is (§5.1's `_POLICY_MATRICES` trade): a policy-v1 workflow seals
+#: byte-identically forever, and `adopt_policy_version` — which consumes a
+#: revision and rewrites the row through the C14 compare-and-swap — is the one
+#: legitimate re-seal boundary.
+_V1_SNAPSHOT_KEYS = (
     "schema", "workflow_id", "task_id", "work_spec_sha256", "report_sha256",
     "snapshot_sha256", "registry_version", "compile_status",
     "work_spec_document", "report_document", "state", "revision",
@@ -836,6 +1095,46 @@ _SNAPSHOT_KEYS = (
     "last_seq", "last_wait_entry_seq", "last_runtime_approval_seq",
     protocols.CONTENT_HASH_FIELD,
 )
+
+#: U-W3 §11.4's eight additive members. Every one is a pure function of the
+#: HISTORY — of what the history actually recorded — and none is read from a
+#: column. The schema string stays `/v1` (§12.3): the snapshot is a private
+#: projection with one producer and one consumer inside this repository,
+#: re-derived on every command rather than exchanged across a boundary.
+_V2_SNAPSHOT_MEMBERS = (
+    "attempt_no", "attempt_state", "attempts_used", "attempt_budget",
+    "last_checkpoint_seq", "checkpoint_count", "compensation_state",
+    "restored_checkpoint_sha256",
+)
+
+_V2_SNAPSHOT_KEYS = (
+    _V1_SNAPSHOT_KEYS[:-1] + _V2_SNAPSHOT_MEMBERS + (
+        protocols.CONTENT_HASH_FIELD,
+    )
+)
+
+_POLICY_SNAPSHOT_KEYS = (
+    (1, _V1_SNAPSHOT_KEYS),
+    (2, _V2_SNAPSHOT_KEYS),
+)
+
+
+def _snapshot_keys_for(policy_version) -> tuple:
+    for version, keys in _POLICY_SNAPSHOT_KEYS:
+        if version == policy_version:
+            return keys
+    raise _refuse("policy_version_unsupported", "/policy_version")
+
+
+def _project_snapshot(body: dict) -> dict:
+    """Restrict a working snapshot to its OWN policy version's member set.
+
+    `decide` and `fold` both work on a body carrying every member, so the
+    handlers stay total whatever version they are judging; this is where the
+    body becomes the record that gets sealed and whose digest is stored.
+    """
+    keys = _snapshot_keys_for(body.get("policy_version"))
+    return {key: body[key] for key in keys if key in body}
 
 
 def _optional(value, pattern) -> bool:
@@ -861,7 +1160,18 @@ def _verify_snapshot(snapshot) -> dict:
         fresh = _fresh(snapshot)
     except protocols.ProtocolError as refusal:
         raise _refuse("snapshot_divergence", "/", code=refusal.code) from None
-    if set(fresh) != set(_SNAPSHOT_KEYS):
+    # The member set is policy-version conditional, so the version is read
+    # first — defensively, because it is untrusted like every other member —
+    # and an unsupported one refuses before any member is judged against the
+    # wrong shape.
+    version = fresh.get("policy_version")
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version < 1
+    ):
+        raise _refuse("snapshot_divergence", "/policy_version")
+    if set(fresh) != set(_snapshot_keys_for(version)):
         raise _refuse("snapshot_divergence", "/")
     if fresh["schema"] != WORKFLOW_SNAPSHOT_SCHEMA:
         raise _refuse("snapshot_divergence", "/schema")
@@ -876,7 +1186,9 @@ def _verify_snapshot(snapshot) -> dict:
         ("compile_status", fresh["compile_status"] in _ADMISSIBLE_STATUSES),
         ("work_spec_document", isinstance(fresh["work_spec_document"], dict)),
         ("report_document", isinstance(fresh["report_document"], dict)),
-        ("state", fresh["state"] in WORKFLOW_STATES),
+        # Judged against the state tuple of the snapshot's OWN version, so a
+        # policy-v1 snapshot cannot claim the fourteenth state.
+        ("state", fresh["state"] in _policy_for(version)[1]),
         ("revision", _count(fresh["revision"], 1)),
         ("policy_version", _count(fresh["policy_version"], 1)),
         ("approval_required", isinstance(fresh["approval_required"], bool)),
@@ -894,6 +1206,25 @@ def _verify_snapshot(snapshot) -> dict:
         ("last_runtime_approval_seq",
          _count(fresh["last_runtime_approval_seq"], 0)),
     )
+    if version >= 2:
+        # U-W3 §11.4's eight additive members, judged to the same standard as
+        # the landed ones: closed vocabulary or bounded integer, `None` only
+        # where the lifecycle genuinely has no value yet.
+        checks += (
+            ("attempt_no", fresh["attempt_no"] is None
+             or _count(fresh["attempt_no"], 1)),
+            ("attempt_state", fresh["attempt_state"] is None
+             or fresh["attempt_state"] in WORKFLOW_ATTEMPT_STATES),
+            ("attempts_used", _count(fresh["attempts_used"], 0)),
+            ("attempt_budget", fresh["attempt_budget"] is None
+             or _count(fresh["attempt_budget"], 1)),
+            ("last_checkpoint_seq", _count(fresh["last_checkpoint_seq"], 0)),
+            ("checkpoint_count", _count(fresh["checkpoint_count"], 0)),
+            ("compensation_state", fresh["compensation_state"] is None
+             or fresh["compensation_state"] in WORKFLOW_COMPENSATION_STATES),
+            ("restored_checkpoint_sha256",
+             _optional(fresh["restored_checkpoint_sha256"], _SHA256_RE)),
+        )
     for name, ok in checks:
         if not ok:
             raise _refuse("snapshot_divergence", f"/{name}")
@@ -901,7 +1232,13 @@ def _verify_snapshot(snapshot) -> dict:
     # The §14.1 structural CHECKs, enforced here too so the reducer never acts
     # on a projection the storage layer would refuse.
     state = fresh["state"]
-    if fresh["dispatch_intent_id"] is not None and state != "validated":
+    if fresh["dispatch_intent_id"] is not None and state not in _DISPATCHABLE_STATES.get(
+        version, ("validated",)
+    ):
+        # `retrying` joins `validated` UNDER POLICY V2 ONLY, because a retry IS
+        # a dispatch issued from `retrying` (§11.2 widens the storage CHECK
+        # identically). A policy-v1 snapshot keeps reading `{validated}`
+        # verbatim, exactly as §22 A2 freezes it.
         raise _refuse("snapshot_divergence", "/dispatch_intent_id")
     if fresh["cancel_intent_id"] is not None and state not in _POST_DISPATCH_STATES:
         raise _refuse("snapshot_divergence", "/cancel_intent_id")
@@ -959,6 +1296,12 @@ def _verify_snapshot(snapshot) -> dict:
         ("last_wait_entry_seq", fresh["last_wait_entry_seq"]),
         ("last_runtime_approval_seq", fresh["last_runtime_approval_seq"]),
     )
+    if version >= 2:
+        counters += (
+            ("attempts_used", fresh["attempts_used"]),
+            ("last_checkpoint_seq", fresh["last_checkpoint_seq"]),
+            ("checkpoint_count", fresh["checkpoint_count"]),
+        )
     for name, value in counters:
         if value >= protocols.INT_MAX - _MAX_EVENTS_PER_COMMAND:
             raise _refuse("snapshot_divergence", f"/{name}")
@@ -1052,7 +1395,7 @@ def _require_admissible_size(snapshot: dict) -> None:
         )
 
 
-def _admit(command: dict, facts: AdmissionFacts) -> WorkflowDecision:
+def _admit(command: dict, facts: ShellFacts) -> WorkflowDecision:
     if command["expected_revision"] != 0:
         raise _refuse("revision_mismatch", "/expected_revision")
     payload = _verify_payload("admit_work_spec", command["payload"])
@@ -1141,6 +1484,7 @@ def _admit(command: dict, facts: AdmissionFacts) -> WorkflowDecision:
         "last_seq": 1,
         "last_wait_entry_seq": 0,
         "last_runtime_approval_seq": 0,
+        **_FRESH_RECOVERY_MEMBERS,
     }
     event = _build_event(
         snapshot,
@@ -1338,13 +1682,206 @@ def _verify_result(fresh: dict, snapshot: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Checkpoints (U-W3 §8) and restore facts (U-W3 §9)
+#
+# Both records are produced OUTSIDE Agentic OS and are UNTRUSTED input. AOS
+# validates the closed shape, the bounds and the bindings; it never reads a
+# checkpoint payload key, never interprets a value, and never renders one.
+
+#: The protocol's frozen attempt ceiling, READ AS DATA from the shipped
+#: `beast.result-envelope/v1` schema rather than typed again. §12.1 freezes
+#: `10` in five places and forbids a sixth ceiling CONSTANT; this is not a
+#: sixth number, it is the first one.
+_PROTOCOL_ATTEMPT_CEILING = protocols.REGISTRY[
+    "beast.result-envelope/v1"
+].schema["properties"]["attempt"]["maximum"]
+
+#: A quarter of the canonical artifact bound, so the envelope around the
+#: payload and the sealed digest still fit inside `MAX_ARTIFACT_BYTES` with
+#: margin. Derived headroom, not a tuned number.
+MAX_CHECKPOINT_PAYLOAD_BYTES = protocols.MAX_ARTIFACT_BYTES // 4
+
+#: Per-attempt and per-workflow checkpoint bounds (§8.2). The workflow bound
+#: is the per-attempt bound times the protocol's attempt ceiling, so no third
+#: number is introduced.
+MAX_CHECKPOINTS_PER_ATTEMPT = 8
+MAX_CHECKPOINTS_PER_WORKFLOW = (
+    MAX_CHECKPOINTS_PER_ATTEMPT * _PROTOCOL_ATTEMPT_CEILING
+)
+
+#: The states in which a workflow attempt is open AND a runtime task is live,
+#: which is exactly where a checkpoint can be produced (§8.4). `waiting_input`
+#: and `paused` have no live runtime fact producer (§20 item 9) and are named
+#: here for TOTALITY, so the gate is closed and no future producer needs a new
+#: policy version — not as exercised paths.
+_CHECKPOINTABLE_STATES = (
+    "running", "waiting_input", "waiting_approval", "paused",
+)
+
+_CHECKPOINT_KEYS = frozenset((
+    "schema", "checkpoint_id", "workflow_id", "work_spec_sha256",
+    "attempt_no", "checkpoint_seq", "runtime_task_uuid", "payload",
+    "created_at", "trace", protocols.CONTENT_HASH_FIELD,
+))
+_CHECKPOINT_REQUIRED_KEYS = (
+    "schema", "checkpoint_id", "workflow_id", "work_spec_sha256",
+    "attempt_no", "checkpoint_seq", "runtime_task_uuid", "payload",
+    "created_at", protocols.CONTENT_HASH_FIELD,
+)
+
+_RESTORE_FACT_KEYS = frozenset((
+    "schema", "workflow_id", "work_spec_sha256", "checkpoint_id",
+    "checkpoint_sha256", "from_attempt_no", "into_attempt_no", "restored_by",
+    "restored_at", "trace", protocols.CONTENT_HASH_FIELD,
+))
+_RESTORE_FACT_REQUIRED_KEYS = (
+    "schema", "workflow_id", "work_spec_sha256", "checkpoint_id",
+    "checkpoint_sha256", "from_attempt_no", "into_attempt_no", "restored_by",
+    "restored_at", protocols.CONTENT_HASH_FIELD,
+)
+
+
+def _bounded_attempt(value) -> bool:
+    """An attempt ordinal inside the PROTOCOL's frozen ceiling. The
+    artifact's own budget is the tighter live bound and is applied by the
+    handler that knows which workflow it is judging."""
+    return _count(value, 1) and value <= _PROTOCOL_ATTEMPT_CEILING
+
+
+def _checkpoint_payload_bytes(payload) -> int:
+    """The canonical length of a checkpoint payload, or a refusal.
+
+    The payload is an OPAQUE canonical object: this measures it and never
+    reads a key. A payload the spine cannot serialize at all is malformed,
+    not an exception to let escape.
+    """
+    if not isinstance(payload, dict):
+        raise _refuse("checkpoint_malformed", "/payload")
+    try:
+        return len(protocols.serialize_canonical(payload))
+    except protocols.ProtocolError as refusal:
+        raise _refuse(
+            "checkpoint_malformed", "/payload", code=refusal.code
+        ) from None
+
+
+def _verify_checkpoint(fresh) -> dict:
+    """The §8.3 closed record, its size bound and its secret scan.
+
+    Already canonical and fresh: `_verify_command` round-tripped the whole
+    envelope on intake. Patterns and bounds REUSE the landed compiled gates
+    exactly; U-W3 adds no new pattern constant.
+    """
+    if not isinstance(fresh, dict):
+        raise _refuse("checkpoint_malformed", "/")
+    if set(fresh) - _CHECKPOINT_KEYS:
+        raise _refuse("checkpoint_malformed", "/")
+    for key in _CHECKPOINT_REQUIRED_KEYS:
+        if key not in fresh:
+            raise _refuse("checkpoint_malformed", f"/{key}")
+    if fresh["schema"] != WORKFLOW_CHECKPOINT_SCHEMA:
+        # An unknown `/vN` refuses here; there is no default-version
+        # resolution, and any additive member would require a `/v2` and a new
+        # policy version (§8.2).
+        raise _refuse("checkpoint_malformed", "/schema")
+    checks = (
+        ("checkpoint_id", _text(fresh["checkpoint_id"], _UUID_RE)),
+        ("workflow_id", _text(fresh["workflow_id"], _WORKFLOW_ID_RE)),
+        ("work_spec_sha256", _text(fresh["work_spec_sha256"], _SHA256_RE)),
+        ("attempt_no", _bounded_attempt(fresh["attempt_no"])),
+        ("checkpoint_seq",
+         _count(fresh["checkpoint_seq"], 1)
+         and fresh["checkpoint_seq"] <= MAX_CHECKPOINTS_PER_ATTEMPT),
+        ("runtime_task_uuid", _text(fresh["runtime_task_uuid"], _UUID_RE)),
+        ("created_at", _is_real_instant(fresh["created_at"])),
+    )
+    for name, ok in checks:
+        if not ok:
+            raise _refuse("checkpoint_malformed", f"/{name}")
+    if "trace" in fresh and not _trace_ok(fresh["trace"]):
+        raise _refuse("checkpoint_malformed", "/trace")
+
+    measured = _checkpoint_payload_bytes(fresh["payload"])
+    if measured > MAX_CHECKPOINT_PAYLOAD_BYTES:
+        raise _refuse(
+            "checkpoint_malformed", "/payload",
+            payload_bytes=measured, limit=MAX_CHECKPOINT_PAYLOAD_BYTES,
+        )
+    # A secret-shaped payload is REFUSED at ingest and never stored — not
+    # redacted, because a redacted checkpoint is an unrestorable lie, and not
+    # stored-then-warned, because that would put a plaintext credential in
+    # `aos.db`. The refusal names the schema-safe path only, never the value
+    # and never which detector fired on which byte.
+    if secretscan.scan_secrets(
+        protocols.serialize_canonical(fresh["payload"]).decode("utf-8")
+    ):
+        raise _refuse("checkpoint_malformed", "/payload")
+    if not _digest_matches(fresh):
+        raise _refuse(
+            "checkpoint_malformed", f"/{protocols.CONTENT_HASH_FIELD}"
+        )
+    return fresh
+
+
+def _verify_restore_fact(fresh) -> dict:
+    """The §9.4 closed record and its self-digest."""
+    if not isinstance(fresh, dict):
+        raise _refuse("restore_fact_malformed", "/")
+    if set(fresh) - _RESTORE_FACT_KEYS:
+        raise _refuse("restore_fact_malformed", "/")
+    for key in _RESTORE_FACT_REQUIRED_KEYS:
+        if key not in fresh:
+            raise _refuse("restore_fact_malformed", f"/{key}")
+    if fresh["schema"] != WORKFLOW_RESTORE_FACT_SCHEMA:
+        raise _refuse("restore_fact_malformed", "/schema")
+    checks = (
+        ("workflow_id", _text(fresh["workflow_id"], _WORKFLOW_ID_RE)),
+        ("work_spec_sha256", _text(fresh["work_spec_sha256"], _SHA256_RE)),
+        ("checkpoint_id", _text(fresh["checkpoint_id"], _UUID_RE)),
+        ("checkpoint_sha256", _text(fresh["checkpoint_sha256"], _SHA256_RE)),
+        ("from_attempt_no", _bounded_attempt(fresh["from_attempt_no"])),
+        ("into_attempt_no", _bounded_attempt(fresh["into_attempt_no"])),
+        ("restored_by", _text(fresh["restored_by"], _PROVENANCE_RE)),
+        ("restored_at", _is_real_instant(fresh["restored_at"])),
+    )
+    for name, ok in checks:
+        if not ok:
+            raise _refuse("restore_fact_malformed", f"/{name}")
+    if "trace" in fresh and not _trace_ok(fresh["trace"]):
+        raise _refuse("restore_fact_malformed", "/trace")
+    if not _digest_matches(fresh):
+        raise _refuse(
+            "restore_fact_malformed", f"/{protocols.CONTENT_HASH_FIELD}"
+        )
+    return fresh
+
+
+# ---------------------------------------------------------------------------
 # Intent builders (§13.1)
 
+def _intent_schema(snapshot: dict) -> str:
+    """`/v2` for a policy-v2 workflow, `/v1` for every earlier one (§12.3).
+
+    The intent is the ONE record that crosses the trust boundary as a file and
+    that the adapter pins by content hash, so a widened accepted member set
+    announces itself with a version rather than by surprise. The rule is per
+    WORKFLOW, not per kind: one policy version, one intent version, no
+    per-kind exception to reason about on the receiving side.
+    """
+    return (
+        WORKFLOW_INTENT_V2_SCHEMA
+        if snapshot["policy_version"] >= 2
+        else WORKFLOW_INTENT_SCHEMA
+    )
+
+
 def _dispatch_intent(
-    snapshot: dict, command: dict, intent_seq: int, queue_route: str
+    snapshot: dict, command: dict, intent_seq: int, queue_route: str,
+    *, attempt_no=None, attempt_budget=None, supersedes=None,
+    restore_checkpoint_id=None, restore_checkpoint_sha256=None,
 ) -> dict:
     body = {
-        "schema": WORKFLOW_INTENT_SCHEMA,
+        "schema": _intent_schema(snapshot),
         "intent_kind": "dispatch",
         "intent_id": _intent_id(snapshot["work_spec_sha256"], intent_seq),
         "workflow_id": snapshot["workflow_id"],
@@ -1362,6 +1899,24 @@ def _dispatch_intent(
         # receiver re-verifies it against work_spec_sha256.
         "work_spec_document": snapshot["work_spec_document"],
     }
+    if attempt_no is not None:
+        # Required members of a `/v2` dispatch (§6.4 rule 2): the enqueuer has
+        # the ordinal and the budget IN FRONT OF THEM and never has to infer
+        # either, and a second file for the same WorkSpec announces itself as
+        # "attempt N of M" instead of looking like a duplicate first dispatch.
+        body["attempt_no"] = attempt_no
+        body["attempt_budget"] = attempt_budget
+    if supersedes is not None:
+        # Present exactly when a prior attempt bound a runtime task, so the
+        # chain of runtime tasks for one WorkSpec is readable from the files
+        # alone (§7.2 defence 2). It makes the landed U-W2 §22 limitation more
+        # LEGIBLE; it does not claim to fix it.
+        body["supersedes_runtime_task_uuid"] = supersedes
+    if restore_checkpoint_id is not None:
+        # A required-TOGETHER optional pair, so the file the operator carries
+        # names exactly what must be restored, by digest (§9.2).
+        body["restore_checkpoint_id"] = restore_checkpoint_id
+        body["restore_checkpoint_sha256"] = restore_checkpoint_sha256
     if "trace" in command:
         body["trace"] = command["trace"]
     return _seal(body)
@@ -1371,7 +1926,7 @@ def _cancel_intent(
     snapshot: dict, command: dict, intent_seq: int, cancels_intent_id
 ) -> dict:
     body = {
-        "schema": WORKFLOW_INTENT_SCHEMA,
+        "schema": _intent_schema(snapshot),
         "intent_kind": "cancel",
         "intent_id": _intent_id(snapshot["work_spec_sha256"], intent_seq),
         "workflow_id": snapshot["workflow_id"],
@@ -1383,6 +1938,40 @@ def _cancel_intent(
         "queue_route": snapshot["queue_route"],
         "requested_at": command["created_at"],
     }
+    if snapshot["runtime_task_uuid"] is not None:
+        body["runtime_task_uuid"] = snapshot["runtime_task_uuid"]
+    if "trace" in command:
+        body["trace"] = command["trace"]
+    return _seal(body)
+
+
+def _compensate_intent(
+    snapshot: dict, command: dict, intent_seq: int, attempt_no: int,
+    failed_result_sha256: str, compensation_ref,
+) -> dict:
+    """The one `compensate` intent (§10.5), on the next `intent_seq`, using
+    the UNCHANGED `intent_id` and `idempotency_key` formulas.
+
+    `compensation_ref` is copied VERBATIM from the failing envelope's
+    `compensation.ref` when present — an opaque reference AOS never
+    dereferences, never parses, never matches and never executes.
+    """
+    body = {
+        "schema": WORKFLOW_INTENT_V2_SCHEMA,
+        "intent_kind": "compensate",
+        "intent_id": _intent_id(snapshot["work_spec_sha256"], intent_seq),
+        "workflow_id": snapshot["workflow_id"],
+        "work_spec_sha256": snapshot["work_spec_sha256"],
+        "attempt_no": attempt_no,
+        "failed_result_sha256": failed_result_sha256,
+        "idempotency_key": _idempotency_key(
+            snapshot["work_spec_sha256"], intent_seq
+        ),
+        "queue_route": snapshot["queue_route"],
+        "requested_at": command["created_at"],
+    }
+    if compensation_ref is not None:
+        body["compensation_ref"] = compensation_ref
     if snapshot["runtime_task_uuid"] is not None:
         body["runtime_task_uuid"] = snapshot["runtime_task_uuid"]
     if "trace" in command:
@@ -1403,6 +1992,7 @@ def _build_event(
     from_state,
     to_state,
     payload: dict,
+    policy_version=None,
 ) -> dict:
     return _seal({
         "schema": WORKFLOW_EVENT_SCHEMA,
@@ -1411,7 +2001,10 @@ def _build_event(
         "work_spec_sha256": snapshot["work_spec_sha256"],
         "seq": seq,
         "revision": revision,
-        "policy_version": snapshot["policy_version"],
+        "policy_version": (
+            snapshot["policy_version"] if policy_version is None
+            else policy_version
+        ),
         "from_state": from_state,
         "to_state": to_state,
         "command_id": command["command_id"],
@@ -1428,14 +2021,14 @@ def _build_event(
 # emission is (event_name, to_state, payload); `from_state` and `seq` are
 # stamped by `decide`, which owns ordering.
 
-def _handle_validate(snapshot, command, matrix, payload):
-    _require_edge(matrix, snapshot["state"], "validated", "cmd:validate",
+def _handle_validate(snapshot, command, policy, payload, facts):
+    _require_edge(policy, snapshot["state"], "validated", "cmd:validate",
                   receipt=False)
     return {"state": "validated"}, [("workflow_validated", "validated", {})], None
 
 
-def _handle_request_approval(snapshot, command, matrix, payload):
-    _require_edge(matrix, snapshot["state"], "awaiting_approval",
+def _handle_request_approval(snapshot, command, policy, payload, facts):
+    _require_edge(policy, snapshot["state"], "awaiting_approval",
                   "cmd:request_approval", receipt=False)
     if not snapshot["approval_required"]:
         raise _refuse("approval_not_required", "/approval_required")
@@ -1452,7 +2045,7 @@ def _handle_request_approval(snapshot, command, matrix, payload):
     )
 
 
-def _handle_record_approval(snapshot, command, matrix, payload):
+def _handle_record_approval(snapshot, command, policy, payload, facts):
     fact = _verify_approval_fact(payload["approval_document"])
     if fact["work_spec_sha256"] != snapshot["work_spec_sha256"]:
         raise _refuse("approval_fact_unbound", "/work_spec_sha256")
@@ -1473,7 +2066,7 @@ def _handle_record_approval(snapshot, command, matrix, payload):
             raise _refuse("approval_already_satisfied", "/scope")
         if state != "awaiting_approval":
             raise _refuse("approval_not_required", "/scope")
-        _require_edge(matrix, state, "validated", "apr:record_approval",
+        _require_edge(policy, state, "validated", "apr:record_approval",
                       receipt=False)
         declared = snapshot["work_spec_document"].get("policy_refs", {}).get(
             "approval_ref"
@@ -1494,8 +2087,31 @@ def _handle_record_approval(snapshot, command, matrix, payload):
     return {}, [("approval_recorded", None, event_payload)], None
 
 
-def _handle_request_dispatch(snapshot, command, matrix, payload):
-    if snapshot["state"] != "validated":
+def _budget_of(snapshot: dict) -> int:
+    """The one budget rule (§6.1): the ADMITTED artifact's own
+    `retry.max_attempts`, defaulting to 1 when it declares no `retry` block.
+
+    Read from the digest-bound, admission-immutable artifact every time, never
+    from a counter and never from anything the runtime reported, so the budget
+    cannot drift and AOS never accepts a budget it did not derive itself.
+    """
+    return snapshot["work_spec_document"].get("retry", {}).get(
+        "max_attempts", 1
+    )
+
+
+#: Where a dispatch may be requested, per policy version. Under v2 `retrying`
+#: joins `validated`: a retry IS a dispatch issued from `retrying` (§13.1),
+#: which is why there is no retry verb and no second way to do one thing.
+_DISPATCHABLE_STATES = {1: ("validated",), 2: ("validated", "retrying")}
+
+
+def _dispatchable(policy) -> tuple:
+    return _DISPATCHABLE_STATES.get(policy[0], ("validated",))
+
+
+def _handle_request_dispatch(snapshot, command, policy, payload, facts):
+    if snapshot["state"] not in _dispatchable(policy):
         raise _refuse("illegal_transition", "/state")
     if snapshot["approval_required"] and not snapshot[
         "admission_approval_satisfied"
@@ -1506,13 +2122,55 @@ def _handle_request_dispatch(snapshot, command, matrix, payload):
     queue_route = payload.get("queue_route", "default")
     if not _text(queue_route, _COMPONENT_ID_RE):
         raise _refuse("payload_malformed", "/payload/queue_route")
+
+    version = policy[0]
+    attempt_no = attempt_budget = supersedes = None
+    restore_id = restore_digest = None
+    event_payload = {}
+    if version >= 2:
+        # RESERVATION, not consumption (§6.2): the ordinal is stated so the
+        # enqueuer can read it, and nothing is written to the attempt ledger.
+        # A queue rejection or an operator revocation therefore materialises
+        # nothing and burns no budget slot — which is what keeps a
+        # default-budget-1 workflow from being stranded by one adapter error.
+        attempt_budget = _budget_of(snapshot)
+        if snapshot["attempts_used"] >= attempt_budget:
+            raise _refuse(
+                "attempt_budget_exhausted", "/attempts_used",
+                attempts_used=snapshot["attempts_used"],
+                budget=attempt_budget,
+            )
+        attempt_no = snapshot["attempts_used"] + 1
+        supersedes = snapshot["runtime_task_uuid"]
+        restore_id = payload.get("restore_checkpoint_id")
+        if restore_id is not None:
+            restore_digest = _resolve_restore(
+                snapshot, facts, restore_id, attempt_no
+            )
+        event_payload["attempt_no"] = attempt_no
+        event_payload["attempt_budget"] = attempt_budget
+    elif "restore_checkpoint_id" in payload:
+        # The payload key exists only under policy v2 (§9.2). Offering it to a
+        # v1 workflow is a payload this verb does not accept there.
+        raise _refuse("payload_malformed", "/payload/restore_checkpoint_id")
+
     intent_seq = snapshot["intent_seq"] + 1
-    intent = _dispatch_intent(snapshot, command, intent_seq, queue_route)
+    intent = _dispatch_intent(
+        snapshot, command, intent_seq, queue_route,
+        attempt_no=attempt_no, attempt_budget=attempt_budget,
+        supersedes=supersedes,
+        restore_checkpoint_id=restore_id,
+        restore_checkpoint_sha256=restore_digest,
+    )
+    if restore_id is not None:
+        event_payload["restore_checkpoint_id"] = restore_id
+        event_payload["restore_checkpoint_sha256"] = restore_digest
     return (
         {
             "dispatch_intent_id": intent["intent_id"],
             "queue_route": queue_route,
             "intent_seq": intent_seq,
+            "attempt_budget": attempt_budget,
         },
         [(
             "dispatch_requested",
@@ -1521,14 +2179,56 @@ def _handle_request_dispatch(snapshot, command, matrix, payload):
                 "intent_id": intent["intent_id"],
                 "idempotency_key": intent["idempotency_key"],
                 "queue_route": queue_route,
+                **event_payload,
             },
         )],
         intent,
     )
 
 
-def _handle_revoke_dispatch(snapshot, command, matrix, payload):
-    if snapshot["state"] != "validated":
+def _resolve_restore(snapshot, facts, restore_id, into_attempt_no) -> str:
+    """The §9.3 eligibility predicate for a restore REQUESTED in a dispatch.
+
+    The reducer checks only that the value is a UUID; whether it names a
+    stored, eligible checkpoint is a STORED-ROW judgment, so the shell
+    resolved it before `decide` and handed the resolved digest and attempt in
+    through `ShellFacts` (§1.2 row S7). An id the shell could not resolve
+    arrives as an absent pair and refuses `checkpoint_unknown` there, never
+    here — this function judges the resolved facts, it does not look anything
+    up.
+    """
+    if not _text(restore_id, _UUID_RE):
+        raise _refuse("payload_malformed", "/payload/restore_checkpoint_id")
+    digest = facts.checkpoint_sha256
+    from_attempt = facts.checkpoint_attempt_no
+    if digest is None or from_attempt is None:
+        raise _refuse("checkpoint_unknown", "/payload/restore_checkpoint_id")
+    _require_restorable(snapshot, from_attempt, into_attempt_no,
+                        ("retrying",))
+    return digest
+
+
+def _require_restorable(snapshot, from_attempt, into_attempt_no,
+                        legal_states) -> None:
+    """§9.3 conjuncts 3, 4 and 5. Conjuncts 1 and 2 are the shell's: an id it
+    cannot find is `checkpoint_unknown`, and a stored digest that does not
+    recompute is never handed over at all.
+
+    Restoration is INELIGIBLE in `compensating` and in every terminal state:
+    compensation undoes work, restoration resumes it, and allowing both would
+    let a workflow resume from a state whose effects it had just undone.
+    """
+    if snapshot["policy_version"] < 2:
+        raise _refuse("checkpoint_ineligible", "/policy_version")
+    if snapshot["state"] not in legal_states:
+        raise _refuse("checkpoint_ineligible", "/state")
+    if not _count(from_attempt, 1) or from_attempt >= into_attempt_no:
+        # You restore FROM a previous attempt, never from the one you are in.
+        raise _refuse("checkpoint_ineligible", "/from_attempt_no")
+
+
+def _handle_revoke_dispatch(snapshot, command, policy, payload, facts):
+    if snapshot["state"] not in _dispatchable(policy):
         raise _refuse("illegal_transition", "/state")
     outstanding = snapshot["dispatch_intent_id"]
     if outstanding is None:
@@ -1553,15 +2253,16 @@ def _handle_revoke_dispatch(snapshot, command, matrix, payload):
     )
 
 
-def _handle_request_cancel(snapshot, command, matrix, payload):
+def _handle_request_cancel(snapshot, command, policy, payload, facts):
     state = snapshot["state"]
-    local = "cmd:request_cancel" in _cell(matrix, state, "cancelled")
+    local = "cmd:request_cancel" in _cell(policy, state, "cancelled")
     if local:
         # AOS is the source of truth until it has OBSERVED queue acceptance.
         updates = {
             "state": "cancelled",
             "dispatch_intent_id": None,
             "cancel_intent_id": None,
+            **_abandon_open_attempt(snapshot),
         }
         emissions = []
         intent = None
@@ -1600,6 +2301,17 @@ def _handle_request_cancel(snapshot, command, matrix, payload):
         [("cancel_requested", None, {"cancel_intent_id": intent["intent_id"]})],
         intent,
     )
+
+
+def _abandon_open_attempt(snapshot) -> dict:
+    """§5.3.5: entering `cancelled` closes an attempt that is still open as
+    `abandoned`. The work never concluded and never will, so the row closes as
+    neither `succeeded` nor `failed` — the fourth attempt state exists for
+    exactly this moment, and `fold` derives the same value from the history.
+    """
+    if snapshot["attempt_state"] != "open":
+        return {}
+    return {"attempt_state": "abandoned"}
 
 
 def _append_intent_id(current: list, intent_id: str, where: str) -> list:
@@ -1645,7 +2357,59 @@ def _bind_dispatch_receipt(snapshot, receipt):
     return intent_id
 
 
-def _handle_record_queue_receipt(snapshot, command, matrix, payload):
+def _bind_failed_receipt(snapshot, receipt):
+    """The attempt a `failed` receipt closes, and the fence around it.
+
+    ONE RULE for every optional corroborating uuid (§22 A24), the same one
+    §5.3.3 and §10.8 apply to a result envelope: a PRESENT value must equal
+    the binding recorded for the attempt this receipt closes, and an ABSENT
+    one refuses nothing. The receipt record shape stays exactly what U-W2
+    §13.2 froze — `runtime_task_uuid` is not a required member of a `failed`
+    receipt and the storage CHECK admits NULL, so requiring it under policy v2
+    would silently break every adapter already emitting shape-legal receipts.
+
+    The receipt does not need to NAME its attempt, because at most one attempt
+    of a workflow is ever open (§6.3): WHICH attempt it closes is decided by
+    the ledger, not by the document. What a present uuid adds is a
+    contradiction check — and a contradiction is never silently dropped.
+
+    The comparison target is the binding folded from the `dispatch_accepted`
+    history — the event-authoritative source, of which the `workflow_attempts`
+    row is the projection — so this needs no store read and adds no
+    `ShellFacts` member. Returns the attempt ordinal, or `None` when this
+    workflow has no attempt for the receipt to close.
+    """
+    reported = receipt.get("runtime_task_uuid")
+    bound = snapshot["runtime_task_uuid"]
+    if reported is not None and bound is not None and reported != bound:
+        raise _refuse("runtime_uuid_mismatch", "/runtime_task_uuid")
+    return snapshot["attempt_no"]
+
+
+def _receipt_retryable(snapshot, receipt, kind: str, version: int) -> bool:
+    """Does this `failed` receipt classify as `rcp:failed_retryable`?
+
+    Under policy v1 the answer is always no — v1 has no `retrying` state and
+    numbered no workflow attempt, so there is nothing to classify against.
+    Under v2 the receipt must first BIND its attempt (§6.2), and then the
+    §5.3.3 predicate decides: `reason.retryable == true` and `attempt_no <
+    budget` and an attempt is open. A `failed` receipt arriving in
+    `compensating` closes the UNDO, never opens a retry (§10.7: there is no
+    compensation retry), so it is never retryable there.
+    """
+    if kind != "failed" or version < 2:
+        return False
+    attempt_no = _bind_failed_receipt(snapshot, receipt)
+    if snapshot["state"] == "compensating":
+        return False
+    if snapshot["attempt_state"] != "open" or attempt_no is None:
+        return False
+    return bool(receipt["reason"]["retryable"]) and attempt_no < _budget_of(
+        snapshot
+    )
+
+
+def _handle_record_queue_receipt(snapshot, command, policy, payload, facts):
     receipt = _verify_receipt(payload["receipt_document"])
     if receipt["workflow_id"] != snapshot["workflow_id"]:
         raise _refuse("receipt_unbound", "/workflow_id")
@@ -1655,13 +2419,28 @@ def _handle_record_queue_receipt(snapshot, command, matrix, payload):
     kind = receipt["receipt_kind"]
     state = snapshot["state"]
     target = _receipt_target(kind)
+    version = policy[0]
     if target is None:
         # `rejected` is a queue's refusal to ADMIT an intent: stateless, and
-        # legal only where a dispatch intent can be outstanding.
-        if state != "validated":
+        # legal only where a dispatch intent can be outstanding — which under
+        # policy v2 is `retrying` as well as `validated`, because a retry is a
+        # dispatch issued from `retrying` and the queue may refuse that one
+        # exactly as it may refuse the first.
+        if state not in _dispatchable(policy):
             raise _refuse("receipt_out_of_order", "/receipt_kind")
     else:
-        _require_edge(matrix, state, target, f"rcp:{kind}", receipt=True)
+        # The landed gate runs FIRST and unchanged, so state legality still
+        # outranks binding: a `failed` receipt in a state that admits none is
+        # `receipt_out_of_order`, exactly as it was under v1.
+        _require_edge(policy, state, target, f"rcp:{kind}", receipt=True)
+
+    retryable = _receipt_retryable(snapshot, receipt, kind, version)
+    if retryable:
+        # `rcp:failed_retryable` is a DIFFERENT driver from `rcp:failed`, so
+        # it is required against its own cell rather than the terminal one.
+        target = "retrying"
+        _require_edge(policy, state, target, "rcp:failed_retryable",
+                      receipt=True)
 
     receipt_id = receipt["receipt_id"]
     receipt_sha256 = protocols.content_digest(receipt)
@@ -1693,24 +2472,63 @@ def _handle_record_queue_receipt(snapshot, command, matrix, payload):
                 )],
                 None,
             )
-        # The runtime mints the task UUID at acceptance; a pre-declared value
-        # must match, and every later receipt must repeat it.
-        if declared_uuid is not None and reported_uuid != declared_uuid:
+        accepted_payload = {
+            **base_payload,
+            "intent_id": intent_id,
+            "idempotency_key": receipt["idempotency_key"],
+            "runtime_task_uuid": reported_uuid,
+        }
+        if version >= 2:
+            # OPENED / CONSUMED (§6.2): the ordinal is assigned here, not at
+            # reservation, so a queue rejection or an operator revocation
+            # never burns a budget slot. It also keeps `attempt_no <= budget
+            # <= 10` always true, which is what makes the reported `attempt`
+            # satisfiable against the shipped envelope's 1..10 bound.
+            attempt_no = snapshot["attempts_used"] + 1
+            if snapshot["dispatch_intent_id"] is None:
+                # No v2 reservation to number this acceptance from. The landed
+                # code's exact meaning applies: the receipt binds no attempt of
+                # this workflow that AOS authoritatively recorded. NO ORDINAL
+                # IS FABRICATED to make the acceptance succeed (§5.5 item 5).
+                raise _refuse("receipt_unbound", "/intent_id")
+            if attempt_no > _budget_of(snapshot):
+                raise _refuse("attempt_budget_exhausted", "/attempts_used")
+            # §6.5, ONE RUNTIME TASK, ONE WORKFLOW ATTEMPT. A retry is a new
+            # runtime task by construction (§7.2), so an `accepted` receipt
+            # offering a uuid this workflow already bound is evidence of a
+            # reused or replayed task, not of a new attempt. The prior binding
+            # is the folded one, so the check is event-authoritative and needs
+            # no store read; `UNIQUE(workflow_id, runtime_task_uuid)` is the
+            # storage backstop behind it.
+            if (
+                snapshot["runtime_task_uuid"] is not None
+                and reported_uuid == snapshot["runtime_task_uuid"]
+            ):
+                raise _refuse("runtime_uuid_mismatch", "/runtime_task_uuid")
+            # The artifact may PRE-DECLARE the runtime task uuid, and under
+            # v1 that declaration bound every acceptance. It cannot bind a
+            # retry: a retry is a NEW runtime task by construction, so a
+            # declaration naming one task could never be satisfied twice.
+            # Frozen: the declaration binds ATTEMPT 1 ONLY (§6.5).
+            if attempt_no == 1 and declared_uuid is not None and (
+                reported_uuid != declared_uuid
+            ):
+                raise _refuse("runtime_uuid_mismatch", "/runtime_task_uuid")
+            accepted_payload["attempt_no"] = attempt_no
+            updates["attempt_no"] = attempt_no
+            updates["attempt_state"] = "open"
+            updates["attempts_used"] = attempt_no
+            updates["attempt_budget"] = _budget_of(snapshot)
+            updates["last_checkpoint_seq"] = 0
+        elif declared_uuid is not None and reported_uuid != declared_uuid:
+            # The runtime mints the task UUID at acceptance; a pre-declared
+            # value must match, and every later receipt must repeat it.
             raise _refuse("runtime_uuid_mismatch", "/runtime_task_uuid")
         updates["state"] = "scheduled"
         updates["runtime_task_uuid"] = reported_uuid
         return (
             updates,
-            [(
-                "dispatch_accepted",
-                "scheduled",
-                {
-                    **base_payload,
-                    "intent_id": intent_id,
-                    "idempotency_key": receipt["idempotency_key"],
-                    "runtime_task_uuid": reported_uuid,
-                },
-            )],
+            [("dispatch_accepted", "scheduled", accepted_payload)],
             None,
         )
 
@@ -1733,6 +2551,7 @@ def _handle_record_queue_receipt(snapshot, command, matrix, payload):
             "state": "cancelled",
             "dispatch_intent_id": None,
             "cancel_intent_id": None,
+            **_abandon_open_attempt(snapshot),
         }
         event_payload = {**base_payload, "initiator": "runtime"}
         if intent_id is not None:
@@ -1751,23 +2570,60 @@ def _handle_record_queue_receipt(snapshot, command, matrix, payload):
         return updates, [("workflow_cancelled", "cancelled", event_payload)], None
 
     if kind == "failed":
-        return (
-            {
-                "state": "failed",
-                "dispatch_intent_id": None,
-                "cancel_intent_id": None,
-            },
-            [(
-                "workflow_failed",
-                "failed",
+        reason_payload = {
+            **base_payload,
+            "reason_code": receipt["reason"]["code"],
+            "retryable": receipt["reason"]["retryable"],
+        }
+        if retryable:
+            return (
                 {
-                    **base_payload,
-                    "reason_code": receipt["reason"]["code"],
-                    "retryable": receipt["reason"]["retryable"],
+                    "state": "retrying",
+                    "attempt_state": "failed",
+                    "cancel_intent_id": None,
                 },
-            )],
-            None,
-        )
+                [(
+                    "attempt_failed",
+                    "retrying",
+                    {
+                        **reason_payload,
+                        "attempt_no": snapshot["attempt_no"],
+                        "attempt_budget": _budget_of(snapshot),
+                        "attempts_used": snapshot["attempts_used"],
+                    },
+                )],
+                None,
+            )
+        if version >= 2 and state == "compensating":
+            # The undo episode ends because the runtime reported the task it
+            # was bound to failed. A distinct event name, so "the work failed"
+            # and "the undo failed" are never confused in the history; it
+            # carries no `compensation_state`, because a queue receipt reports
+            # about the TASK, not about the undo (§5.5).
+            return (
+                {
+                    "state": "failed",
+                    "compensation_state": "failed",
+                    "dispatch_intent_id": None,
+                    "cancel_intent_id": None,
+                },
+                [(
+                    "compensation_failed",
+                    "failed",
+                    {**reason_payload, "attempt_no": snapshot["attempt_no"]},
+                )],
+                None,
+            )
+        updates = {
+            "state": "failed",
+            "dispatch_intent_id": None,
+            "cancel_intent_id": None,
+        }
+        if version >= 2:
+            updates["attempt_state"] = "failed"
+            reason_payload["attempt_no"] = snapshot["attempt_no"]
+            reason_payload["attempts_used"] = snapshot["attempts_used"]
+        return updates, [("workflow_failed", "failed", reason_payload)], None
 
     return (
         {"state": target},
@@ -1780,7 +2636,7 @@ def _handle_record_queue_receipt(snapshot, command, matrix, payload):
     )
 
 
-def _handle_record_result(snapshot, command, matrix, payload):
+def _handle_record_result(snapshot, command, policy, payload, facts):
     # §6 makes record_result legal in `running` only; the matrix's reserved
     # cells are unreachable from here by construction (§5.2).
     if snapshot["state"] != "running":
@@ -1799,34 +2655,90 @@ def _handle_record_result(snapshot, command, matrix, payload):
 
     outcome = envelope["outcome"]
     result_sha256 = protocols.content_digest(envelope)
+    version = policy[0]
+    compensation = _compensation_state(envelope)
+    if version >= 2:
+        # The universal attempt fence (§5.3.3): the `attempt` integer alone
+        # selects and binds the attempt, and it must equal the OPEN one. An
+        # attempt number that names nothing is not accounting.
+        if envelope["attempt"] != snapshot["attempt_no"] or snapshot[
+            "attempt_state"
+        ] != "open":
+            raise _refuse("attempt_mismatch", "/attempt")
+        # Optional corroboration, never a selector: a PRESENT value must match
+        # the recorded binding, an ABSENT one refuses nothing, and a matching
+        # one grants no additional authority (§5.3.3).
+        _require_uuid_corroboration(snapshot, envelope)
     if outcome not in ("success", "fail"):
-        # Retry and salvage semantics are U-W3's; policy v2 will widen this.
+        # `partial` and `unknown` are honest statements of ignorance and are
+        # deliberately NOT activated under policy v2: U-W3 cannot know WHAT
+        # was partially done, and turning a producer's uncertainty into an AOS
+        # claim about the world is the one rule this architecture never bends.
         raise _refuse("result_outcome_inconclusive", "/outcome", outcome=outcome)
 
+    if version >= 2 and compensation in ("applied", "failed"):
+        # A FIRST result cannot report a CONCLUSION. Checked AFTER the outcome
+        # gate, so §10.3's `partial`/`unknown` row — "any" compensation state —
+        # keeps selecting `result_outcome_inconclusive` (§22 A27).
+        raise _refuse("compensation_state_inconsistent", "/compensation/state")
+
     if outcome == "fail":
-        _require_edge(matrix, "running", "failed", "res:fail", receipt=False)
+        if version >= 2 and compensation == "pending":
+            # Compensation OUTRANKS retry, and the retry predicate is not even
+            # consulted: undoing a partial effect before re-running is the only
+            # safe order, and retrying over an un-undone effect is the hazard
+            # the whole model exists to prevent (§10.3).
+            return _enter_compensation(snapshot, command, policy, envelope,
+                                       result_sha256)
+        if version >= 2 and _result_retryable(snapshot, envelope):
+            attempt_no = snapshot["attempt_no"]
+            _require_edge(policy, "running", "retrying", "res:fail_retryable",
+                          receipt=False)
+            return (
+                {
+                    "state": "retrying",
+                    "attempt_state": "failed",
+                    "cancel_intent_id": None,
+                },
+                [(
+                    "attempt_failed",
+                    "retrying",
+                    {
+                        "attempt_no": attempt_no,
+                        "attempt_budget": _budget_of(snapshot),
+                        "attempts_used": snapshot["attempts_used"],
+                        "result_sha256": result_sha256,
+                    },
+                )],
+                None,
+            )
+        _require_edge(policy, "running", "failed", "res:fail", receipt=False)
+        failed_payload = {
+            "result_sha256": result_sha256,
+            "attempt": envelope["attempt"],
+            "outcome": outcome,
+        }
+        if version >= 2:
+            failed_payload["attempt_no"] = snapshot["attempt_no"]
+            failed_payload["attempts_used"] = snapshot["attempts_used"]
         return (
             {
                 "state": "failed",
+                "attempt_state": "failed",
                 "dispatch_intent_id": None,
                 "cancel_intent_id": None,
             },
-            [(
-                "workflow_failed",
-                "failed",
-                {
-                    "result_sha256": result_sha256,
-                    "attempt": envelope["attempt"],
-                    "outcome": outcome,
-                },
-            )],
+            [("workflow_failed", "failed", failed_payload)],
             None,
         )
 
+    if version >= 2 and compensation == "pending":
+        # A success that needs undoing is not an honest report.
+        raise _refuse("result_inconsistent", "/compensation/state")
     if envelope["retryable"]:
         # A claim of success that asks to be retried is not an honest report.
         raise _refuse("result_inconsistent", "/retryable")
-    _require_edge(matrix, "running", "succeeded", "res:success", receipt=False)
+    _require_edge(policy, "running", "succeeded", "res:success", receipt=False)
 
     expected = artifact["expected_result"]
     counted, discounted_kind, discounted_blank = _count_evidence(
@@ -1845,6 +2757,7 @@ def _handle_record_result(snapshot, command, matrix, payload):
     return (
         {
             "state": "succeeded",
+            "attempt_state": "succeeded",
             "dispatch_intent_id": None,
             "cancel_intent_id": None,
         },
@@ -1855,6 +2768,385 @@ def _handle_record_result(snapshot, command, matrix, payload):
                 "result_sha256": result_sha256,
                 "attempt": envelope["attempt"],
                 # Digests, never raw refs.
+                "evidence": [
+                    {
+                        "kind": item["kind"],
+                        "ref_sha256": hashlib.sha256(
+                            item["ref"].encode("utf-8")
+                        ).hexdigest(),
+                        "provenance": item["provenance"],
+                    }
+                    for item in counted
+                ],
+                "evidence_counted": len(counted),
+                "evidence_required": required,
+            },
+        )],
+        None,
+    )
+
+
+def _compensation_state(envelope: dict):
+    """The envelope's optional `compensation.state`, or `None`.
+
+    `beast.result-envelope/v1` ships `compensation` as an optional object
+    whose only required member is `state`, so the document has already been
+    spine-validated by the time this reads it: a present block has a `state`
+    from the shipped four-member enum, and there is nothing here to guess.
+    """
+    block = envelope.get("compensation")
+    if not isinstance(block, dict):
+        return None
+    state = block.get("state")
+    return state if isinstance(state, str) else None
+
+
+def _require_uuid_corroboration(snapshot, envelope) -> None:
+    """The §5.3.3 / §10.8 rule for a result or compensation envelope.
+
+    `beast.result-envelope/v1` ships `runtime_task_uuid` as an OPTIONAL
+    property, so U-W3 treats it as corroborating evidence and never as a
+    selector: a PRESENT value must equal the recorded binding of the attempt
+    the envelope names, an ABSENT one refuses nothing and is never replaced by
+    a default or an inferred value, and a matching one grants no additional
+    authority. A present contradiction is never silently dropped — ignoring
+    evidence that disagrees with the ledger is the same class of error as
+    fabricating evidence that agrees with it.
+    """
+    reported = envelope.get("runtime_task_uuid")
+    if reported is None:
+        return
+    if reported != snapshot["runtime_task_uuid"]:
+        raise _refuse("runtime_uuid_mismatch", "/runtime_task_uuid")
+
+
+def _result_retryable(snapshot, envelope) -> bool:
+    """§5.3.3 `res:fail_retryable`: the producer asked to be retried AND the
+    artifact's own budget still has room."""
+    return bool(envelope["retryable"]) and snapshot[
+        "attempt_no"
+    ] < _budget_of(snapshot)
+
+
+def _enter_compensation(snapshot, command, policy, envelope, result_sha256):
+    """`running → compensating` (§10.3, §10.4), the only entry there is.
+
+    The open attempt closes `failed` with the FAILING result's digest
+    preserved as the authoritative compensation trigger, and exactly one
+    `compensate` intent is emitted. Compensation authority is this verified
+    envelope and nothing else: no tool manifest, no skill manifest, no agent
+    passport, no compile-report finding and no `recovery.action` reaches this
+    decision, because no U-W3 code path reads one.
+    """
+    _require_edge(policy, "running", "compensating", "res:compensable",
+                  receipt=False)
+    block = envelope.get("compensation")
+    reference = block.get("ref") if isinstance(block, dict) else None
+    intent_seq = snapshot["intent_seq"] + 1
+    attempt_no = snapshot["attempt_no"]
+    intent = _compensate_intent(
+        snapshot, command, intent_seq, attempt_no, result_sha256, reference
+    )
+    event_payload = {
+        "result_sha256": result_sha256,
+        "attempt_no": attempt_no,
+    }
+    if reference is not None:
+        event_payload["compensation_ref"] = reference
+    return (
+        {
+            "state": "compensating",
+            "attempt_state": "failed",
+            "compensation_state": "pending",
+            "intent_seq": intent_seq,
+            "dispatch_intent_id": None,
+            "cancel_intent_id": None,
+        },
+        [("compensation_started", "compensating", event_payload)],
+        intent,
+    )
+
+
+def _handle_adopt_policy_version(snapshot, command, policy, payload, facts):
+    """§5.2. An EXPLICIT, RECORDED, forward-only human decision.
+
+    Stateless: it traverses no matrix cell, changes no `state`, emits exactly
+    one event and consumes one revision. There is no downgrade, no `--force`,
+    no batch adopt and no implicit adoption inside any other verb.
+    """
+    requested = payload.get("policy_version")
+    if not _count(requested, 1):
+        raise _refuse("payload_malformed", "/payload/policy_version")
+    current = snapshot["policy_version"]
+    if requested not in SUPPORTED_POLICY_VERSIONS:
+        # A version this build does not ship is refused, never guessed.
+        raise _refuse("policy_version_unsupported", "/payload/policy_version")
+    if requested <= current:
+        raise _refuse(
+            "policy_version_not_upgradable", "/payload/policy_version"
+        )
+    _require_adoption_safe(snapshot)
+    return (
+        {"policy_version": requested},
+        [(
+            "policy_version_adopted",
+            None,
+            {"from_policy_version": current, "to_policy_version": requested},
+        )],
+        None,
+    )
+
+
+def _require_adoption_safe(snapshot) -> None:
+    """The §5.2.1 adoption-safety predicate: A1, A2 or A3.
+
+    The edge-superset property makes adoption TRANSITION-safe — no move that
+    was legal under the old version becomes illegal under the new one. It
+    establishes nothing about the attempt ledger, and that is a second,
+    independent obligation: policy v2 decides retry, checkpoint, restore and
+    compensation against an authoritative record of which attempt is open,
+    which runtime task it bound, and how many attempts are used — a record
+    policy v1 never kept.
+
+    Every conjunct is read from the FOLDED snapshot. No `workflow_attempts`
+    row is ever synthesized from historical events, no `attempt_no` is ever
+    inferred, and no `--force` or `--repair` reaches around this predicate.
+    A1 is the live path; A2 and A3 are stated for totality — A2 because the
+    non-terminal conjunct refuses a terminal workflow first with
+    `workflow_terminal`, A3 because the 6→7 migration derives no attempt row,
+    so no policy-v1 workflow can hold the complete v2 history it describes.
+    """
+    if snapshot["state"] in TERMINAL_STATES:  # A2, unreachable: see above
+        return
+    pre_dispatch = (
+        snapshot["runtime_task_uuid"] is None
+        and snapshot["attempts_used"] == 0
+        and snapshot["attempt_no"] is None
+        and snapshot["dispatch_intent_id"] is None
+    )
+    if pre_dispatch:  # A1
+        return
+    raise _refuse("policy_version_not_upgradable", "/state")
+
+
+def _handle_record_checkpoint(snapshot, command, policy, payload, facts):
+    """§8. Store a bounded, attempt-bound execution-restoration state the
+    EXECUTING SIDE produced. Stateless: it traverses no matrix cell, changes
+    no `state`, and never satisfies an evidence predicate or an attempt.
+
+    AOS never creates, derives, synthesises, edits or completes a checkpoint,
+    never reads a payload key, and never renders one.
+    """
+    if policy[0] < 2:
+        raise _refuse("illegal_transition", "/policy_version")
+    document = _verify_checkpoint(payload["checkpoint_document"])
+    if document["workflow_id"] != snapshot["workflow_id"]:
+        raise _refuse("checkpoint_unbound", "/workflow_id")
+    if document["work_spec_sha256"] != snapshot["work_spec_sha256"]:
+        raise _refuse("checkpoint_unbound", "/work_spec_sha256")
+    if snapshot["state"] not in _CHECKPOINTABLE_STATES:
+        raise _refuse("illegal_transition", "/state")
+    if (
+        document["attempt_no"] != snapshot["attempt_no"]
+        or snapshot["attempt_state"] != "open"
+    ):
+        raise _refuse("attempt_mismatch", "/attempt_no")
+    if document["runtime_task_uuid"] != snapshot["runtime_task_uuid"]:
+        raise _refuse("runtime_uuid_mismatch", "/runtime_task_uuid")
+    # The count bounds are read from the LEDGER, not from the submitted
+    # ordinal, so the ninth checkpoint of an attempt refuses its own exact
+    # code rather than failing the record's 1..8 shape gate.
+    if snapshot["last_checkpoint_seq"] >= MAX_CHECKPOINTS_PER_ATTEMPT:
+        raise _refuse("checkpoint_limit_exceeded", "/checkpoint_seq")
+    if snapshot["checkpoint_count"] >= MAX_CHECKPOINTS_PER_WORKFLOW:
+        raise _refuse("checkpoint_limit_exceeded", "/checkpoint_seq")
+    if document["checkpoint_seq"] != snapshot["last_checkpoint_seq"] + 1:
+        # Monotone from 1 WITHIN AN ATTEMPT (§8.2). A record naming any other
+        # ordinal does not describe this ledger's next checkpoint.
+        raise _refuse("checkpoint_malformed", "/checkpoint_seq")
+    return (
+        {
+            "last_checkpoint_seq": document["checkpoint_seq"],
+            "checkpoint_count": snapshot["checkpoint_count"] + 1,
+        },
+        [(
+            "checkpoint_recorded",
+            None,
+            {
+                "checkpoint_id": document["checkpoint_id"],
+                "checkpoint_sha256": protocols.content_digest(document),
+                "attempt_no": document["attempt_no"],
+                "checkpoint_seq": document["checkpoint_seq"],
+                "payload_bytes": _checkpoint_payload_bytes(
+                    document["payload"]
+                ),
+            },
+        )],
+        None,
+    )
+
+
+def _handle_record_restore(snapshot, command, policy, payload, facts):
+    """§9.4. Record that a named, digest-bound, STORED checkpoint was loaded
+    into a named attempt.
+
+    Stateless, exactly like a runtime-scope `approval_recorded`. A
+    `run_resumed` event is NEVER proof that a checkpoint was restored, and
+    this event NEVER changes state: the two resumes are separate facts and
+    neither is derived from the other.
+    """
+    if policy[0] < 2:
+        raise _refuse("illegal_transition", "/policy_version")
+    document = _verify_restore_fact(payload["restore_document"])
+    if document["workflow_id"] != snapshot["workflow_id"]:
+        raise _refuse("restore_fact_unbound", "/workflow_id")
+    if document["work_spec_sha256"] != snapshot["work_spec_sha256"]:
+        raise _refuse("restore_fact_unbound", "/work_spec_sha256")
+    if facts.checkpoint_sha256 is None or facts.checkpoint_attempt_no is None:
+        raise _refuse("checkpoint_unknown", "/checkpoint_id")
+    if document["checkpoint_sha256"] != facts.checkpoint_sha256:
+        raise _refuse("restore_fact_unbound", "/checkpoint_sha256")
+    # The checkpoint digest alone is insufficient: it proves WHICH BYTES were
+    # restored, not WHICH ATTEMPT they captured.
+    if document["from_attempt_no"] != facts.checkpoint_attempt_no:
+        raise _refuse("restore_fact_unbound", "/from_attempt_no")
+    if (
+        document["into_attempt_no"] != snapshot["attempt_no"]
+        or snapshot["attempt_state"] != "open"
+    ):
+        raise _refuse("attempt_mismatch", "/into_attempt_no")
+    _require_restorable(
+        snapshot, document["from_attempt_no"], document["into_attempt_no"],
+        ("scheduled", "running"),
+    )
+    return (
+        {"restored_checkpoint_sha256": document["checkpoint_sha256"]},
+        [(
+            "checkpoint_restored",
+            None,
+            {
+                "checkpoint_id": document["checkpoint_id"],
+                "checkpoint_sha256": document["checkpoint_sha256"],
+                "from_attempt_no": document["from_attempt_no"],
+                "into_attempt_no": document["into_attempt_no"],
+                "restored_by": document["restored_by"],
+            },
+        )],
+        None,
+    )
+
+
+#: The §10.8 conclusion table, exhaustive over `outcome` x
+#: `compensation.state`. Every cell names EXACTLY ONE code or driver, so no
+#: compensation envelope reaches a decision this contract did not name.
+#: `None` is an absent `compensation` block.
+_COMPENSATION_CONCLUSIONS = {
+    ("success", "applied"): "applied",
+    ("fail", "applied"): "applied",
+    ("success", "failed"): "failed",
+    ("fail", "failed"): "failed",
+}
+
+
+def _handle_record_compensation(snapshot, command, policy, payload, facts):
+    """§10.8. The conclusion of a compensation episode: exactly two outcomes.
+
+    AOS decides the STATE; the executing side performed the ACT. This reads a
+    verified `beast.result-envelope/v1` and nothing else — no manifest, no
+    finding, no `recovery.action`, and no uuid decides anything.
+    """
+    if policy[0] < 2:
+        raise _refuse("illegal_transition", "/policy_version")
+    if snapshot["state"] != "compensating":
+        raise _refuse("compensation_not_required", "/state")
+    if snapshot["compensation_state"] != "pending":
+        # A second conclusion. Unreachable while both conclusions are terminal
+        # (a terminal row refuses `workflow_terminal` first), and kept as a
+        # total guard rather than an assumption.
+        raise _refuse("compensation_already_concluded", "/compensation_state")
+    envelope = _verify_result(payload["compensation_document"], snapshot)
+    result_sha256 = protocols.content_digest(envelope)
+    outcome = envelope["outcome"]
+    reported = _compensation_state(envelope)
+
+    # The conclusion is bound to the attempt it concludes by a MANDATORY
+    # ordinal: the compensating attempt `compensation_started` recorded. No
+    # attempt is open in `compensating` — §6.2 closed it `failed` at entry —
+    # so this is deliberately not the "open attempt" comparison.
+    if envelope["attempt"] != snapshot["attempt_no"]:
+        raise _refuse("attempt_mismatch", "/attempt")
+    _require_uuid_corroboration(snapshot, envelope)
+    if outcome not in ("success", "fail"):
+        raise _refuse("result_outcome_inconclusive", "/outcome", outcome=outcome)
+    verdict = (
+        None if reported is None
+        else _COMPENSATION_CONCLUSIONS.get((outcome, reported))
+    )
+    if verdict is None:
+        # An absent block, `not_required`, or `pending`: none of them is a
+        # conclusion, and each is a contradiction between the envelope and the
+        # phase it claims to end.
+        raise _refuse(
+            "compensation_state_inconsistent", "/compensation/state"
+        )
+
+    if verdict == "failed":
+        _require_edge(policy, "compensating", "failed", "cmp:failed",
+                      receipt=False)
+        return (
+            {
+                "state": "failed",
+                "compensation_state": "failed",
+                "dispatch_intent_id": None,
+                "cancel_intent_id": None,
+            },
+            [(
+                "compensation_failed",
+                "failed",
+                {
+                    "attempt_no": snapshot["attempt_no"],
+                    "result_sha256": result_sha256,
+                    "compensation_state": reported,
+                },
+            )],
+            None,
+        )
+
+    _require_edge(policy, "compensating", "compensated", "cmp:applied",
+                  receipt=False)
+    # `compensated` is gated by the SAME §12.2 evidence predicate as
+    # `succeeded`, applied to the compensation envelope. One rule, one
+    # existing code, no new vocabulary.
+    expected = snapshot["work_spec_document"]["expected_result"]
+    counted, discounted_kind, discounted_blank = _count_evidence(
+        envelope, expected
+    )
+    required = expected["min_evidence_count"]
+    if len(counted) < required:
+        raise _refuse(
+            "evidence_insufficient",
+            "/evidence",
+            required=required,
+            counted=len(counted),
+            discounted_kind=discounted_kind,
+            discounted_blank=discounted_blank,
+        )
+    return (
+        {
+            "state": "compensated",
+            "compensation_state": "applied",
+            "dispatch_intent_id": None,
+            "cancel_intent_id": None,
+        },
+        [(
+            "compensation_applied",
+            "compensated",
+            {
+                "result_sha256": result_sha256,
+                "compensation_state": reported,
+                "attempt_no": snapshot["attempt_no"],
+                # Digests, never raw refs — the landed `workflow_succeeded`
+                # shape.
                 "evidence": [
                     {
                         "kind": item["kind"],
@@ -1911,13 +3203,17 @@ _HANDLERS = (
     ("request_cancel", _handle_request_cancel),
     ("record_queue_receipt", _handle_record_queue_receipt),
     ("record_result", _handle_record_result),
+    ("adopt_policy_version", _handle_adopt_policy_version),
+    ("record_checkpoint", _handle_record_checkpoint),
+    ("record_restore", _handle_record_restore),
+    ("record_compensation", _handle_record_compensation),
 )
 
 
 # ---------------------------------------------------------------------------
 # The reducer (§9)
 
-def decide(snapshot, command, facts: AdmissionFacts) -> WorkflowDecision:
+def decide(snapshot, command, facts: ShellFacts) -> WorkflowDecision:
     """snapshot + typed command + verified facts -> the next snapshot, the
     events it appends, and at most one queue intent.
 
@@ -1939,7 +3235,14 @@ def decide(snapshot, command, facts: AdmissionFacts) -> WorkflowDecision:
         raise _refuse("workflow_unknown", "/workflow_id")
 
     state = _verify_snapshot(snapshot)
-    matrix = _matrix_for(state["policy_version"])
+    # A policy-v1 snapshot carries none of §11.4's members. The handlers are
+    # written once, for one shape, so the working value gets the fresh
+    # defaults and `_seal_snapshot` projects them back off before the record
+    # is sealed — a v1 workflow therefore keeps sealing over exactly U-W2's
+    # member set. The defaults are the honest zero, never an inference: a v1
+    # history recorded no ordinal and none is invented for it (§5.5 item 5).
+    state = {**_FRESH_RECOVERY_MEMBERS, **state}
+    policy = _policy_for(state["policy_version"])
     if fresh_command["workflow_id"] != state["workflow_id"]:
         raise _refuse("command_malformed", "/workflow_id")
     if state["state"] in TERMINAL_STATES:
@@ -1951,7 +3254,7 @@ def decide(snapshot, command, facts: AdmissionFacts) -> WorkflowDecision:
     for verb, handler in _HANDLERS:
         if verb == name:
             updates, emissions, intent = handler(
-                state, fresh_command, matrix, payload
+                state, fresh_command, policy, payload, facts
             )
             break
     else:  # pragma: no cover - _verify_command closed the vocabulary
@@ -1975,6 +3278,13 @@ def decide(snapshot, command, facts: AdmissionFacts) -> WorkflowDecision:
                 from_state=from_state,
                 to_state=to_state,
                 payload=event_payload,
+                # The adoption event is the ONE place the stamp is the NEW
+                # version rather than the snapshot's prior one, so `fold`
+                # reconstructs the change from the history alone (§5.2).
+                policy_version=(
+                    after["policy_version"]
+                    if event_name == "policy_version_adopted" else None
+                ),
             )
         )
         if to_state is not None:
@@ -2006,25 +3316,98 @@ _EVENT_KEYS = (
 #: What `fold` reads out of each event payload. Verifying it is what makes
 #: "certified by `verify_history`" imply "foldable": §14.2 requires the
 #: integrity path to REPORT, and a `KeyError` out of `fold` is not a report.
+#: `(minimum policy version, event, rules)`. The version axis is the same
+#: shape §5.1 freezes for `_POLICY_MATRICES`, and it exists for one
+#: load-bearing reason: `dispatch_accepted` MUST carry `attempt_no` under
+#: policy v2 and MUST be allowed to omit it under policy v1, because policy v1
+#: never numbered workflow attempts and a v1 history is correct, complete
+#: history that must fold forever. A row is enforced against an event whose
+#: own recorded `policy_version` is at least the row's version.
 _EVENT_PAYLOAD_REQUIRED = (
-    ("workflow_admitted", (
+    (1, "workflow_admitted", (
         ("task_id", "task"), ("report_sha256", "sha256"),
         ("snapshot_sha256", "sha256"), ("registry_version", "count"),
         ("compile_status", "status"), ("approval_required", "bool"),
     )),
-    ("approval_recorded", (("scope", "scope"),)),
-    ("dispatch_requested", (("intent_id", "uuid"), ("queue_route", "slug"))),
-    ("dispatch_revoked", (("intent_id", "uuid"),)),
-    ("dispatch_accepted", (
+    (1, "approval_recorded", (("scope", "scope"),)),
+    (1, "dispatch_requested", (
+        ("intent_id", "uuid"), ("queue_route", "slug"),
+    )),
+    (1, "dispatch_revoked", (("intent_id", "uuid"),)),
+    (1, "dispatch_accepted", (
         ("intent_id", "uuid"), ("runtime_task_uuid", "uuid"),
     )),
-    ("dispatch_rejected", (("intent_id", "uuid"),)),
-    ("cancel_requested", (("cancel_intent_id", "uuid"),)),
+    (2, "dispatch_accepted", (("attempt_no", "attempt"),)),
+    (1, "dispatch_rejected", (("intent_id", "uuid"),)),
+    (1, "cancel_requested", (("cancel_intent_id", "uuid"),)),
+    (2, "policy_version_adopted", (
+        ("from_policy_version", "count"), ("to_policy_version", "count"),
+    )),
+    (2, "attempt_failed", (
+        ("attempt_no", "attempt"), ("attempt_budget", "attempt"),
+        ("attempts_used", "count"),
+    )),
+    (2, "checkpoint_recorded", (
+        ("checkpoint_id", "uuid"), ("checkpoint_sha256", "sha256"),
+        ("attempt_no", "attempt"), ("checkpoint_seq", "count"),
+        ("payload_bytes", "count"),
+    )),
+    (2, "checkpoint_restored", (
+        ("checkpoint_id", "uuid"), ("checkpoint_sha256", "sha256"),
+        ("from_attempt_no", "attempt"), ("into_attempt_no", "attempt"),
+        ("restored_by", "provenance"),
+    )),
+    (2, "compensation_started", (
+        ("result_sha256", "sha256"), ("attempt_no", "attempt"),
+    )),
+    (2, "compensation_applied", (
+        ("result_sha256", "sha256"), ("attempt_no", "attempt"),
+        ("compensation_state", "compensation"),
+    )),
+    (2, "compensation_failed", (("attempt_no", "attempt"),)),
 )
+
+#: The policy version each event NAME became available at. U-W2's seventeen
+#: are available at every version; U-W3's seven exist only under policy v2.
+#:
+#: This is the other half of the version axis, and it is load-bearing: without
+#: it, a spliced `checkpoint_recorded` stamped `policy_version: 1` would skip
+#: its own required-payload row (that row applies at version >= 2), be
+#: CERTIFIED by `verify_history`, and then crash `fold` with a raw `KeyError`
+#: on the member the row would have required. A `KeyError` out of `fold` is
+#: not a report (§5.5, §11.4), and a history `verify_history` certifies must
+#: never crash `fold` — so an event whose name did not exist at its own
+#: stamped version is `history_corrupt`, refused before it is ever folded.
+_EVENT_MIN_POLICY_VERSION = (
+    ("policy_version_adopted", 2),
+    ("attempt_failed", 2),
+    ("checkpoint_recorded", 2),
+    ("checkpoint_restored", 2),
+    ("compensation_started", 2),
+    ("compensation_applied", 2),
+    ("compensation_failed", 2),
+)
+
+
+def _event_available(event: str, policy_version: int) -> bool:
+    for name, minimum in _EVENT_MIN_POLICY_VERSION:
+        if name == event:
+            return policy_version >= minimum
+    return True
+
 
 #: Read conditionally by `fold`, so only the type is pinned when present.
 _EVENT_PAYLOAD_OPTIONAL = (
-    ("workflow_cancelled", (("intent_id", "uuid"),)),
+    (1, "workflow_cancelled", (("intent_id", "uuid"),)),
+    (2, "compensation_started", (("compensation_ref", "ref"),)),
+    (2, "compensation_failed", (
+        ("result_sha256", "sha256"), ("compensation_state", "compensation"),
+    )),
+    (2, "dispatch_requested", (
+        ("attempt_no", "attempt"), ("attempt_budget", "attempt"),
+        ("restore_checkpoint_id", "uuid"),
+        ("restore_checkpoint_sha256", "sha256"),
+    )),
 )
 
 
@@ -2045,18 +3428,26 @@ def _payload_value_ok(kind: str, value) -> bool:
         return _count(value, 1)
     if kind == "bool":
         return isinstance(value, bool)
+    if kind == "attempt":
+        return _bounded_attempt(value)
+    if kind == "provenance":
+        return _text(value, _PROVENANCE_RE)
+    if kind == "ref":
+        return _text(value, _OPAQUE_REF_RE)
+    if kind == "compensation":
+        return value in WORKFLOW_COMPENSATION_STATES
     return False  # pragma: no cover - the table is closed
 
 
-def _verify_event_payload(event: str, payload: dict) -> bool:
-    for name, rules in _EVENT_PAYLOAD_REQUIRED:
-        if name != event:
+def _verify_event_payload(event: str, payload: dict, policy_version: int) -> bool:
+    for version, name, rules in _EVENT_PAYLOAD_REQUIRED:
+        if name != event or policy_version < version:
             continue
         for key, kind in rules:
             if key not in payload or not _payload_value_ok(kind, payload[key]):
                 return False
-    for name, rules in _EVENT_PAYLOAD_OPTIONAL:
-        if name != event:
+    for version, name, rules in _EVENT_PAYLOAD_OPTIONAL:
+        if name != event or policy_version < version:
             continue
         for key, kind in rules:
             if key in payload and not _payload_value_ok(kind, payload[key]):
@@ -2081,15 +3472,28 @@ def _verify_event_shape(record, index: int):
         return _refuse("history_corrupt", f"/{index}/policy_version")
     if fresh["policy_version"] not in SUPPORTED_POLICY_VERSIONS:
         return _refuse("policy_version_unsupported", f"/{index}/policy_version")
+    if not _event_available(fresh["event"], fresh["policy_version"]):
+        # An event name that did not exist at its own stamped version is a
+        # history this engine never wrote. Refusing here is what keeps
+        # "certified by `verify_history`" implying "foldable".
+        return _refuse("history_corrupt", f"/{index}/event")
     checks = (
         ("workflow_id", _text(fresh["workflow_id"], _WORKFLOW_ID_RE)),
         ("work_spec_sha256", _text(fresh["work_spec_sha256"], _SHA256_RE)),
         ("seq", _count(fresh["seq"], 1)),
         ("revision", _count(fresh["revision"], 1)),
+        # Judged against the state tuple of the EVENT's own version, exactly
+        # as `_event_available` judges the event NAME and `_verify_snapshot`
+        # judges the snapshot's `state`. Without this the three disagree: a
+        # policy-v1 event could name the fourteenth state, `fold` would return
+        # a v1 snapshot sitting in `retrying`, every read surface — including
+        # `verify`, the one the integrity note calls total — would report
+        # `ok`, and every mutating command would refuse `snapshot_divergence`
+        # with no diagnosis available anywhere (§22 A29.2).
         ("from_state", fresh["from_state"] is None
-         or fresh["from_state"] in WORKFLOW_STATES),
+         or fresh["from_state"] in _policy_for(fresh["policy_version"])[1]),
         ("to_state", fresh["to_state"] is None
-         or fresh["to_state"] in WORKFLOW_STATES),
+         or fresh["to_state"] in _policy_for(fresh["policy_version"])[1]),
         ("command_id", _text(fresh["command_id"], _UUID_RE)),
         ("command_sha256", _text(fresh["command_sha256"], _SHA256_RE)),
         ("actor", _text(fresh["actor"], _PROVENANCE_RE)),
@@ -2099,7 +3503,9 @@ def _verify_event_shape(record, index: int):
     for name, ok in checks:
         if not ok:
             return _refuse("history_corrupt", f"/{index}/{name}")
-    if not _verify_event_payload(fresh["event"], fresh["payload"]):
+    if not _verify_event_payload(
+        fresh["event"], fresh["payload"], fresh["policy_version"]
+    ):
         return _refuse("history_corrupt", f"/{index}/payload")
     if fresh["from_state"] == fresh["to_state"]:
         return _refuse("history_corrupt", f"/{index}/to_state")
@@ -2211,6 +3617,7 @@ def fold(events) -> dict:
         "last_seq": first["seq"],
         "last_wait_entry_seq": 0,
         "last_runtime_approval_seq": 0,
+        **_FRESH_RECOVERY_MEMBERS,
     }
     for record in records[1:]:
         name = record["event"]
@@ -2225,6 +3632,8 @@ def fold(events) -> dict:
             snapshot["dispatch_intent_id"] = payload["intent_id"]
             snapshot["queue_route"] = payload["queue_route"]
             snapshot["intent_seq"] += 1
+            if "attempt_budget" in payload:
+                snapshot["attempt_budget"] = payload["attempt_budget"]
         elif name == "dispatch_revoked":
             snapshot["dispatch_intent_id"] = None
             # The same §9 bound `decide` appends under: a history carrying
@@ -2244,6 +3653,47 @@ def fold(events) -> dict:
             )
             if name == "dispatch_accepted":
                 snapshot["runtime_task_uuid"] = payload["runtime_task_uuid"]
+                # A policy-v1 `dispatch_accepted` carries NO `attempt_no`, and
+                # this reads it through an explicit presence check: the absent
+                # case binds the runtime task, advances no counter, opens no
+                # attempt and raises no `KeyError`, so a v1 history folds
+                # forever and a v1 workflow honestly folds to
+                # `attempts_used = 0`. No ordinal is inferred from event
+                # sequence, receipt sequence, `runtime_task_uuid` or state —
+                # what was never written is not recoverable (§5.5 item 5).
+                if "attempt_no" in payload:
+                    snapshot["attempt_no"] = payload["attempt_no"]
+                    snapshot["attempt_state"] = "open"
+                    snapshot["attempts_used"] = payload["attempt_no"]
+                    snapshot["last_checkpoint_seq"] = 0
+        elif name == "attempt_failed":
+            snapshot["attempt_state"] = "failed"
+        elif name == "checkpoint_recorded":
+            snapshot["last_checkpoint_seq"] = payload["checkpoint_seq"]
+            snapshot["checkpoint_count"] += 1
+        elif name == "checkpoint_restored":
+            snapshot["restored_checkpoint_sha256"] = payload[
+                "checkpoint_sha256"
+            ]
+        elif name == "compensation_started":
+            snapshot["attempt_state"] = "failed"
+            snapshot["compensation_state"] = "pending"
+            # One `compensate` intent is emitted with this event (§10.5), so
+            # the per-workflow intent sequence advances here exactly as it
+            # does for the three landed intent-emitting events. `decide` and
+            # `fold` must agree on `intent_seq` or every later command reads
+            # `snapshot_divergence`.
+            snapshot["intent_seq"] += 1
+        elif name == "compensation_applied":
+            snapshot["compensation_state"] = "applied"
+        elif name == "compensation_failed":
+            snapshot["compensation_state"] = "failed"
+        elif name == "workflow_succeeded":
+            if snapshot["attempt_state"] == "open":
+                snapshot["attempt_state"] = "succeeded"
+        elif name == "workflow_failed":
+            if snapshot["attempt_state"] == "open":
+                snapshot["attempt_state"] = "failed"
         elif name == "cancel_requested":
             snapshot["cancel_intent_id"] = payload["cancel_intent_id"]
             snapshot["intent_seq"] += 1
@@ -2259,6 +3709,15 @@ def fold(events) -> dict:
             if record["to_state"] in TERMINAL_STATES:
                 snapshot["dispatch_intent_id"] = None
                 snapshot["cancel_intent_id"] = None
+                # §5.3.5: entering `cancelled` ABANDONS an attempt that was
+                # still open. The work never concluded and never will, so the
+                # row closes as neither `succeeded` nor `failed` — the fourth
+                # attempt state exists for exactly this moment.
+                if (
+                    record["to_state"] == "cancelled"
+                    and snapshot["attempt_state"] == "open"
+                ):
+                    snapshot["attempt_state"] = "abandoned"
         snapshot["revision"] = record["revision"]
         snapshot["policy_version"] = record["policy_version"]
         snapshot["last_seq"] = seq

@@ -4,7 +4,7 @@ transaction helper that carries the domain-row + event-row invariant.
 Rules honored here:
 - WAL journal mode set at init.
 - PRAGMA foreign_keys=ON on EVERY connection; busy_timeout >= 3000ms.
-- meta.schema_version = "6" at init; a different version is a hard stop.
+- meta.schema_version = "7" at init; a different version is a hard stop.
   Normal commands NEVER auto-migrate: an older database is refused here and
   the human is pointed at `migrate status/plan/apply` (U-M2 M2.5; U-M3 M3.1).
 """
@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .utils import DB_FILENAME, AosError
 
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "7"
 
 #: The v3 memory claim (U-M2 M2.2; U-M3 M3.2). The table name is parameterized
 #: for exactly one reason: the 1→2 and 2→3 migrations build the new table
@@ -422,8 +422,13 @@ AGENT_HANDOFF_TRANSITIONS_DDL = """CREATE TABLE {table}(
 #:
 #: The three structural CHECKs mirror the reducer's own `_verify_snapshot`
 #: cross-field rules, so a projection the reducer would refuse cannot be
-#: stored: a pending dispatch pointer only in `validated`, a pending cancel
-#: pointer only post-dispatch, and no runtime task before the queue accepted.
+#: stored: a pending dispatch pointer only in `validated` or `retrying`
+#: (U-W3 §11.2 — a retry is a dispatch issued from `retrying`), a pending
+#: cancel pointer only post-dispatch, and no runtime task before the queue
+#: accepted. `retrying` is deliberately ABSENT from the third CHECK's list,
+#: which is what lets a retrying workflow keep the runtime task binding of the
+#: attempt that failed; and absent from the second, because `retrying` is not
+#: a post-dispatch state and cancellation from it is local.
 #:
 #: The table name is parameterized like every other DDL here — and the 5→6
 #: migration creates it DIRECTLY under its real name (no temp-table rename),
@@ -443,8 +448,8 @@ WORKFLOWS_DDL = """CREATE TABLE {table}(
   state TEXT NOT NULL
     CHECK (state IN ('compiled','validated','awaiting_approval','scheduled',
                      'running','waiting_input','waiting_approval','paused',
-                     'compensating','succeeded','failed','cancelled',
-                     'compensated')),
+                     'retrying','compensating','succeeded','failed',
+                     'cancelled','compensated')),
   revision INTEGER NOT NULL CHECK (revision >= 1),
   policy_version INTEGER NOT NULL CHECK (policy_version >= 1),
   approval_required INTEGER NOT NULL CHECK (approval_required IN (0,1)),
@@ -455,7 +460,7 @@ WORKFLOWS_DDL = """CREATE TABLE {table}(
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   content_sha256 TEXT NOT NULL,
-  CHECK (dispatch_intent_id IS NULL OR state = 'validated'),
+  CHECK (dispatch_intent_id IS NULL OR state IN ('validated','retrying')),
   CHECK (cancel_intent_id IS NULL OR state IN
          ('scheduled','running','waiting_input','waiting_approval','paused')),
   CHECK (runtime_task_uuid IS NULL
@@ -493,17 +498,21 @@ WORKFLOW_EVENTS_DDL = """CREATE TABLE {table}(
                      'dispatch_revoked','dispatch_accepted','run_started',
                      'run_waiting_input','run_waiting_approval','run_paused',
                      'run_resumed','cancel_requested','workflow_succeeded',
-                     'workflow_failed','workflow_cancelled')),
+                     'workflow_failed','workflow_cancelled',
+                     'policy_version_adopted','attempt_failed',
+                     'checkpoint_recorded','checkpoint_restored',
+                     'compensation_started','compensation_applied',
+                     'compensation_failed')),
   from_state TEXT
     CHECK (from_state IS NULL OR from_state IN
            ('compiled','validated','awaiting_approval','scheduled','running',
-            'waiting_input','waiting_approval','paused','compensating',
-            'succeeded','failed','cancelled','compensated')),
+            'waiting_input','waiting_approval','paused','retrying',
+            'compensating','succeeded','failed','cancelled','compensated')),
   to_state TEXT
     CHECK (to_state IS NULL OR to_state IN
            ('compiled','validated','awaiting_approval','scheduled','running',
-            'waiting_input','waiting_approval','paused','compensating',
-            'succeeded','failed','cancelled','compensated')),
+            'waiting_input','waiting_approval','paused','retrying',
+            'compensating','succeeded','failed','cancelled','compensated')),
   revision INTEGER NOT NULL CHECK (revision >= 1),
   policy_version INTEGER NOT NULL CHECK (policy_version >= 1),
   command_id TEXT NOT NULL,
@@ -539,7 +548,9 @@ WORKFLOW_COMMANDS_DDL = """CREATE TABLE {table}(
   command TEXT NOT NULL
     CHECK (command IN ('admit_work_spec','validate','request_approval',
                        'record_approval','request_dispatch','revoke_dispatch',
-                       'request_cancel','record_queue_receipt','record_result')),
+                       'request_cancel','record_queue_receipt','record_result',
+                       'adopt_policy_version','record_checkpoint',
+                       'record_restore','record_compensation')),
   command_sha256 TEXT NOT NULL,
   expected_revision INTEGER NOT NULL CHECK (expected_revision >= 0),
   resulting_revision INTEGER NOT NULL CHECK (resulting_revision >= 1),
@@ -565,7 +576,8 @@ WORKFLOW_INTENTS_DDL = """CREATE TABLE {table}(
   id INTEGER PRIMARY KEY,
   workflow_id INTEGER NOT NULL,
   intent_id TEXT NOT NULL UNIQUE,
-  intent_kind TEXT NOT NULL CHECK (intent_kind IN ('dispatch','cancel')),
+  intent_kind TEXT NOT NULL
+    CHECK (intent_kind IN ('dispatch','cancel','compensate')),
   idempotency_key TEXT NOT NULL,
   queue_route TEXT NOT NULL,
   document TEXT NOT NULL,
@@ -633,6 +645,82 @@ WORKFLOW_FACTS_DDL = """CREATE TABLE {table}(
   FOREIGN KEY(workflow_id) REFERENCES workflows(id)
 )"""
 
+#: The U-W3 workflow-attempt ledger (§11.2). ONE row per CONSUMED workflow
+#: attempt: the row is inserted when an `accepted` receipt opens the attempt,
+#: never at reservation, so a queue rejection or an operator revocation burns
+#: no budget slot. Exactly two writes reach a row — the opening INSERT and one
+#: compare-and-swap that closes it.
+#:
+#: `attempt_no BETWEEN 1 AND 10` is the protocol's own frozen ceiling closed
+#: storage-side (`beast.result-envelope/v1`'s `attempt`, `beast.work-spec/v1`'s
+#: `retry.max_attempts`); the artifact's own budget is the tighter live bound
+#: and belongs to the reducer. `UNIQUE(workflow_id, runtime_task_uuid)` makes
+#: one runtime task serving two attempts of the same workflow UNSTORABLE — the
+#: storage backstop for the §6.5 acceptance gate. The column is NOT NULL (a row
+#: exists only because an `accepted` receipt supplied the binding), so SQLite's
+#: NULL-distinct UNIQUE semantics can never arise.
+#:
+#: The biconditional pairs `open` with an absent `closed_seq`, so a closed
+#: attempt with no closing event and an open attempt claiming one are both
+#: unstorable. `content_sha256` carries no default, like every hashed record
+#: in this schema.
+WORKFLOW_ATTEMPTS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  workflow_id INTEGER NOT NULL,
+  attempt_no INTEGER NOT NULL CHECK (attempt_no BETWEEN 1 AND 10),
+  state TEXT NOT NULL
+    CHECK (state IN ('open','succeeded','failed','abandoned')),
+  runtime_task_uuid TEXT NOT NULL,
+  dispatch_intent_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  result_sha256 TEXT,
+  opened_seq INTEGER NOT NULL CHECK (opened_seq >= 1),
+  closed_seq INTEGER CHECK (closed_seq IS NULL OR closed_seq >= opened_seq),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  UNIQUE(workflow_id, attempt_no),
+  UNIQUE(workflow_id, runtime_task_uuid),
+  UNIQUE(workflow_id, dispatch_intent_id),
+  CHECK ((state = 'open') = (closed_seq IS NULL)),
+  CHECK (result_sha256 IS NULL OR state IN ('succeeded','failed')),
+  FOREIGN KEY(workflow_id) REFERENCES workflows(id),
+  FOREIGN KEY(dispatch_intent_id) REFERENCES workflow_intents(intent_id)
+)"""
+
+#: The U-W3 checkpoint store (§11.2). INSERT-ONCE in full: no code path in
+#: this slice or any other issues UPDATE or DELETE against this table after
+#: the creating transaction's own row-hash finalization (the `workflow_events`
+#: / `agent_handoff_transitions` discipline).
+#:
+#: The composite foreign key pins every checkpoint to a REAL, CONSUMED
+#: attempt, so a checkpoint for an attempt that never opened is
+#: unrepresentable; the parent columns carry `workflow_attempts`'
+#: `UNIQUE(workflow_id, attempt_no)` index, which is what makes the composite
+#: reference legal. `payload_bytes` is the RECOMPUTED canonical length, stored
+#: so `verify` can re-check the bound without re-serializing and CHECKed
+#: against the frozen limit — `2` is the canonical length of the empty
+#: object, the smallest legal payload.
+WORKFLOW_CHECKPOINTS_DDL = """CREATE TABLE {table}(
+  id INTEGER PRIMARY KEY,
+  workflow_id INTEGER NOT NULL,
+  attempt_no INTEGER NOT NULL CHECK (attempt_no BETWEEN 1 AND 10),
+  checkpoint_id TEXT NOT NULL,
+  checkpoint_seq INTEGER NOT NULL CHECK (checkpoint_seq BETWEEN 1 AND 8),
+  runtime_task_uuid TEXT NOT NULL,
+  document TEXT NOT NULL,
+  document_sha256 TEXT NOT NULL,
+  payload_bytes INTEGER NOT NULL
+    CHECK (payload_bytes BETWEEN 2 AND 65536),
+  recorded_at TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  UNIQUE(workflow_id, checkpoint_id),
+  UNIQUE(workflow_id, attempt_no, checkpoint_seq),
+  FOREIGN KEY(workflow_id) REFERENCES workflows(id),
+  FOREIGN KEY(workflow_id, attempt_no)
+    REFERENCES workflow_attempts(workflow_id, attempt_no)
+)"""
+
 MEMORY_TABLE = "memory"
 MEMORY_EVIDENCE_TABLE = "memory_evidence"
 MEMORY_SOURCES_TABLE = "memory_sources"
@@ -650,6 +738,8 @@ WORKFLOW_COMMANDS_TABLE = "workflow_commands"
 WORKFLOW_INTENTS_TABLE = "workflow_intents"
 WORKFLOW_RECEIPTS_TABLE = "workflow_receipts"
 WORKFLOW_FACTS_TABLE = "workflow_facts"
+WORKFLOW_ATTEMPTS_TABLE = "workflow_attempts"
+WORKFLOW_CHECKPOINTS_TABLE = "workflow_checkpoints"
 
 #: The three tables U-M3 adds, paired with their DDL. The 2→3 migration
 #: iterates this rather than repeating the CREATEs, so a fresh v3 schema and a
@@ -672,12 +762,19 @@ ROUTING_HANDOFF_TABLES: tuple[tuple[str, str], ...] = (
     (AGENT_HANDOFF_TRANSITIONS_TABLE, AGENT_HANDOFF_TRANSITIONS_DDL),
 )
 
-#: The six tables U-W2.2 adds, paired with their DDL, in FK-parent-first order:
-#: workflows → events → commands → intents → receipts → facts. This is the ONLY
-#: enumeration — `SCHEMA_SQL` composition, the 5→6 migration step, and the three
-#: historical fixtures all iterate it, so a seventh table cannot be added in one
-#: place and forgotten in the others (the MEMORY_GRAPH_TABLES /
+#: The eight workflow tables — U-W2.2's six plus U-W3's two — paired with
+#: their DDL, in FK-parent-first order: workflows → events → commands →
+#: intents → receipts → facts → attempts → checkpoints. This is the ONLY
+#: enumeration — `SCHEMA_SQL` composition, the 5→6 migration step (through its
+#: FROZEN v6 copy, `migrations._V6_WORKFLOW_TABLES`), the 6→7 step, and the
+#: three historical fixtures all iterate it, so a ninth table cannot be added
+#: in one place and forgotten in the others (the MEMORY_GRAPH_TABLES /
 #: ROUTING_HANDOFF_TABLES rule, applied a third time; D-v0.4.84).
+#:
+#: `workflow_attempts` follows `workflow_intents` because it holds a foreign
+#: key into it, and `workflow_checkpoints` follows `workflow_attempts` for the
+#: same reason — the reversed order the fixtures drop by is therefore
+#: children-first with no edit (U-W3 §11.7).
 WORKFLOW_TABLES: tuple[tuple[str, str], ...] = (
     (WORKFLOWS_TABLE, WORKFLOWS_DDL),
     (WORKFLOW_EVENTS_TABLE, WORKFLOW_EVENTS_DDL),
@@ -685,6 +782,8 @@ WORKFLOW_TABLES: tuple[tuple[str, str], ...] = (
     (WORKFLOW_INTENTS_TABLE, WORKFLOW_INTENTS_DDL),
     (WORKFLOW_RECEIPTS_TABLE, WORKFLOW_RECEIPTS_DDL),
     (WORKFLOW_FACTS_TABLE, WORKFLOW_FACTS_DDL),
+    (WORKFLOW_ATTEMPTS_TABLE, WORKFLOW_ATTEMPTS_DDL),
+    (WORKFLOW_CHECKPOINTS_TABLE, WORKFLOW_CHECKPOINTS_DDL),
 )
 
 _SCHEMA_HEAD = """
@@ -806,8 +905,10 @@ CREATE TABLE IF NOT EXISTS packs(
 #: 1→2 (M2.3) and 2→3 (M3.11) migrations; the agent tables have exactly one,
 #: shared with the 3→4 migration (U-A1); and the four routing/handoff tables
 #: have exactly one, shared with the 4→5 migration (U-A3, D-v0.4.22); and the
-#: six workflow tables have exactly one, shared with the 5→6 migration and the
-#: three historical fixtures (U-W2.2, D-v0.4.84).
+#: eight workflow tables have exactly one, shared with the 6→7 migration and
+#: the three historical fixtures (U-W2.2 D-v0.4.84; U-W3 §11.5 — the 5→6 step
+#: builds from `migrations._V6_WORKFLOW_TABLES`, the frozen copy of these
+#: constants as they stood at `fef0c2b`).
 SCHEMA_SQL = (
     _SCHEMA_HEAD
     + MEMORY_CLAIM_DDL.format(table=MEMORY_TABLE)

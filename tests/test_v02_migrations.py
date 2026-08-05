@@ -196,7 +196,7 @@ class ProductionRegistryTest(MigrationTestCase):
         # If this fails, a migration was added without raising SCHEMA_VERSION
         # with it — or the reverse.
         self.assertEqual(migrations.LATEST_VERSION, int(db.SCHEMA_VERSION))
-        self.assertEqual(migrations.LATEST_VERSION, 6)
+        self.assertEqual(migrations.LATEST_VERSION, 7)
 
     def test_production_registry_is_the_five_production_steps(self):
         self.assertEqual(
@@ -210,6 +210,7 @@ class ProductionRegistryTest(MigrationTestCase):
                 (3, 4, "u-a1-agent-passports-v4"),
                 (4, 5, "u-a3-routing-handoffs-v5"),
                 (5, 6, "u-w2-workflow-state-v6"),
+                (6, 7, "u-w3-runtime-recovery-v7"),
             ],
         )
         migrations.validate_registry()
@@ -224,7 +225,7 @@ class ProductionRegistryTest(MigrationTestCase):
     def test_production_registry_reports_the_pending_migrations(self):
         report = migrations.status(self.db_path)
         self.assertEqual(report["current_version"], 1)
-        self.assertEqual(report["latest_version"], 6)
+        self.assertEqual(report["latest_version"], 7)
         self.assertTrue(report["pending"])
         self.assertEqual(
             report["plan"],
@@ -234,6 +235,8 @@ class ProductionRegistryTest(MigrationTestCase):
                 {"from": 3, "to": 4, "migration_id": "u-a1-agent-passports-v4"},
                 {"from": 4, "to": 5, "migration_id": "u-a3-routing-handoffs-v5"},
                 {"from": 5, "to": 6, "migration_id": "u-w2-workflow-state-v6"},
+                {"from": 6, "to": 7,
+                 "migration_id": "u-w3-runtime-recovery-v7"},
             ],
         )
 
@@ -1076,6 +1079,7 @@ class RegistryValidationTest(MigrationTestCase):
                 "u-a1-agent-passports-v4",
                 "u-a3-routing-handoffs-v5",
                 "u-w2-workflow-state-v6",
+                "u-w3-runtime-recovery-v7",
             ],
         )
         self.assertEqual(
@@ -1086,6 +1090,7 @@ class RegistryValidationTest(MigrationTestCase):
                 "u-a1-agent-passports-v4",
                 "u-a3-routing-handoffs-v5",
                 "u-w2-workflow-state-v6",
+                "u-w3-runtime-recovery-v7",
             ],
         )
 

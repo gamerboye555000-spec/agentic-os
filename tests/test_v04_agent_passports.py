@@ -202,10 +202,10 @@ class V4WorkspaceTestCase(unittest.TestCase):
 # (1) Schema and registry shape
 
 class SchemaTests(V4WorkspaceTestCase):
-    def test_fresh_init_is_version_six_with_both_agent_tables(self):
+    def test_fresh_init_is_version_seven_with_both_agent_tables(self):
         self.assertEqual(
             self.query("SELECT value FROM meta WHERE key='schema_version'")[0][0],
-            "6",
+            "7",
         )
         names = {
             r[0]
@@ -216,7 +216,7 @@ class SchemaTests(V4WorkspaceTestCase):
         self.assertIn("agents", names)
         self.assertIn("agent_passports", names)
 
-    def test_registry_is_exactly_the_five_steps_in_order(self):
+    def test_registry_is_exactly_the_six_steps_in_order(self):
         self.assertEqual(
             [
                 (m.from_version, m.to_version, m.migration_id)
@@ -228,6 +228,7 @@ class SchemaTests(V4WorkspaceTestCase):
                 (3, 4, "u-a1-agent-passports-v4"),
                 (4, 5, "u-a3-routing-handoffs-v5"),
                 (5, 6, "u-w2-workflow-state-v6"),
+                (6, 7, "u-w3-runtime-recovery-v7"),
             ],
         )
 
@@ -265,6 +266,7 @@ class MigrationTests(V3FixtureTestCase):
                 "u-a1-agent-passports-v4",
                 "u-a3-routing-handoffs-v5",
                 "u-w2-workflow-state-v6",
+                "u-w3-runtime-recovery-v7",
             ],
         )
 
@@ -435,16 +437,16 @@ class MigrationTests(V3FixtureTestCase):
         self.assertTrue(caught.exception.snapshot.is_file())
 
         # Corrected retry applies every remaining step exactly once — the
-        # rolled-back 3→4 is not double-applied. To-current now spans three
-        # steps (3→4, then the additive 4→5 and 5→6), so exactly three
-        # migrate events exist.
+        # rolled-back 3→4 is not double-applied. To-current now spans four
+        # steps (3→4, then the additive 4→5 and 5→6, then 6→7), so exactly
+        # four migrate events exist.
         self.migrate()
         self.assertEqual(
             self.query(
                 "SELECT COUNT(*) FROM events WHERE entity='system' "
                 "AND action='migrate'"
             )[0][0],
-            3,
+            4,
         )
 
     def test_damaged_legacy_row_refuses_safely_and_rolls_back(self):

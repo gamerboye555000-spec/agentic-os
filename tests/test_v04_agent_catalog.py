@@ -848,11 +848,11 @@ class StatusPlanCliTests(V4WorkspaceTestCase):
         after = _table_snapshot(self.query)
         self.assertEqual(before, after)
 
-    def test_schema_stays_version_six(self):
+    def test_schema_stays_version_seven(self):
         self.ok("agent", "catalog", "status")
         self.ok("agent", "catalog", "plan", "--all")
         self.assertEqual(
-            self.query("SELECT value FROM meta WHERE key='schema_version'")[0][0], "6"
+            self.query("SELECT value FROM meta WHERE key='schema_version'")[0][0], "7"
         )
 
 
@@ -1389,7 +1389,7 @@ class InstallTests(V4WorkspaceTestCase):
         self.assertEqual(core_schema(self.db_path), before_schema)
         conn = db.connect(self.db_path)
         try:
-            self.assertEqual(db.get_meta(conn, "schema_version"), "6")
+            self.assertEqual(db.get_meta(conn, "schema_version"), "7")
         finally:
             conn.close()
 

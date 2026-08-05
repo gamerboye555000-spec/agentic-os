@@ -42,15 +42,38 @@ STORE_SOURCE = REPO_ROOT / "agentic_os" / "workflow_store.py"
 NOW = "2026-07-24T10:00:00Z"
 HASH = "0" * 64
 
-#: The six frozen table names, in the contract's FK-parent-first order (§5).
-SIX_TABLES = (
+#: The eight frozen table names, in FK-parent-first order (U-W2.2 §5 plus
+#: U-W3 §11.2's two).
+EIGHT_TABLES = (
     "workflows",
     "workflow_events",
     "workflow_commands",
     "workflow_intents",
     "workflow_receipts",
     "workflow_facts",
+    "workflow_attempts",
+    "workflow_checkpoints",
 )
+
+#: The four tables U-W3 REBUILDS to widen a closed enum. `ALTER TABLE …
+#: RENAME` may requote an identifier the original `CREATE TABLE` did not, so
+#: fresh-versus-migrated equality is STRUCTURAL for exactly these four and
+#: byte-exact for the other four.
+REBUILT_TABLES = (
+    "workflows",
+    "workflow_events",
+    "workflow_commands",
+    "workflow_intents",
+)
+
+BYTE_IDENTICAL_TABLES = tuple(
+    t for t in EIGHT_TABLES if t not in REBUILT_TABLES
+)
+
+#: The SIX tables schema version 6 had, hand-transcribed. The 5 -> 6 step is
+#: history now and builds from `migrations._V6_WORKFLOW_TABLES`, so a v6
+#: database carries exactly these and never a seventh or eighth.
+V6_TABLES = EIGHT_TABLES[:6]
 
 #: §5.1-§5.6 column lists, transcribed by hand from the contract's SQL blocks.
 CONTRACT_COLUMNS = {
@@ -86,6 +109,18 @@ CONTRACT_COLUMNS = {
         "id", "workflow_id", "fact_kind", "fact_scope", "document",
         "document_sha256", "recorded_at", "content_sha256",
     ),
+    # U-W3 §11.2's two new tables, transcribed by hand from its SQL blocks.
+    "workflow_attempts": (
+        "id", "workflow_id", "attempt_no", "state", "runtime_task_uuid",
+        "dispatch_intent_id", "idempotency_key", "result_sha256",
+        "opened_seq", "closed_seq", "created_at", "updated_at",
+        "content_sha256",
+    ),
+    "workflow_checkpoints": (
+        "id", "workflow_id", "attempt_no", "checkpoint_id", "checkpoint_seq",
+        "runtime_task_uuid", "document", "document_sha256", "payload_bytes",
+        "recorded_at", "content_sha256",
+    ),
 }
 
 #: Columns the contract requires to carry NO default (§5.1, KA4's rationale).
@@ -97,12 +132,17 @@ NO_DEFAULT_COLUMNS = {
     "workflow_intents": ("status", "content_sha256"),
     "workflow_receipts": ("receipt_sha256", "content_sha256"),
     "workflow_facts": ("document_sha256", "content_sha256"),
+    "workflow_attempts": ("state", "opened_seq", "content_sha256"),
+    "workflow_checkpoints": (
+        "checkpoint_seq", "document_sha256", "payload_bytes",
+        "content_sha256",
+    ),
 }
 
 #: The thirteen states, transcribed from contract §5.1's CHECK.
 CONTRACT_STATES = (
     "compiled", "validated", "awaiting_approval", "scheduled", "running",
-    "waiting_input", "waiting_approval", "paused", "compensating",
+    "waiting_input", "waiting_approval", "paused", "retrying", "compensating",
     "succeeded", "failed", "cancelled", "compensated",
 )
 
@@ -114,6 +154,9 @@ CONTRACT_EVENTS = (
     "run_waiting_input", "run_waiting_approval", "run_paused", "run_resumed",
     "cancel_requested", "workflow_succeeded", "workflow_failed",
     "workflow_cancelled",
+    "policy_version_adopted", "attempt_failed", "checkpoint_recorded",
+    "checkpoint_restored", "compensation_started", "compensation_applied",
+    "compensation_failed",
 )
 
 #: The nine verbs, transcribed from contract §5.3's CHECK.
@@ -121,6 +164,8 @@ CONTRACT_COMMANDS = (
     "admit_work_spec", "validate", "request_approval", "record_approval",
     "request_dispatch", "revoke_dispatch", "request_cancel",
     "record_queue_receipt", "record_result",
+    "adopt_policy_version", "record_checkpoint", "record_restore",
+    "record_compensation",
 )
 
 #: The nine receipt kinds, transcribed from contract §5.5's CHECK.
@@ -366,7 +411,7 @@ class _V6TestCase(unittest.TestCase):
 
 class DdlAndConstraintTests(_V6TestCase):
     def test_six_tables_exist_with_exactly_the_contract_columns(self):
-        for table in SIX_TABLES:
+        for table in EIGHT_TABLES:
             with self.subTest(table=table):
                 info = self.query(f"PRAGMA table_info({table})")
                 self.assertEqual(
@@ -646,11 +691,11 @@ class DdlAndConstraintTests(_V6TestCase):
                                                        document_sha256=_sha("v")))
 
     def test_no_explicit_index_exists_for_the_six_tables(self):
-        placeholders = ", ".join("?" for _ in SIX_TABLES)
+        placeholders = ", ".join("?" for _ in EIGHT_TABLES)
         rows = self.query(
             "SELECT name FROM sqlite_master WHERE type='index' "
             f"AND tbl_name IN ({placeholders}) AND sql IS NOT NULL",
-            SIX_TABLES,
+            EIGHT_TABLES,
         )
         self.assertEqual([r["name"] for r in rows], [])
 
@@ -686,8 +731,8 @@ class IdentityRenderingTests(unittest.TestCase):
 # S4 - fresh initialization (§5)
 
 class FreshInitTests(unittest.TestCase):
-    def test_schema_version_is_six(self):
-        self.assertEqual(db.SCHEMA_VERSION, "6")
+    def test_schema_version_is_seven(self):
+        self.assertEqual(db.SCHEMA_VERSION, "7")
 
     def test_workflow_table_name_constants(self):
         self.assertEqual(db.WORKFLOWS_TABLE, "workflows")
@@ -699,14 +744,14 @@ class FreshInitTests(unittest.TestCase):
 
     def test_workflow_tables_tuple_is_the_only_enumeration_fk_parent_first(self):
         self.assertEqual(
-            tuple(name for name, _ddl in db.WORKFLOW_TABLES), SIX_TABLES
+            tuple(name for name, _ddl in db.WORKFLOW_TABLES), EIGHT_TABLES
         )
         for name, ddl in db.WORKFLOW_TABLES:
             with self.subTest(table=name):
                 self.assertIn("{table}", ddl)
                 self.assertTrue(ddl.startswith("CREATE TABLE {table}("))
 
-    def test_fresh_init_creates_all_six_tables_from_the_tuple(self):
+    def test_fresh_init_creates_all_eight_tables_from_the_tuple(self):
         with self.subTest("in-memory init"):
             conn = db.connect(":memory:")
             self.addCleanup(conn.close)
@@ -720,7 +765,7 @@ class FreshInitTests(unittest.TestCase):
             for table, ddl in db.WORKFLOW_TABLES:
                 self.assertEqual(stored[table], ddl.format(table=table), table)
 
-    def test_fresh_bootstrap_stamps_version_six(self):
+    def test_fresh_bootstrap_stamps_version_seven(self):
         import tempfile
 
         from agentic_os import ops
@@ -732,14 +777,14 @@ class FreshInitTests(unittest.TestCase):
             self.addCleanup(conn.close)
             self.assertTrue(created)
             ops.initialize(conn, root)
-            self.assertEqual(db.get_meta(conn, "schema_version"), "6")
+            self.assertEqual(db.get_meta(conn, "schema_version"), "7")
             names = {
                 r["name"]
                 for r in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )
             }
-            self.assertLessEqual(set(SIX_TABLES), names)
+            self.assertLessEqual(set(EIGHT_TABLES), names)
 
 
 # ---------------------------------------------------------------------------
@@ -753,7 +798,7 @@ class MigrationTests(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
 
-    def test_registry_is_exactly_the_five_steps_in_order(self):
+    def test_registry_is_exactly_the_six_steps_in_order(self):
         self.assertEqual(
             [
                 (m.from_version, m.to_version, m.migration_id)
@@ -765,13 +810,14 @@ class MigrationTests(unittest.TestCase):
                 (3, 4, "u-a1-agent-passports-v4"),
                 (4, 5, "u-a3-routing-handoffs-v5"),
                 (5, 6, "u-w2-workflow-state-v6"),
+                (6, 7, "u-w3-runtime-recovery-v7"),
             ],
         )
         migrations.validate_registry()
 
     def test_latest_version_is_derived_not_duplicated(self):
         self.assertEqual(migrations.LATEST_VERSION, int(db.SCHEMA_VERSION))
-        self.assertEqual(migrations.LATEST_VERSION, 6)
+        self.assertEqual(migrations.LATEST_VERSION, 7)
         source = (REPO_ROOT / "agentic_os" / "migrations.py").read_text(
             encoding="utf-8"
         )
@@ -800,20 +846,21 @@ class MigrationTests(unittest.TestCase):
         db_path = build_v3_workspace(self.root / "v3")
         report = migrations.status(db_path)
         self.assertEqual(report["current_version"], 3)
-        self.assertEqual(report["latest_version"], 6)
+        self.assertEqual(report["latest_version"], 7)
         self.assertEqual(
             [s["migration_id"] for s in report["plan"]],
             [
                 "u-a1-agent-passports-v4",
                 "u-a3-routing-handoffs-v5",
                 "u-w2-workflow-state-v6",
+                "u-w3-runtime-recovery-v7",
             ],
         )
 
-    def test_apply_migrations_reaches_six_and_creates_the_six_tables(self):
+    def test_apply_migrations_reaches_seven_and_creates_the_eight_tables(self):
         db_path = build_v3_workspace(self.root / "v3")
         result = migrations.apply_migrations(db_path.parent)
-        self.assertEqual(result["current_version"], 6)
+        self.assertEqual(result["current_version"], 7)
         conn = db.connect(db_path)
         self.addCleanup(conn.close)
         names = {
@@ -822,7 +869,7 @@ class MigrationTests(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-        self.assertLessEqual(set(SIX_TABLES), names)
+        self.assertLessEqual(set(EIGHT_TABLES), names)
 
     def test_step_reads_no_existing_row_and_no_clock(self):
         from unittest import mock
@@ -853,8 +900,11 @@ class MigrationTests(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-        self.assertLessEqual(set(SIX_TABLES), names)
-        for table in SIX_TABLES:
+        # The 5 -> 6 step builds the SIX v6 tables from the frozen copy, not
+        # the live eight: version 6 is history and gets a frozen definition.
+        self.assertLessEqual(set(V6_TABLES), names)
+        self.assertEqual(set(EIGHT_TABLES) - set(V6_TABLES) & names, set())
+        for table in V6_TABLES:
             self.assertEqual(
                 conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0
             )
@@ -864,7 +914,7 @@ class MigrationTests(unittest.TestCase):
                 continue
             self.assertEqual(rows, after[table], table)
 
-    def test_injected_failure_rolls_back_all_six_tables_and_retry_succeeds(self):
+    def test_injected_failure_rolls_back_the_v6_tables_and_retry_succeeds(self):
         db_path = build_v3_workspace(self.root / "v3")
         migrations.apply_migrations(db_path.parent)
         # Roll the six tables away to re-create the 5 -> 6 situation.
@@ -896,10 +946,10 @@ class MigrationTests(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-        self.assertEqual(set(SIX_TABLES) & names, set())
+        self.assertEqual(set(EIGHT_TABLES) & names, set())
         conn.close()
         result = migrations.apply_migrations(db_path.parent)
-        self.assertEqual(result["current_version"], 6)
+        self.assertEqual(result["current_version"], 7)
 
     def test_no_shipped_migration_constant_was_edited(self):
         # The 3->4 / 4->5 freeze obligation (D-v0.4.29) does NOT fire: this
@@ -917,6 +967,88 @@ class MigrationTests(unittest.TestCase):
 
 # ---------------------------------------------------------------------------
 # S6 - fresh/migrated equivalence and fixture hygiene (§6)
+
+def _normalize_table_sql(sql: str) -> str:
+    """Strip the ONE documented storage mechanic (D-v0.3.51): the
+    `ALTER TABLE … RENAME` quoting artifact. Everything else is compared
+    verbatim."""
+    if sql.startswith('CREATE TABLE "'):
+        return sql.replace('CREATE TABLE "', "CREATE TABLE ", 1).replace(
+            '"(', "(", 1
+        )
+    return sql
+
+
+def _structure(conn, table: str) -> dict:
+    """Six of §11.5's seven facets as comparable data: table identity, the
+    column set and its ordering, declared defaults, foreign keys, indexes and
+    uniqueness. The seventh — CHECK BEHAVIOR — is probed by insert, because
+    comparing CHECK text would be comparing whitespace."""
+    columns = [
+        (r["cid"], r["name"], r["type"], r["notnull"], r["dflt_value"],
+         r["pk"])
+        for r in conn.execute(f"PRAGMA table_info({table})")
+    ]
+    foreign_keys = sorted(
+        (r["table"], r["from"], r["to"], r["on_update"], r["on_delete"])
+        for r in conn.execute(f"PRAGMA foreign_key_list({table})")
+    )
+    indexes = []
+    for row in conn.execute(f"PRAGMA index_list({table})"):
+        members = tuple(
+            r["name"]
+            for r in conn.execute(f"PRAGMA index_info({row['name']})")
+        )
+        indexes.append((row["unique"], row["origin"], row["partial"], members))
+    return {
+        "table": table,
+        "columns": columns,
+        "foreign_keys": foreign_keys,
+        "indexes": sorted(indexes),
+    }
+
+
+def _check_behaviour(conn, table: str, values: dict) -> bool:
+    """Does `table`'s stored DDL ADMIT this row?
+
+    The seventh facet of §11.5 is CHECK BEHAVIOR — the same rows admitted and
+    the same rows refused — not the same whitespace. So the table's own
+    `sqlite_master.sql` is replayed into a throwaway in-memory database with
+    no foreign keys and no sibling rows, and the row is offered to it: what
+    comes back is the CHECK verdict and nothing else.
+    """
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name = ?",
+        (table,),
+    ).fetchone()[0]
+    probe = sqlite3.connect(":memory:")
+    try:
+        probe.execute(sql)
+        columns = ", ".join(values)
+        marks = ", ".join("?" * len(values))
+        try:
+            probe.execute(
+                f"INSERT INTO {table} ({columns}) VALUES ({marks})",
+                tuple(values.values()),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        return True
+    finally:
+        probe.close()
+
+
+def _workflow_probe_row(state: str) -> dict:
+    return {
+        "id": 987654321, "task_id": 1, "work_spec_sha256": "a" * 64,
+        "report_sha256": "b" * 64, "snapshot_sha256": "c" * 64,
+        "registry_version": 1, "compile_status": "valid",
+        "work_spec_document": "{}", "report_document": "{}", "state": state,
+        "revision": 1, "policy_version": 2, "approval_required": 0,
+        "created_at": "2026-07-24T10:00:00Z",
+        "updated_at": "2026-07-24T10:00:00Z", "content_sha256": "d" * 64,
+    }
+
 
 class EquivalenceTests(unittest.TestCase):
     def setUp(self):
@@ -938,19 +1070,71 @@ class EquivalenceTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_fresh_and_migrated_sql_is_byte_identical_for_the_six_tables(self):
+    def _fresh_and_migrated(self):
         fresh_path = self.root / "fresh" / "aos.db"
         conn, _ = db.init_db(fresh_path)
         conn.close()
-        fresh = self._table_sql(fresh_path)
         db_path = build_v3_workspace(self.root / "v3")
         migrations.apply_migrations(db_path.parent)
+        return fresh_path, db_path
+
+    def test_fresh_and_migrated_sql_is_byte_identical_for_four_tables(self):
+        """U-W3 §1.2 row S16, narrow half: the two tables U-W3 does not
+        rebuild and the two it creates directly under their real names are
+        still required to be BYTE-identical."""
+        fresh_path, db_path = self._fresh_and_migrated()
+        fresh = self._table_sql(fresh_path)
         migrated = self._table_sql(db_path)
-        for table in SIX_TABLES:
+        for table in BYTE_IDENTICAL_TABLES:
             with self.subTest(table=table):
                 self.assertEqual(fresh[table], migrated[table])
 
-    def test_the_three_fixtures_lack_all_six_tables(self):
+    def test_fresh_and_migrated_are_structurally_equivalent_for_rebuilds(self):
+        """U-W3 §11.5's seven-way comparison for the four REBUILT tables.
+
+        `ALTER TABLE … RENAME` may requote an identifier the original
+        `CREATE TABLE` did not, so raw SQL text is explicitly not required to
+        match for these four — and nothing else is relaxed. Table identity,
+        the column set AND its ordering, every declared default, CHECK
+        BEHAVIOR (probed by insert, not by whitespace), foreign keys, indexes
+        and uniqueness constraints must all agree.
+        """
+        fresh_path, db_path = self._fresh_and_migrated()
+        fresh_conn = db.connect(fresh_path)
+        self.addCleanup(fresh_conn.close)
+        migrated_conn = db.connect(db_path)
+        self.addCleanup(migrated_conn.close)
+        for table in REBUILT_TABLES:
+            with self.subTest(table=table):
+                self.assertEqual(
+                    _structure(fresh_conn, table),
+                    _structure(migrated_conn, table),
+                )
+                # And the quoting artifact really is the ONLY difference: with
+                # it normalised away the raw text matches byte for byte.
+                self.assertEqual(
+                    _normalize_table_sql(self._table_sql(fresh_path)[table]),
+                    _normalize_table_sql(self._table_sql(db_path)[table]),
+                )
+        # CHECK BEHAVIOR, the seventh facet: the same rows are admitted and
+        # the same rows refused on both sides. `retrying` is the widening,
+        # `running` is a landed state, and a state no version admits is still
+        # refused — so this proves agreement in both directions rather than
+        # only that the new value got through.
+        for state, admitted in (
+            ("retrying", True), ("running", True), ("not_a_state", False),
+        ):
+            with self.subTest(state=state):
+                fresh_verdict = _check_behaviour(
+                    fresh_conn, "workflows", _workflow_probe_row(state)
+                )
+                migrated_verdict = _check_behaviour(
+                    migrated_conn, "workflows", _workflow_probe_row(state)
+                )
+                self.assertEqual(fresh_verdict, admitted)
+                self.assertEqual(migrated_verdict, admitted)
+
+    def test_the_three_fixtures_lack_all_eight_tables(self):
         for name, build in (
             ("v1", build_v1_workspace),
             ("v2", build_v2_workspace),
@@ -968,7 +1152,7 @@ class EquivalenceTests(unittest.TestCase):
             finally:
                 conn.close()
             with self.subTest(fixture=name):
-                self.assertEqual(set(SIX_TABLES) & names, set())
+                self.assertEqual(set(EIGHT_TABLES) & names, set())
 
     def test_fixture_drop_loop_precedes_the_routing_loop(self):
         # §6 freezes the placement: newest layer first. With no FK between the
@@ -991,7 +1175,7 @@ class EquivalenceTests(unittest.TestCase):
         for module in (v1_workspace, v2_workspace, v3_workspace):
             with self.subTest(module=module.__name__):
                 self.assertEqual(
-                    set(module.FIXTURE_TABLES) & set(SIX_TABLES), set()
+                    set(module.FIXTURE_TABLES) & set(EIGHT_TABLES), set()
                 )
 
     def test_storage_checks_data_compare_to_the_engine_vocabularies(self):
@@ -1294,7 +1478,7 @@ class StoreCase(unittest.TestCase):
 
     def counts(self, workflow_row_id=None):
         out = {}
-        for table in SIX_TABLES:
+        for table in EIGHT_TABLES:
             if workflow_row_id is None or table == "workflows":
                 key = "id" if table == "workflows" else "workflow_id"
                 sql = f"SELECT COUNT(*) FROM {table}"
@@ -1959,7 +2143,7 @@ class EnvelopeSubsetTests(StoreCase):
         }
         try:
             workflow_engine.decide(
-                None, document, workflow_engine.AdmissionFacts()
+                None, document, workflow_engine.ShellFacts()
             )
         except workflow_engine.WorkflowRefusal as refusal:
             if refusal.reason in subset_codes and refusal.where in subset_paths:
@@ -2798,7 +2982,7 @@ class CrashMatrixTests(StoreCase):
 
         def dump(conn, row_id):
             out = {}
-            for table in SIX_TABLES:
+            for table in EIGHT_TABLES:
                 key = "id" if table == "workflows" else "workflow_id"
                 out[table] = [
                     tuple(r)
@@ -2836,7 +3020,7 @@ class CrashMatrixTests(StoreCase):
         retried = dump(self.conn, crashed.row_id)
         # Same shapes, same counts, same column-by-column structure; the two
         # differ only in the identity-derived values.
-        for table in SIX_TABLES:
+        for table in EIGHT_TABLES:
             self.assertEqual(
                 len(clean[table]), len(retried[table]), table
             )
@@ -2937,8 +3121,10 @@ class HistoryCorruptionTests(StoreCase):
         self.assertEqual(view.unreadable_seq, 2)
 
     def test_an_unsupported_policy_version_refuses(self):
+        # 2 is a SHIPPED version now; 3 is the unsupported future one. A
+        # future version is refused, never guessed.
         journey = self._damaged(
-            "UPDATE workflow_events SET policy_version = 2 "
+            "UPDATE workflow_events SET policy_version = 3 "
             "WHERE seq = 1 AND workflow_id = ?"
         )
         self._assert_refuses(journey, "policy_version_unsupported")
@@ -3227,6 +3413,25 @@ class HostileRowTests(StoreCase):
         "",
     )
 
+    #: The seven child tables in FK-CHILD-FIRST order. `workflow_checkpoints`
+    #: references `workflow_attempts(workflow_id, attempt_no)`,
+    #: `workflow_attempts` references `workflow_intents(intent_id)`, and the
+    #: connection runs with `foreign_keys=ON`, so `_restore` deletes in this
+    #: order and re-inserts in the reverse of it. No hostile column is a
+    #: `workflow_id`, so `WHERE workflow_id = ?` still selects exactly the
+    #: tampered journey's rows after every tamper in the matrix.
+    _CHILD_TABLES = (
+        "workflow_checkpoints", "workflow_attempts", "workflow_receipts",
+        "workflow_facts", "workflow_commands", "workflow_events",
+        "workflow_intents",
+    )
+
+    #: Set the moment one hostile value's clean baseline cannot be put back
+    #: exactly. `subTest` swallows what `_restore` raises so the loop can
+    #: carry on; the matrix reads this instead and stops, because a lost
+    #: baseline is the one failure no later value can be read through.
+    _restoration_failure = None
+
     def _exercise(self, journey, label):
         calls = (
             ("submit", lambda: self.store.submit(
@@ -3293,6 +3498,13 @@ class HostileRowTests(StoreCase):
             "workflow_facts": ("fact_kind", "fact_scope", "document",
                                "document_sha256", "recorded_at",
                                "content_sha256"),
+            "workflow_attempts": ("state", "runtime_task_uuid",
+                                  "dispatch_intent_id", "idempotency_key",
+                                  "result_sha256", "created_at", "updated_at",
+                                  "content_sha256"),
+            "workflow_checkpoints": ("checkpoint_id", "runtime_task_uuid",
+                                     "document", "document_sha256",
+                                     "recorded_at", "content_sha256"),
         }
         integer_columns = {
             "workflows": ("task_id", "registry_version", "revision",
@@ -3300,16 +3512,27 @@ class HostileRowTests(StoreCase):
             "workflow_events": ("seq", "revision", "policy_version"),
             "workflow_commands": ("expected_revision", "resulting_revision",
                                   "event_seq_first", "event_seq_last"),
+            "workflow_attempts": ("attempt_no", "opened_seq", "closed_seq"),
+            "workflow_checkpoints": ("attempt_no", "checkpoint_seq",
+                                     "payload_bytes"),
         }
         tag = 0
         for table, columns in text_columns.items():
             for column in columns:
+                journey, baseline = self._hostile_journey(tag + 1)
+                database = self._database_state()
                 for value in self.HOSTILE_VALUES:
                     tag += 1
                     with self.subTest(table=table, column=column, value=tag):
-                        self._tamper_and_exercise(table, column, value, tag)
+                        self._tamper_and_exercise(
+                            journey, baseline, table, column, value, tag
+                        )
+                    self._halt_on_restoration_failure()
+                self._assert_no_leakage(database, f"{table}.{column}")
         for table, columns in integer_columns.items():
             for column in columns:
+                journey, baseline = self._hostile_journey(tag + 1)
+                database = self._database_state()
                 # `protocols.INT_MAX + 1` is the honest "INT_MAX overflow"
                 # of S17: SQLite stores it, the canonical spine refuses it.
                 # `2 ** 70` is unstorable at all, so it would test nothing.
@@ -3317,9 +3540,83 @@ class HostileRowTests(StoreCase):
                               2 ** 63 - 1, -1):
                     tag += 1
                     with self.subTest(table=table, column=column, value=tag):
-                        self._tamper_and_exercise(table, column, value, tag)
+                        self._tamper_and_exercise(
+                            journey, baseline, table, column, value, tag
+                        )
+                    self._halt_on_restoration_failure()
+                self._assert_no_leakage(database, f"{table}.{column}")
 
-    def _tamper_and_exercise(self, table, column, value, tag):
+    def _tamper_and_exercise(self, journey, baseline, table, column, value,
+                             tag):
+        label = f"{table}.{column} value {tag}"
+        self._assert_baseline(journey, baseline, f"{label}: before the tamper")
+        key = "id" if table == "workflows" else "workflow_id"
+        try:
+            try:
+                with self.conn:
+                    self.conn.execute(
+                        f"UPDATE {table} SET {column} = ? WHERE {key} = ?",
+                        (value, journey.row_id),
+                    )
+            except (sqlite3.IntegrityError, OverflowError):
+                # The storage boundary refused the tamper outright — which is
+                # the strongest possible outcome and needs no further
+                # exercise.
+                return
+            self._exercise(journey, f"{table}.{column}")
+        finally:
+            # A failed assertion, an escaped exception and a refused
+            # operation all land here, so no hostile value can leave the
+            # journey dirty for the next one.
+            self._restore(journey, baseline, label)
+
+    # -- one journey per table/column pair, restored between every value ----
+    #
+    # S17 is a VALUE matrix, not a journey matrix: what it proves is that a
+    # hostile byte in a column cannot escape the public boundary, and the
+    # journey underneath is scaffolding. Building one per value made the
+    # scaffolding quadratic — `verify` and `list_workflows` walk every
+    # workflow in the database, and the database was 740 of them by the end.
+    # One journey per table/column pair keeps every table, every column,
+    # every value, every subTest identity and every assertion, and is sound
+    # only because each value hands the journey back byte for byte. Both
+    # halves of that claim are proved rather than assumed: `_assert_baseline`
+    # before the tamper, `_restore` plus `_assert_baseline` after it, and
+    # `_assert_no_leakage` over the WHOLE store at the end of the pair.
+
+    def _rows_of(self, sql, params=()):
+        return tuple(tuple(row) for row in self.conn.execute(sql, params))
+
+    def _journey_state(self, row_id):
+        """Every persisted byte one hostile value can reach: the workflow's
+        own row, its rows in the seven child tables, and the `events` journal
+        rows `_journal` appended under its entity id."""
+        state = {}
+        for table in EIGHT_TABLES:
+            key = "id" if table == "workflows" else "workflow_id"
+            state[table] = self._rows_of(
+                f"SELECT * FROM {table} WHERE {key} = ? ORDER BY id",
+                (row_id,),
+            )
+        state["events"] = self._rows_of(
+            "SELECT * FROM events WHERE entity = 'workflow' AND entity_id = ? "
+            "ORDER BY id",
+            (row_id,),
+        )
+        return state
+
+    def _database_state(self):
+        """The same nine tables, every workflow — the whole store."""
+        state = {
+            table: self._rows_of(f"SELECT * FROM {table} ORDER BY id")
+            for table in EIGHT_TABLES
+        }
+        state["events"] = self._rows_of("SELECT * FROM events ORDER BY id")
+        return state
+
+    def _hostile_journey(self, tag):
+        """One clean, fully driven workflow and the EXACT clean baseline of
+        its persisted state, captured before any hostile value touches it."""
         artifact = work_spec(
             idempotency_key=f"wshostile-{tag:05d}",
             work_spec_id=f"7{tag:07d}-7777-4777-8777-777777777777",
@@ -3333,18 +3630,74 @@ class HostileRowTests(StoreCase):
             "record_result",
             payload={"result_document": result_envelope(journey.artifact)},
         )
-        key = "id" if table == "workflows" else "workflow_id"
+        for outcome in journey.outcomes:
+            self.assertEqual(outcome.status, "accepted", outcome.reason)
+        return journey, self._journey_state(journey.row_id)
+
+    def _assert_baseline(self, journey, baseline, label):
+        """Prove the workflow IS the clean baseline — every row, every hash,
+        every intent and receipt reference, byte for byte."""
+        observed = self._journey_state(journey.row_id)
+        for table, rows in baseline.items():
+            self.assertEqual(observed[table], rows, f"{label}: {table}")
+
+    def _assert_no_leakage(self, database, label):
+        """No value of this pair touched a row outside its own workflow."""
+        observed = self._database_state()
+        for table, rows in database.items():
+            self.assertEqual(
+                len(observed[table]), len(rows), f"{label}: {table} rows"
+            )
+            self.assertEqual(observed[table], rows, f"{label}: {table}")
+
+    def _restore(self, journey, baseline, label):
+        """Put the workflow back exactly, then prove it went back.
+
+        Unconditional rather than "undo what changed": a restoration that
+        only reverses what it expected is exactly the one that leaks the case
+        it did not expect. `workflows.id` is a plain rowid alias with no
+        AUTOINCREMENT anywhere in the schema, so deleting and re-inserting
+        the same explicit ids leaves no counter behind.
+        """
+        row_id = journey.row_id
         try:
             with self.conn:
+                for table in self._CHILD_TABLES:
+                    self.conn.execute(
+                        f"DELETE FROM {table} WHERE workflow_id = ?",
+                        (row_id,),
+                    )
                 self.conn.execute(
-                    f"UPDATE {table} SET {column} = ? WHERE {key} = ?",
-                    (value, journey.row_id),
+                    "DELETE FROM events WHERE entity = 'workflow' "
+                    "AND entity_id = ?",
+                    (row_id,),
                 )
-        except (sqlite3.IntegrityError, OverflowError):
-            # The storage boundary refused the tamper outright — which is the
-            # strongest possible outcome and needs no further exercise.
-            return
-        self._exercise(journey, f"{table}.{column}")
+                self.conn.execute(
+                    "DELETE FROM workflows WHERE id = ?", (row_id,)
+                )
+                for table in (("workflows",)
+                              + tuple(reversed(self._CHILD_TABLES))
+                              + ("events",)):
+                    for row in baseline[table]:
+                        marks = ", ".join("?" for _ in row)
+                        self.conn.execute(
+                            f"INSERT INTO {table} VALUES ({marks})", row
+                        )
+            self._assert_baseline(
+                journey, baseline, f"{label}: after restoration"
+            )
+        except Exception as failure:
+            self._restoration_failure = f"{label}: {failure}"
+            raise
+
+    def _halt_on_restoration_failure(self):
+        """Raised OUTSIDE the `subTest` block, which is what makes it end the
+        matrix rather than be recorded and stepped over."""
+        if self._restoration_failure is not None:
+            raise AssertionError(
+                "hostile-row restoration failed; no later value can be "
+                f"trusted: {self._restoration_failure}"
+            )
 
     def test_a_bad_workflow_id_refuses_before_any_query(self):
         for bad in ("", "WF-", "X-7", "WF-abc", "WF-0", 7, None,
@@ -3409,7 +3762,8 @@ class HostileRowTests(StoreCase):
 _TABLE_CONSTANTS = frozenset((
     "WORKFLOWS_TABLE", "WORKFLOW_EVENTS_TABLE", "WORKFLOW_COMMANDS_TABLE",
     "WORKFLOW_INTENTS_TABLE", "WORKFLOW_RECEIPTS_TABLE",
-    "WORKFLOW_FACTS_TABLE",
+    "WORKFLOW_FACTS_TABLE", "WORKFLOW_ATTEMPTS_TABLE",
+    "WORKFLOW_CHECKPOINTS_TABLE",
 ))
 
 _FORBIDDEN_SQL = (
@@ -3502,7 +3856,9 @@ class SqlAndTextSafetyTests(StoreCase):
         self.assertGreater(checked, 20)
         # Every §5.8 hash finalization must be one of the checked call sites,
         # so the `row_sql` exemption above can never hide one.
-        self.assertEqual(finalize_sites, 4)
+        # Six row-hash finalizations now: the four landed ones plus the
+        # attempt INSERT's and the checkpoint INSERT's (U-W3 §11.3).
+        self.assertEqual(finalize_sites, 6)
 
     def test_no_sql_constant_interpolates_anything_but_a_table_name(self):
         tree = _store_ast()
@@ -3784,7 +4140,7 @@ class CompatibilityTests(StoreCase):
 
     def test_the_module_sql_names_only_the_nine_permitted_tables(self):
         tree = _store_ast()
-        permitted = set(SIX_TABLES) | {"tasks", "meta", "events"}
+        permitted = set(EIGHT_TABLES) | {"tasks", "meta", "events"}
         seen = set()
         for name, value in _sql_constants(tree).items():
             if not name.startswith("_SQL"):
@@ -3904,7 +4260,7 @@ class CompatibilityTests(StoreCase):
                 table: [
                     tuple(r) for r in conn.execute(f"SELECT * FROM {table}")
                 ]
-                for table in SIX_TABLES
+                for table in EIGHT_TABLES
             }
 
         first = run_journey(self.conn, "2020-01-01T00:00:00Z")
@@ -3945,16 +4301,28 @@ class ExclusionAndVocabularyTests(StoreCase):
         self.assertNotIn("submit", calls)
 
     def test_no_later_unit_surface_exists(self):
+        """U-W3 owns checkpoint storage, the attempt ledger and compensation
+        persistence, so `checkpoint`, `attempts` and `compensat` leave this
+        list — the store now carries them by contract (U-W3 §17.1 path 2).
+
+        Everything the removed tokens fenced OUT stays fenced out, and the
+        PRIVATE-RUNTIME columns U-W2.2 refused to mirror are still refused by
+        name: no `next_visible_at`, no `delivered_at`, no lease, worker,
+        heartbeat, backoff or queue-transport surface of any kind.
+        """
         source = STORE_SOURCE.read_text(encoding="utf-8").lower()
-        for forbidden in ("checkpoint", "resume(", "compensate", "temporal",
-                          "heartbeat", "lease", "worker", "next_visible_at",
-                          "delivered_at", "attempts", "obsidian", ".claude"):
+        for forbidden in ("resume(", "temporal", "heartbeat", "lease",
+                          "worker", "next_visible_at", "delivered_at",
+                          "backoff", "obsidian", ".claude", "postgres",
+                          "psycopg", "monitor", "interrupt"):
             with self.subTest(term=forbidden):
                 self.assertNotIn(forbidden, source)
 
-    def test_transition_reserved_is_unreachable_through_the_store(self):
-        # No command or receipt kind moves a workflow INTO `compensating`
-        # under policy v1, so the one reserved edge cannot be attempted.
+    def test_compensating_is_entered_only_from_running_by_an_envelope(self):
+        """Under policy v1 no driver targeted `compensating` at all, so the
+        reserved edge could not be attempted through the store. Under v2 it is
+        DRIVEN — by a verified result envelope and by nothing else: still only
+        from `running`, and still by no receipt kind."""
         reachable = {
             target
             for _kind, target in workflow_engine.RECEIPT_TARGET_STATES
@@ -3971,6 +4339,14 @@ class ExclusionAndVocabularyTests(StoreCase):
         self.assertEqual(into, ["running"])
         self.assertEqual(
             matrix[states.index("running")][states.index("compensating")],
+            ("res:compensable",),
+        )
+        # Policy v1's table is retained VERBATIM, so its reserved cells — and
+        # therefore `transition_reserved` — stay reachable for a v1 snapshot.
+        v1 = workflow_engine._V1_TRANSITION_MATRIX
+        v1_states = workflow_engine._V1_WORKFLOW_STATES
+        self.assertEqual(
+            v1[v1_states.index("running")][v1_states.index("compensating")],
             ("reserved",),
         )
 
@@ -3982,14 +4358,30 @@ class ExclusionAndVocabularyTests(StoreCase):
             workflow_engine.WORKFLOW_RECEIPT_KINDS, CONTRACT_RECEIPT_KINDS
         )
         self.assertEqual(
-            workflow_engine.WORKFLOW_INTENT_KINDS, ("dispatch", "cancel")
+            workflow_engine.WORKFLOW_INTENT_KINDS,
+            ("dispatch", "cancel", "compensate"),
         )
-        self.assertEqual(len(workflow_engine.WORKFLOW_REFUSAL_REASONS), 43)
-        self.assertEqual(workflow_engine.TRANSITION_POLICY_VERSION, 1)
-        self.assertEqual(workflow_engine.SUPPORTED_POLICY_VERSIONS, (1,))
-        self.assertEqual(len(workflow_engine.TRANSITION_MATRIX), 13)
+        self.assertEqual(len(workflow_engine.WORKFLOW_REFUSAL_REASONS), 57)
+        self.assertEqual(workflow_engine.TRANSITION_POLICY_VERSION, 2)
+        self.assertEqual(workflow_engine.SUPPORTED_POLICY_VERSIONS, (1, 2))
+        self.assertEqual(len(workflow_engine.TRANSITION_MATRIX), 14)
         for row in workflow_engine.TRANSITION_MATRIX:
+            self.assertEqual(len(row), 14)
+        # ZERO reserved cells under v2, and policy v1's table retained
+        # verbatim beside it so v1 replay coverage is preserved rather than
+        # traded away.
+        self.assertEqual(
+            [c for row in workflow_engine.TRANSITION_MATRIX for c in row
+             if c == ("reserved",)],
+            [],
+        )
+        v1 = workflow_engine._V1_TRANSITION_MATRIX
+        self.assertEqual(len(v1), 13)
+        for row in v1:
             self.assertEqual(len(row), 13)
+        self.assertEqual(
+            len([c for row in v1 for c in row if c == ("reserved",)]), 3
+        )
         # The store shadows none of them.
         tree = _store_ast()
         assigned = {
@@ -4352,7 +4744,7 @@ class AuditRegressionTests(StoreCase):
         which is exactly where F-SEC-1 and F-SEC-2 lived."""
         closed = (sqlite3.Error, protocols.ProtocolError, KeyError, TypeError,
                   ValueError, AttributeError, AosError_)
-        for table in SIX_TABLES:
+        for table in EIGHT_TABLES:
             for column in ("id", "workflow_id"):
                 if table == "workflows" and column == "workflow_id":
                     continue
@@ -4943,13 +5335,24 @@ class AmendmentStoreUnavailableTests(StoreCase):
                 sites.append(node.lineno)
         return sites
 
-    def test_s28_exactly_ten_raise_sites_exist(self):
-        self.assertEqual(len(self._sites()), 10, self._sites())
+    def test_s28_exactly_fourteen_raise_sites_exist(self):
+        """U-W3 §22 A22/E15: the census is still CLOSED and still exact — it
+        grows by exactly the four sites the two new tables need, each a
+        faithful mirror of a landed one, and by nothing else."""
+        self.assertEqual(len(self._sites()), 14, self._sites())
 
     def test_s28_the_site_classification_matches_the_frozen_table(self):
-        """B1 §B1.5 freezes not just ten sites but their KINDS: four
-        `sqlite3.Error` mappings, two deliberate non-`sqlite3` exception
-        mappings, and four non-exception triggers."""
+        """B1 §B1.5 freezes not just the count but the KINDS. U-W3 extends the
+        table by exactly three, each mirroring a landed site on one of the two
+        new tables: `_close_attempt`'s unreadable-row mapping and its
+        rowcount guard mirror `_close_intent`'s two, and
+        `_checkpoint_dedupe`'s stored-row-with-no-event guard mirrors
+        `_receipt_dedupe`'s, and `_open_attempt`'s own `sqlite3.Error` arm
+        mirrors `_insert_workflow`'s — the two INSERTs that narrowly map an
+        `IntegrityError` to a workflow refusal both need a residual arm for
+        every OTHER storage error. FIVE `sqlite3.Error` mappings, THREE
+        deliberate non-`sqlite3` exception mappings, and SIX non-exception
+        triggers."""
         tree = _store_ast()
         handlers = {"sqlite": 0, "other_exception": 0}
         non_exception = 0
@@ -4975,7 +5378,7 @@ class AmendmentStoreUnavailableTests(StoreCase):
                 handlers["other_exception"] += 1
         self.assertEqual(
             (handlers["sqlite"], handlers["other_exception"], non_exception),
-            (4, 2, 4),
+            (5, 3, 6),
             "the store_unavailable trigger classification drifted from §B1.5")
 
     def test_s28_trigger_4_unreadable_row_after_insert(self):

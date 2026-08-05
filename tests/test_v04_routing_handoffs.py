@@ -340,10 +340,10 @@ class SchemaAndMigrationTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_schema_version_is_six(self):
-        self.assertEqual(db.SCHEMA_VERSION, "6")
-        self.assertEqual(migrations.LATEST_VERSION, 6)
-        self.assertEqual(self._version(self._fresh_db()), "6")
+    def test_schema_version_is_seven(self):
+        self.assertEqual(db.SCHEMA_VERSION, "7")
+        self.assertEqual(migrations.LATEST_VERSION, 7)
+        self.assertEqual(self._version(self._fresh_db()), "7")
 
     def test_registry_has_the_new_fifth_step_in_exact_order(self):
         self.assertEqual(
@@ -357,6 +357,7 @@ class SchemaAndMigrationTests(unittest.TestCase):
                 (3, 4, "u-a1-agent-passports-v4"),
                 (4, 5, "u-a3-routing-handoffs-v5"),
                 (5, 6, "u-w2-workflow-state-v6"),
+                (6, 7, "u-w3-runtime-recovery-v7"),
             ],
         )
         migrations.validate_registry()
@@ -365,9 +366,13 @@ class SchemaAndMigrationTests(unittest.TestCase):
         db_path = build_v3_workspace(self.root / "v3")
         report = migrations.status(db_path)
         self.assertEqual(report["current_version"], 3)
-        self.assertEqual(report["latest_version"], 6)
+        self.assertEqual(report["latest_version"], 7)
         self.assertEqual(
             report["plan"][-1],
+            {"from": 6, "to": 7, "migration_id": "u-w3-runtime-recovery-v7"},
+        )
+        self.assertEqual(
+            report["plan"][-2],
             {"from": 5, "to": 6, "migration_id": "u-w2-workflow-state-v6"},
         )
 
@@ -377,7 +382,7 @@ class SchemaAndMigrationTests(unittest.TestCase):
     def test_migrated_v3_workspace_creates_all_four_tables(self):
         db_path = build_v3_workspace(self.root / "v3")
         result = migrations.apply_migrations(db_path.parent)
-        self.assertEqual(result["current_version"], 6)
+        self.assertEqual(result["current_version"], 7)
         self.assertLessEqual(set(FOUR_TABLES), self._tables(db_path))
 
     def test_fresh_and_migrated_sql_is_byte_identical_for_the_four_tables(self):
@@ -431,7 +436,7 @@ class SchemaAndMigrationTests(unittest.TestCase):
 
         # The corrected retry, with the real registry, resumes from v4.
         result = migrations.apply_migrations(db_path.parent)
-        self.assertEqual(result["current_version"], 6)
+        self.assertEqual(result["current_version"], 7)
         self.assertLessEqual(set(FOUR_TABLES), self._tables(db_path))
 
 
@@ -1060,10 +1065,11 @@ class RowModelTests(_SeededV5TestCase):
             self.assertFalse(hasattr(cls, "autonomy_rank"))
 
     def test_dataclasses_changed_no_schema_or_migration(self):
-        self.assertEqual(db.SCHEMA_VERSION, "6")
-        self.assertEqual(len(migrations.MIGRATIONS), 5)
+        self.assertEqual(db.SCHEMA_VERSION, "7")
+        self.assertEqual(len(migrations.MIGRATIONS), 6)
         self.assertEqual(
-            migrations.MIGRATIONS[-1].migration_id, "u-w2-workflow-state-v6"
+            migrations.MIGRATIONS[-1].migration_id,
+            "u-w3-runtime-recovery-v7",
         )
         # No field carries a default: a row model cannot invent a column
         # value the database did not supply.
