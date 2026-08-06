@@ -261,6 +261,18 @@ COMMAND_POLICY: dict[tuple[str, ...], CommandPolicy] = {
     ("workflow", "list"):             _p(READ_ONLY),
     ("workflow", "verify"):           _p(READ_ONLY),
     ("workflow", "export-intents"):   _p(DERIVED_WRITE),
+    # U-E1 observability (§9.6). The projection has NO write path into aos.db
+    # at all — it recomputes every span, log record and metric point from
+    # stored rows on every call — so `trace`, `metrics` and `verify` are
+    # read_only and stay available in recovery: an operator diagnosing a
+    # damaged workspace needs to READ the trace of the workflow that broke.
+    # `export` is the only leaf that writes anything, and what it writes is a
+    # regenerable file capsule, never a ledger row — derived_write, therefore
+    # blocked in recovery and deferred in eco.
+    ("observe", "trace"):             _p(READ_ONLY),
+    ("observe", "metrics"):           _p(READ_ONLY),
+    ("observe", "verify"):            _p(READ_ONLY),
+    ("observe", "export"):            _p(DERIVED_WRITE),
     ("ingest", "dropfile"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("done",): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("migrate", "apply"): _p(AUTHORITATIVE_WRITE, ledger=True),

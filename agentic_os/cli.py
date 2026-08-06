@@ -3033,6 +3033,242 @@ def cmd_workflow_export_intents(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# U-E1 observability (contract §9). One group, four leaves, no write path into
+# aos.db at all: three read-only projections and one derived file export.
+
+def _observe_projection(args):
+    from . import observability
+
+    workflow_id = observability.render_workflow_id(
+        ids.parse_id(args.id, "workflow")
+    )
+    with _ledger(args) as (aos_dir, conn):
+        return aos_dir, observability.project_workflow(conn, workflow_id)
+
+
+def cmd_observe_trace(args) -> int:
+    from . import observability
+
+    _aos_dir, projection = _observe_projection(args)
+    if args.json:
+        # The canonical document already carries `truncated`, so a --json
+        # consumer has the preflight finding without a line of prose that
+        # would corrupt the document it is reading.
+        _print_json(observability.projection_document(projection))
+        return 0
+    # U-E1 §9.6: deep runs the §9.4 bounds check as a PREFLIGHT — the same
+    # predicate check 43 uses, restricted to the workflow being traced. It
+    # REPORTS and never refuses: check 43 is warn-only by design, and a bound
+    # reached because history happened must not turn a read red (D-v0.3.22,
+    # D-v0.4.44).
+    if power.mode_of(args) == power.DEEP:
+        findings = observability.bound_violations_for(projection)
+        for _identity, what, limit in findings:
+            print(f"deep preflight: {what} at {limit}")
+        if not findings:
+            print("deep preflight: projection within bounds")
+    for line in observability.render_trace(projection):
+        print(line)
+    return 0
+
+
+def cmd_observe_metrics(args) -> int:
+    from . import observability
+
+    with _ledger(args) as (aos_dir, conn):
+        projection = observability.project_metrics(conn)
+    if args.json:
+        _print_json(observability.metrics_document(projection))
+        return 0
+    print(
+        f"{projection.series} series of at most "
+        f"{observability.MAX_METRIC_SERIES}  "
+        f"({observability.TEMPORALITY_CUMULATIVE} from ledger genesis)"
+    )
+    for metric in projection.metrics:
+        print(
+            f"{metric.name}  {metric.instrument}  {metric.unit}  "
+            f"{len(metric.points)} point(s)"
+        )
+        for point in metric.points:
+            dimensions = ", ".join(
+                f"{key}={value}" for key, value in point.attributes
+            ) or "(no dimensions)"
+            if metric.instrument == observability.INSTRUMENT_HISTOGRAM:
+                print(
+                    f"  {dimensions:<40} count {point.count}  sum {point.sum}s"
+                )
+            else:
+                print(f"  {dimensions:<40} {point.value}")
+    return 0
+
+
+def cmd_observe_verify(args) -> int:
+    from . import observability
+
+    workflow_id = (
+        observability.render_workflow_id(ids.parse_id(args.id, "workflow"))
+        if args.id is not None else None
+    )
+    with _ledger(args) as (aos_dir, conn):
+        reports = observability.verify(conn, workflow_id)
+    if args.json:
+        _print_json(observability.verify_document(reports))
+        return 0
+    if not reports:
+        print("(no workflows)")
+        return 0
+    for report in reports:
+        print(f"{report.workflow_id}: {'OK' if report.ok else 'divergent'}")
+        for table, row, code in report.divergent:
+            print(f"  divergent  {table} row {row}  {code}")
+        for where, code in report.unreadable:
+            print(f"  unreadable {where}  {code}")
+        for what, limit in report.truncated:
+            print(f"  truncated  {what}  at {limit}")
+        if report.trace_root != observability.TRACE_ROOT_WORK_SPEC:
+            print(f"  trace root {report.trace_root}")
+        if report.clock_inconsistent:
+            print("  clock      inconsistent")
+    # Divergence is REPORTED, not failed: a check that turns red because
+    # history happened is a broken check (D-v0.3.22, D-v0.4.44). Exit stays 0.
+    return 0
+
+
+def cmd_observe_export(args) -> int:
+    import stat as stat_module
+
+    from . import observability, protocols
+
+    workflow_id = observability.render_workflow_id(
+        ids.parse_id(args.id, "workflow")
+    )
+    # U-E1 §9.6: eco SKIPS the one leaf that writes files. The capsule is
+    # regenerable from the ledger at any time, which is exactly what makes it
+    # deferrable — the `init` mirror-refresh precedent (D-v0.2.x, U-E2 §13).
+    # The three read-only leaves run in every mode, including recovery.
+    if power.mode_of(args) == power.ECO:
+        print(
+            "eco: skipped the observability export (derived work). The "
+            "projection is recomputed from the ledger, so nothing was lost. "
+            "Run it anytime: python aos.py power set standard"
+        )
+        return 0
+    # OUT is used exactly as the operator typed it: no expansion, no
+    # resolution, no normalisation — the `workflow export-intents` discipline.
+    target = Path(args.out)
+    directory = protocols.safe_name(target)
+    try:
+        info = os.lstat(target)
+    except OSError:
+        info = None
+    if info is None or not stat_module.S_ISDIR(info.st_mode):
+        raise AosError(
+            f"Not an existing directory: {directory}. Create it first, then "
+            "re-run: python aos.py observe export WF-n --out DIR"
+        )
+    with os.scandir(target) as entries:
+        occupied = any(True for _entry in entries)
+    if occupied:
+        # §9.5: refuses to write into a non-empty directory rather than
+        # merging or overwriting. A capsule is a set, not a patch.
+        raise AosError(
+            f"Refused: {directory} is not empty. An observability capsule is "
+            "never merged into existing files. Name an empty directory, then "
+            "re-run: python aos.py observe export WF-n --out DIR"
+        )
+
+    with _ledger(args) as (aos_dir, conn):
+        documents = observability.export_documents(
+            conn, workflow_id, aos_dir.parent
+        )
+    oversize = observability.oversize_documents(documents)
+    if oversize:
+        raise AosError(
+            f"Refused: {', '.join(oversize)} would exceed "
+            f"{observability.MAX_EXPORT_DOCUMENT_BYTES} bytes. Nothing was "
+            "written."
+        )
+    written = []
+    for name in observability.EXPORT_FILES:
+        body = observability.document_bytes(documents[name]).decode("utf-8")
+        utils.write_text_lf(target / name, body)
+        written.append((name, len(body)))
+    if args.json:
+        _print_json({
+            "workflow_id": workflow_id,
+            "directory": directory,
+            "files": [{"name": n, "bytes": b} for n, b in written],
+            "content_sha256": documents[observability.EXPORT_MANIFEST][
+                "content_sha256"
+            ],
+        })
+        return 0
+    for name, size in written:
+        print(f"written   {name:<16} {size} byte(s)")
+    print(
+        f"{len(written)} file(s) into {directory}; manifest sealed "
+        f"{documents[observability.EXPORT_MANIFEST]['content_sha256']}"
+    )
+    return 0
+
+
+def _build_observe_parser(sub) -> None:
+    """The one `observe` group: two levels, so power._PATH_DESTS resolves the
+    classification key to exactly ("observe", <verb>).
+
+    No --actor, no --force, no --all, no --since, no --limit, no
+    --redact/--unredact (there is no flag that reveals more — §7.3), no
+    --collector, no --endpoint, no --otlp-http. U-E1 opens no socket.
+    """
+    p_observe = sub.add_parser(
+        "observe",
+        help="OpenTelemetry-compatible projection over the workflow ledger "
+        "(U-E1): traces, metrics and structured logs, recomputed on every "
+        "read. Stores nothing, writes nothing to the ledger, repairs nothing.",
+    )
+    observe_sub = p_observe.add_subparsers(
+        dest="subcommand", metavar="SUBCOMMAND", required=True
+    )
+
+    p_trace = observe_sub.add_parser(
+        "trace",
+        help="task -> workflow -> trace -> span -> link -> log for one "
+        "workflow, on one screen and without SQL",
+    )
+    p_trace.add_argument("id", metavar="WF-n")
+    p_trace.add_argument("--json", action="store_true")
+    p_trace.set_defaults(func=cmd_observe_trace)
+
+    p_metrics = observe_sub.add_parser(
+        "metrics",
+        help="the five derived metrics, cumulative from ledger genesis "
+        "(no accumulator, no reset, no gap)",
+    )
+    p_metrics.add_argument("--json", action="store_true")
+    p_metrics.set_defaults(func=cmd_observe_metrics)
+
+    p_export = observe_sub.add_parser(
+        "export",
+        help="write the OTLP/JSON capsule for one workflow into an EMPTY "
+        "directory (no network, no collector, no endpoint)",
+    )
+    p_export.add_argument("id", metavar="WF-n")
+    p_export.add_argument("--out", required=True, metavar="DIR")
+    p_export.add_argument("--json", action="store_true")
+    p_export.set_defaults(func=cmd_observe_export)
+
+    p_verify = observe_sub.add_parser(
+        "verify",
+        help="report projection divergence, unreadable rows and clock skew "
+        "(reports; never repairs; exit 0 even when it finds divergence)",
+    )
+    p_verify.add_argument("id", nargs="?", default=None, metavar="WF-n")
+    p_verify.add_argument("--json", action="store_true")
+    p_verify.set_defaults(func=cmd_observe_verify)
+
+
 def _build_workflow_parser(sub) -> None:
     """The one `workflow` group: two levels, so power._PATH_DESTS resolves the
     classification key to exactly ("workflow", <verb>)."""
@@ -3966,6 +4202,9 @@ def build_parser() -> _Parser:
 
     # U-W2.3 local workflow CLI (contract §2). One group, thirteen leaves.
     _build_workflow_parser(sub)
+
+    # U-E1 observability (contract §9.1). One group, four leaves.
+    _build_observe_parser(sub)
 
     p_ingest = sub.add_parser("ingest", help="ingest agent write-back artifacts")
     ingest_sub = p_ingest.add_subparsers(

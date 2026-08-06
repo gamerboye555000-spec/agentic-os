@@ -924,8 +924,89 @@ def run_checks(conn: sqlite3.Connection, aos_dir: Path) -> list[Check]:
     checks.extend(_agent_registry_checks(conn))
     checks.extend(_catalog_checks(conn))
     checks.extend(_routing_handoff_checks(conn))
+    checks.extend(_observability_checks(conn))
 
     return checks
+
+
+# ---------------------------------------------------------------------------
+# U-E1 observability integrity (checks 42-43)
+#
+# Both APPEND AT THE END, so no existing positional assertion about an earlier
+# check moves. Neither opens a write path: `observability` issues SELECT only.
+
+#: The FROZEN recovery instruction for check 42 (U-E1 §9.4). It points at the
+#: stored row, never at `observe`, because `observe` never repairs a stored
+#: row — it has no write path into aos.db at all.
+_OBSERVABILITY_TRACE_ROOT_RECOVERY = (
+    "A workflow's stored WorkSpec document is unparseable or carries no "
+    "usable trace. This is a stored-row integrity problem, not an "
+    "observability problem: run `aos workflow verify <WF-n>`, then restore "
+    "from a verified backup (see RECOVERY.md). `observe` never repairs a "
+    "stored row."
+)
+
+
+def _observability_trace_roots_check(conn: sqlite3.Connection) -> Check:
+    """42 (FAIL). Every `workflows` row yields a parseable
+    `work_spec_document.trace` with a non-zero 32-hex `trace_id`.
+
+    The diagnostic is a WF id plus one of `observability.UNREADABLE_CODES` —
+    never a document, a trace value, an excerpt or an offset.
+    """
+    from . import observability
+
+    problems: list[str] = []
+    try:
+        findings = observability.unresolvable_trace_roots(conn)
+    except Exception:
+        # Doctor stays total even where a stored value breaks the projection
+        # itself — the check-38/39 backstop shape, never the exception text.
+        findings = ()
+        problems.append("workflow ledger unreadable")
+    problems.extend(f"{identity}: {code}" for identity, code in findings)
+    detail = _bounded_problems(problems)
+    if problems:
+        detail += " — " + _OBSERVABILITY_TRACE_ROOT_RECOVERY
+    return Check(
+        "observability trace roots resolvable",
+        not problems,
+        detail,
+    )
+
+
+def _observability_bounds_check(conn: sqlite3.Connection) -> Check:
+    """43 (WARN, never fatal). Every workflow's projection stays inside the
+    contract's span, link, attribute and record bounds.
+
+    Advisory by design: a projection that truncates at a bound is still a
+    correct projection — it says so — and a bound reached because history
+    happened must not turn a health check red (D-v0.3.22, D-v0.4.44).
+    """
+    from . import observability
+
+    problems: list[str] = []
+    try:
+        findings = observability.bound_violations(conn)
+    except Exception:
+        findings = ()
+        problems.append("workflow ledger unreadable")
+    problems.extend(
+        f"{identity}: {what} at {limit}" for identity, what, limit in findings
+    )
+    return Check(
+        "observability projection bounded",
+        not problems,
+        _bounded_problems(problems),
+        warn_only=True,
+    )
+
+
+def _observability_checks(conn: sqlite3.Connection) -> list[Check]:
+    return [
+        _observability_trace_roots_check(conn),
+        _observability_bounds_check(conn),
+    ]
 
 
 # ---------------------------------------------------------------------------

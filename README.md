@@ -853,6 +853,112 @@ refused rather than reconciled.
 The frozen contract is
 `agentic-os-v0.4-u-w3-runtime-recovery-contract.md`.
 
+## Observability (U-E1)
+
+U-E1 reads the workflow ledger and *projects* three OpenTelemetry signals from
+it — **spans**, **log records** and **metrics**. There is no fourth signal, no
+background collector and no exporter: "OpenTelemetry-compatible" here means the
+field names, types and semantics of the bytes AOS writes are the data models'
+own, serialized on request as OTLP/JSON. Nothing from OpenTelemetry is
+imported, linked or vendored, and no dependency was added.
+
+```bash
+# task → workflow → trace → span → link → log, on one screen, no SQL:
+python aos.py observe trace WF-1
+
+# The five derived metrics, cumulative from ledger genesis:
+python aos.py observe metrics --json
+
+# Report projection divergence, unreadable rows and clock skew.
+# Exit 0 even when it finds divergence — a check that turns red because
+# history happened is a broken check.
+python aos.py observe verify
+
+# Write the OTLP/JSON capsule for one workflow into an EMPTY directory:
+mkdir ./capsule && python aos.py observe export WF-1 --out ./capsule
+# → traces.json  logs.json  metrics.json  manifest.json (content_sha256-sealed)
+```
+
+**Nothing is persisted.** Every span, span id, link, log record, metric point
+and exported file is recomputed from stored rows on every invocation, so there
+is no cache to invalidate, no accumulator to reset, no retention policy and no
+new failure mode in any write path — `observe` has no write path into `aos.db`
+at all, and repairs nothing.
+
+**One workflow, one trace, fixed at admission.** A workflow's trace identity is
+`work_spec_document.trace.trace_id`, which the ledger already stores verbatim
+under `work_spec_sha256 UNIQUE`. That is why U-E1 needed no schema change: the
+one identity an observability layer must have was already durable, immutable
+and digest-sealed. A `trace_id` appearing anywhere else is a *foreign* trace and
+is never adopted. Span ids are the first 16 hex characters of a
+domain-separated SHA-256 — no clock and no RNG is read, so the same ledger
+yields the same ids forever, and the W3C `random-trace-id` flag is therefore
+always clear rather than falsely asserted.
+
+**Retry is a sibling, not a child.** Attempt 2 is not work performed *inside*
+attempt 1; it is work performed *because* attempt 1 ended. It gets its own span
+alongside attempt 1 with a `retry_of` link. A checkpoint restored across
+attempts adds a `restored_from` link, and compensation is a child of the
+*workflow* span carrying a `compensates` link. An `abandoned` attempt reports
+span status Unset, not Error: it was cancelled, not failed.
+
+**Privacy is structural, not filtered.** An attribute value must be a member of
+a closed vocabulary frozen in code, an identity matching a frozen pattern, a
+SHA-256 digest, a bounded integer, an RFC3339 instant, or a boolean. There is
+**no free-text value type**, so a prompt, a goal, an acceptance criterion, a
+`reason.message`, a checkpoint payload or a model output cannot be expressed —
+not "is filtered out", but cannot be expressed. Log record `Body` is always
+empty and there is no flag that reveals more. Only `work_spec_document` is ever
+parsed, and only four of its members are read; every other stored body is
+referenced by digest. `service.instance.id` is a digest of the workspace path,
+never the path, and no hostname, username, IP or process id is emitted.
+
+**Cardinality is closed.** Five metrics, at most **67 series**, every dimension
+drawn from a vocabulary already frozen in code — so the ceiling cannot grow with
+the number of workflows, tasks, attempts, agents or operators. `workflow_id`,
+`trace_id`, `reason_code`, `queue_route`, `actor`, `attempt_no`, any digest and
+any timestamp are forbidden as metric dimensions by name.
+
+**Time, honestly.** `Timestamp` is `workflow_events.created_at`, which is copied
+from the caller's command; `ObservedTimestamp` is the base journal row AOS wrote
+from its own clock in the same transaction. Both are second-precision, both are
+reported, and the contract says outright that the low nine digits of every
+nanosecond value are zero. There is no monotonic clock in this codebase and
+U-E1 invents none: a duration is `end − start` clamped at 0, and a span whose
+end precedes its start carries `aos.clock.inconsistent = true` and is listed by
+`observe verify`. A negative duration is unrepresentable.
+
+Two doctor checks are appended. **42** (fail) proves every workflow's stored
+WorkSpec document still yields a usable trace root; when it fails, that is a
+stored-row integrity problem, not an observability one — run
+`aos workflow verify <WF-n>`, then restore from a verified backup (see
+RECOVERY.md). `observe` never repairs a stored row. **43** (warn-only) reports a
+projection that reached a bound; a bound reached because history happened must
+not turn a health check red.
+
+Power: the three read-only leaves run in every mode including recovery —
+reading the trace of the workflow that broke is exactly what recovery is for.
+`observe export` is the only leaf that writes anything, so eco skips it and
+recovery blocks it.
+
+**Boundaries.** U-E1 adds no dependency, no socket, no collector, no endpoint,
+no daemon, no thread and no sampling. It mints no span events (the API is
+deprecated; log records carry the same trace and span identity) and no
+`gen_ai.*` name (those conventions moved out of the core repository). It writes
+no row to `aos.db`, changes no schema, protocol, workflow command, event,
+refusal reason or policy version. Deterministic replay, incident
+reconstruction, payload capture, time-travel query and retention policy are
+reserved to U-E6 by name. Declared limitations: every duration is quantized to
+one second, so a fast workflow measures 0 s; event time is caller-asserted and
+U-E1 exposes the disagreement rather than resolving it; private-runtime task
+attempts, leases and queue latency are invisible, because AOS never observed
+them; and a base-journal row outside a workflow (a migration, a backup, a pack
+build) carries no `TraceId`, because inventing one would be manufacturing
+identity.
+
+The frozen contract is
+`agentic-os-v0.4-u-e1-observability-foundation-contract.md`.
+
 ## Weekend commands
 
 Decisions, handoffs, and memory are first-class ledger rows (each mutation

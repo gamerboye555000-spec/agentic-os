@@ -921,16 +921,19 @@ class TestDoctorSecretSweep(WarnCase):
     def test_clean_workspace_sweep_passes(self):
         out = self.doctor_ok()
         self.assertTrue(self.sweep_line(out).startswith("[PASS]"))
-        # 18 → 20 → 21 → 25 → 30 → 31 → 34 → 37 → 41: the two U-H2 warn-only
-        # checks, the U-E2 runtime power state check, U-M2's four
+        # 18 → 20 → 21 → 25 → 30 → 31 → 34 → 37 → 41 → 43: the two U-H2
+        # warn-only checks, the U-E2 runtime power state check, U-M2's four
         # memory-claim checks, U-M3's five memory-graph checks, U-M5's
         # retrieval benchmark registry check, U-A1's three agent-registry
         # checks, U-A2's three built-in catalog checks, then U-A3's four
-        # routing/handoff checks joined the mandated set (D-W8.1 pattern —
-        # the pin moves UP with mandated new checks; this fixture never
-        # installs the catalog, so all three stay [PASS]).
+        # routing/handoff checks, then U-E1's two appended observability
+        # checks — "observability trace roots resolvable" (42) and the
+        # warn-only "observability projection bounded" (43) — joined the
+        # mandated set (D-W8.1 pattern — the pin moves UP with mandated new
+        # checks; this fixture never installs the catalog, so all three stay
+        # [PASS]).
         self.assertEqual(
-            len([l for l in out.strip().splitlines() if l]), 41
+            len([l for l in out.strip().splitlines() if l]), 43
         )
 
     def test_domain_row_finding_names_id_field_pattern_only(self):

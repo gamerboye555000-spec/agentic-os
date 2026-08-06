@@ -2215,11 +2215,13 @@ class DoctorCatalogTests(V4WorkspaceTestCase):
                 return check
         raise AssertionError(f"no doctor check named {name!r}")
 
-    def test_doctor_emits_exactly_41_checks_with_the_catalog_checks_at_35_37(self):
+    def test_doctor_emits_exactly_43_checks_with_the_catalog_checks_at_35_37(self):
         # U-A3 Wave 6 appends four routing/handoff checks (38-41) after the
-        # three catalog checks, moving them off the tail; 37 → 41.
+        # three catalog checks, moving them off the tail; 37 → 41. U-E1 then
+        # appends its two observability checks (42-43); 41 → 43. Both append
+        # at the END, so the catalog window below does not move.
         checks = self._checks()
-        self.assertEqual(len(checks), 41)
+        self.assertEqual(len(checks), 43)
         self.assertEqual(
             [c.name for c in checks[34:37]],
             [
@@ -2232,10 +2234,13 @@ class DoctorCatalogTests(V4WorkspaceTestCase):
     def test_doctor_check_count_matches_the_cli(self):
         out = self.ok("doctor")
         lines = [l for l in out.strip().splitlines() if l]
-        self.assertEqual(len(lines), 41)
-        self.assertTrue(lines[-7].startswith("[PASS] built-in catalog verified"))
-        self.assertTrue(lines[-6].startswith("[PASS] installed catalog identities verified"))
-        self.assertTrue(lines[-5].startswith("[PASS] catalog entries available to install"))
+        self.assertEqual(len(lines), 43)
+        # Positive indices now, naming exactly the same three catalog checks:
+        # U-E1's two appended lines moved the tail, and the identical
+        # assertion is retargeted rather than weakened.
+        self.assertTrue(lines[34].startswith("[PASS] built-in catalog verified"))
+        self.assertTrue(lines[35].startswith("[PASS] installed catalog identities verified"))
+        self.assertTrue(lines[36].startswith("[PASS] catalog entries available to install"))
 
     # -- 35: built-in catalog verified -------------------------------------
 
@@ -2612,12 +2617,12 @@ class EntrypointParityTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn('"agent":"aos.architect"', out)
 
-    def test_doctor_is_byte_identical_with_41_lines_across_all_four_entrypoints(self):
+    def test_doctor_is_byte_identical_with_43_lines_across_all_four_entrypoints(self):
         root = self._fresh_root()
         code, out, _err = self._assert_four_way(["doctor"], root)
         self.assertEqual(code, 0)
         lines = [l for l in out.strip().splitlines() if l]
-        self.assertEqual(len(lines), 41)
+        self.assertEqual(len(lines), 43)
         self.assertNotIn("[FAIL]", out)
 
     def test_packaged_zipapp_install_smoke_creates_one_valid_catalog_identity(self):
