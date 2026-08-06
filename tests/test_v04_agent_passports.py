@@ -1141,18 +1141,21 @@ class EventPayloadTests(V4WorkspaceTestCase):
 # (9) Doctor
 
 class DoctorTests(V4WorkspaceTestCase):
-    def test_doctor_emits_exactly_41_checks(self):
+    def test_doctor_emits_exactly_43_checks(self):
         # U-A2 adds three built-in catalog checks (35-37) after the
         # existing 34; this fixture never installs the catalog, so all
         # three stay [PASS]. U-A3 Wave 6 appends the four routing/handoff
         # checks (38-41); with no plans or governed handoffs they all PASS.
+        # U-E1 appends two observability checks (42-43): "observability
+        # trace roots resolvable" and the warn-only "observability
+        # projection bounded"; 41 → 43.
         code, out, err = self.aos("doctor")
         self.assertEqual(code, 0, err)
         lines = [
             line for line in out.splitlines()
             if line.startswith(("[PASS]", "[FAIL]", "[WARN]"))
         ]
-        self.assertEqual(len(lines), 41)
+        self.assertEqual(len(lines), 43)
         self.assertIn("agent identity hashes verify", lines[31])
         self.assertIn("agent passport history intact", lines[32])
         self.assertIn("active agents without a published passport", lines[33])

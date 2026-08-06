@@ -5870,14 +5870,15 @@ class Wave5RecoveryDeepEcoTests(Wave5CliCase):
         self.assertEqual(code, 0)
         self.assertEqual(self.table_counts()[0], 3)
 
-    def test_doctor_emits_forty_one_with_governed_handoffs_present(self):
+    def test_doctor_emits_forty_three_with_governed_handoffs_present(self):
         # Wave 6: the four U-A3 checks (38-41) joined the set; 37 → 41.
+        # U-E1 then appended its two observability checks (42-43); 41 → 43.
         self.create()
         self.run_cli("agent", "handoff", "accept", "AH-0001")
         self.run_cli("sync")
         code, out, err = self.run_cli("doctor")
         self.assertEqual(code, 0, out + err)
-        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 41)
+        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 43)
 
 
 # ---------------------------------------------------------------------------
@@ -6698,9 +6699,9 @@ class Wave6SecretSweepTests(_DoctorCase):
         secretish = [c for c in checks if "secret" in c.name]
         self.assertEqual(secretish, named)
 
-    def test_total_doctor_count_remains_41_not_42(self):
+    def test_total_doctor_count_remains_43_not_44(self):
         self.make_handoff(objective_md=f"use {WAVE6_SECRET}")
-        self.assertEqual(len(self.checks()), 41)
+        self.assertEqual(len(self.checks()), 43)
 
 
 class Wave6EventPrivacyGateTests(_DoctorCase):
@@ -6862,7 +6863,7 @@ class Wave6DoctorMutationFreeTests(_DoctorCase):
             db, "transaction", side_effect=forbidden
         ):
             checks = self.checks()
-        self.assertEqual(len(checks), 41)
+        self.assertEqual(len(checks), 43)
 
     def test_doctor_reuses_the_domain_verifiers(self):
         self.cap_plan()
@@ -6882,18 +6883,21 @@ class Wave6DoctorMutationFreeTests(_DoctorCase):
 
 
 class Wave6DoctorOrderTests(_DoctorCase):
-    def test_clean_workspace_emits_exactly_41_checks(self):
+    def test_clean_workspace_emits_exactly_43_checks(self):
         checks = self.checks()
-        self.assertEqual(len(checks), 41)
+        self.assertEqual(len(checks), 43)
 
     def test_new_checks_append_last_in_contract_order(self):
+        # Positive indices now: U-E1 appended checks 42-43 after these four,
+        # so the identical assertion is retargeted off the tail rather than
+        # weakened. Indices 37..40 are checks 38..41.
         checks = self.checks()
         self.assertEqual(
-            [c.name for c in checks[-4:]],
+            [c.name for c in checks[37:41]],
             [CHECK_38, CHECK_39, CHECK_40, CHECK_41],
         )
         self.assertEqual(
-            [c.warn_only for c in checks[-4:]], [False, False, True, True]
+            [c.warn_only for c in checks[37:41]], [False, False, True, True]
         )
 
     def test_legacy_checks_retain_names_order_and_severity(self):
@@ -6915,10 +6919,12 @@ class Wave6DoctorOrderTests(_DoctorCase):
         # Check 30 (index 29) is warn-only ONLY when restricted claims exist
         # (its clean-fixture early return carries no warn flag) — so on this
         # fixture the warn set is the four U-C3/U-H2 lines, the two U-M2
-        # lines, the U-A1 and U-A2 lines, and Wave 6's checks 40 and 41.
+        # lines, the U-A1 and U-A2 lines, Wave 6's checks 40 and 41, and
+        # U-E1's warn-only check 43 (index 42). Every earlier index is
+        # unchanged, which is the point of appending at the end.
         self.assertEqual(
             [index for index, c in enumerate(checks) if c.warn_only],
-            [16, 17, 18, 19, 23, 24, 33, 36, 39, 40],
+            [16, 17, 18, 19, 23, 24, 33, 36, 39, 40, 42],
         )
 
 

@@ -1,3 +1,346 @@
+# DECISIONS — Agentic OS v0.4 U-E1 observability foundation (governed replan A1)
+
+This section continues the `D-v0.4.*` series for the U-E1 **governed replan**,
+which resolves two contradictions the implementation wave proved inside the U-E1
+Wave 0 freeze itself. Architecture only — exactly two repository paths are
+written, `DECISIONS.md` and
+`agentic-os-v0.4-u-e1-observability-foundation-contract.md`, and no
+implementation or test byte is touched in this session. Branch
+`v0.4-u-e1-observability-foundation`, worktree
+`/home/daksh/Projects/agentic-os-u-e1`, baseline
+`f32fb005869e3567d24e12f054d672c1ef0d0e39` (= HEAD). Prepended per the same
+precedent the Wave 0 section cites (D-W0.4, D-v0.2.7, D-v0.4.4, D-v0.4.103);
+everything below stays byte-identical, including the whole Wave 0 section
+D-v0.4.118 … D-v0.4.140 and D-v0.4.1 … D-v0.4.117.
+
+The Wave 0 section states that U-E1 supersedes nothing at all. That remains true
+of every **landed** contract and decision. It is no longer true of U-E1's own
+freeze: D-v0.4.141 and D-v0.4.142 each retire a clause the implementation wave
+proved unsatisfiable, and D-v0.4.143 records the supersession boundary so a later
+reader is not left to infer which text still governs.
+
+## D-v0.4 decisions (U-E1, governed replan A1)
+
+- **D-v0.4.141 — the doctor-count census is nine files, not three, so the closed
+  boundary is seventeen paths.** Wave 0 verified that the `power.COMMAND_POLICY`
+  versus `power.iter_command_paths` census is asserted *dynamically* in eight
+  modules and therefore absorbs U-E1's four new leaves unchanged — correct, and
+  still true. It then generalized that finding to the **doctor** count, which is
+  not dynamic: it is pinned with static integer literals. §9.4 moves doctor from
+  41 to 43 checks, and six modules Wave 0 never enumerated break mechanically on
+  that literal — `tests/test_cli.py:837`, `test_v02_secret_safety.py:932`,
+  `test_v03_memory_claims.py:1536`, `test_v03_memory_graph.py:2063`,
+  `test_v04_agent_passports.py:1155` and `test_weekend_views.py:671`, each one
+  assertion, each `43 != 41`. The boundary therefore expands from eleven paths to
+  **seventeen** — fifteen implementation paths plus the two architecture
+  documents — and each added path carries exactly **one** authorized doctor-count
+  census correction: the count literal, the test method name where it spells the
+  count, the co-located census comment or docstring, and (only where the same
+  test asserts a tail-relative window) that identical assertion retargeted to
+  positive indices. Nothing else in those files may be edited, no assertion is
+  deleted and no bound is loosened. Doctor stays at **43**: the two appended
+  checks are a frozen deliverable that appends at the end and moves no existing
+  index, and the failing literals are stale pins on a number a mandated new check
+  is *supposed* to move — the D-W8.1 pattern, cited in the very docstrings being
+  corrected. Reverting doctor to 41 would delete a deliverable to protect a
+  census. This decision authorizes **no eighteenth path and no expansion escape
+  hatch**: §19.1 now fires on an eighteenth total or sixteenth implementation
+  path, and §19.10 fires on any edit to a census file that is not a member of the
+  named correction class. The count moved once, under this decision, and the
+  trigger exists to stop it moving again.
+
+- **D-v0.4.142 — `foreign_trace` leaves the active link-kind vocabulary, because
+  no valid U-E1 projection can emit it.** D-v0.4.122 required a `trace_id`
+  observed outside `work_spec_document.trace` to be represented as a span link.
+  D-v0.4.137 forbids U-E1 from parsing `workflow_receipts.document`,
+  `workflow_facts.document`, `workflow_intents.document`,
+  `workflow_checkpoints.document` and `report_document` — which are the **only**
+  places a foreign trace could ever be learned. The two decisions cannot both be
+  satisfied: the emission half of D-v0.4.122 is unreachable by construction, and
+  the implementation correctly declined to invent a reachable path to it. The
+  ruling, seven clauses: the authoritative trace root remains
+  `work_spec_document.trace.trace_id`; U-E1 inspects no receipt, result,
+  checkpoint, fact or report body for trace identities; a trace outside that root
+  is **neither adopted nor emitted** — not as a span's `trace_id`, a link's
+  trace, an attribute, a log field or an exported value; `foreign_trace` is
+  **removed** from the active vocabulary, leaving exactly `retry_of`,
+  `restored_from` and `compensates`; §18.6 row E3 proves **both** halves,
+  non-adoption and non-emission, plus the single-source property; the three
+  preserved kinds are unchanged, since narrowing the vocabulary changes no link
+  that is actually produced; and a future governed cross-runtime adapter may
+  introduce verified foreign-trace links under a separate contract, which will
+  have to supply the two things U-E1 lacks — an authorized read path to the body
+  carrying the foreign trace, and a rule for verifying it. **An active link kind
+  that no valid projection can emit is not preserved as decoration.** It is a
+  false promise to every consumer that reads the vocabulary as a feature list,
+  and a standing invitation to a later implementer to "finish" it by opening a
+  document body §7.3 forbids. The term "foreign trace" survives as terminology,
+  because operators still need a name for what U-E1 refuses to read; naming a
+  refusal is not keeping a link kind for it. This narrows D-v0.4.122 and leaves
+  D-v0.4.121, D-v0.4.123 and D-v0.4.137 intact — indeed D-v0.4.137 is the reason
+  the narrowing is forced.
+
+- **D-v0.4.143 — the replan supersedes only U-E1's own clauses, and the
+  corrections it authorizes are pending, not done.** The clauses retired are, in
+  the contract: §1.2's "Nothing", §17's "Eleven paths", §17.3's three-file limit
+  and its "Why only three" reasoning, §17.6's "Exactly the three", §18.3's "the
+  three forced edits", §19.1's twelfth path, §19.10's "three files", §21's "paths
+  1–9", §4.3's `foreign_trace` link rule, §4.5 rule 3, §15's "foreign trace" row
+  and the original §18.6 row E3; and in this file, the "eleven paths" clause of
+  D-v0.4.119 and the emission half of D-v0.4.122. Every other clause of the Wave 0
+  freeze stands, and **no landed contract, decision or behavior is touched** —
+  amending one's own freeze under a governed decision is not the same act as
+  amending a landed one, and the distinction is kept rather than blurred. Two
+  obligations are authorized here and **outstanding in the implementation**: the
+  six doctor-count census corrections, and the A1.2 correction removing
+  `foreign_trace` from `observability.LINK_KINDS` and retargeting row E3's
+  assertion off `assertIn("foreign_trace", LINK_KINDS)` onto non-adoption and
+  non-emission. No test ran in the replan session and no implementation byte
+  changed, so the build wave is **not** PASS and is not recorded as one. An
+  architecture that has been re-frozen is not an implementation that has been
+  re-verified.
+
+---
+
+# DECISIONS — Agentic OS v0.4 U-E1 observability foundation (Wave 0)
+
+This section continues the `D-v0.4.*` series for the U-E1 Wave 0 architecture
+freeze: OpenTelemetry-compatible traces, metrics and structured logs for the
+local Agentic OS control plane, grounded in U-X1 identities and U-W3 workflow
+attempt semantics. Architecture only — no production code, tests, DDL,
+migrations, fixtures, CLI handlers, power entries, protocol schemas or README
+prose ship in this commit. Branch `v0.4-u-e1-observability-foundation`, worktree
+`/home/daksh/Projects/agentic-os-u-e1`, baseline
+`f32fb005869e3567d24e12f054d672c1ef0d0e39` (= HEAD = `origin/main` = the
+merge-base = `milestone/v0.4-u-w3-runtime-recovery^{}`). Prepended per the
+established precedent (D-W0.4, reaffirmed in D-v0.2.7, D-v0.4.4, D-v0.4.103);
+everything below stays byte-identical, including D-v0.4.1 … D-v0.4.117.
+
+Like U-W3, this freeze writes **no amendment into any landed contract file**.
+Unlike U-W3, it also supersedes nothing at all: every supersession U-E1 might
+have needed was dissolved by D-v0.4.119, which found the identity U-E1 requires
+already durable in the ledger. The two authorized repository paths are
+`DECISIONS.md` and `agentic-os-v0.4-u-e1-observability-foundation-contract.md`.
+
+## D-v0.4 decisions (U-E1, Wave 0 architecture freeze)
+
+- **D-v0.4.118 — "OpenTelemetry-compatible" means the bytes, not the
+  dependency.** U-E1 freezes an internal canonical representation whose field
+  names, types and semantics are those of the OpenTelemetry data models and W3C
+  Trace Context, serialized on request as OTLP/JSON, such that a conformant
+  consumer can read it without this project importing, linking, vendoring or
+  depending on any OpenTelemetry artifact. Compatibility is a property of what
+  we write, not of what we load. The alternative — taking the SDK — would add
+  the first third-party runtime dependency this project has ever had, and the
+  distribution smoke job currently proves the wheel and zipapp contain exactly
+  the source tree and nothing else. A telemetry library is not worth spending
+  that proof on, and it buys nothing the byte format does not already buy.
+
+- **D-v0.4.119 — the trace root already exists, so U-E1 needs no schema
+  change.** `trace` is in `protocols._ENVELOPE_REQUIRED`, so every valid WorkSpec
+  carries one; when the author supplies none, `workspecs._derive_defaults` mints
+  `trace_id` as a domain-separated SHA-256 prefix guarded against all-zeros; and
+  `workflows.work_spec_document` stores the admitted artifact verbatim under
+  `work_spec_sha256 UNIQUE`. The trace identity an observability layer must have
+  is therefore already durable, immutable, digest-bound and tamper-evident
+  before U-E1 exists. `db.SCHEMA_VERSION` stays `"7"`, the migration chain stays
+  at six steps, no DDL constant changes, `db.WORKFLOW_TABLES` stays at eight, and
+  `tests/fixtures/**` stays byte-unchanged. This decision is the reason the whole
+  unit is eleven paths instead of twenty-one: a new table would have stored a
+  second copy of a value the ledger already seals.
+
+- **D-v0.4.120 — U-E1 persists nothing, and that is a design, not a
+  shortcut.** Every span, span id, link, log record, metric point and exported
+  document is recomputed from stored rows on every invocation. The consequences
+  are all deliberate: no cache to invalidate, no accumulator to reset, no
+  divergence between stored and computed telemetry, no retention or pruning
+  policy, no unbounded growth, and no new failure mode in any write path —
+  because U-E1 has no write path into `aos.db` at all. The one durable/derived
+  boundary that matters was settled by D-v0.4.119; everything on the derived side
+  stays there.
+
+- **D-v0.4.121 — one workflow, one trace, fixed at admission.** A workflow's
+  trace identity is `work_spec_document.trace.trace_id` for the whole life of the
+  workflow, and every span of that workflow shares it. A `trace` legally appears
+  on commands, receipts, result envelopes and intent bodies too, and those values
+  are independent of each other — one workflow can accumulate four different
+  trace identities. Choosing the WorkSpec's is not arbitrary: it is the only one
+  sealed by a content digest at admission and incapable of being rewritten
+  afterwards.
+
+- **D-v0.4.122 — a foreign trace is a link, never an adoption.** A `trace_id`
+  observed anywhere other than `work_spec_document.trace` is represented as a
+  span link carrying that foreign trace, and never as the AOS span's own
+  `trace_id`. U-E1 never merges, re-roots, reconciles or prefers a foreign trace.
+  Links across traces are exactly what the OpenTelemetry link concept is for;
+  adoption would silently splice unrelated traces together and would hand any
+  caller the ability to attach its own trace to somebody else's workflow.
+
+- **D-v0.4.123 — identity laundering is prevented by making the identifier
+  decide nothing.** No U-E1 trace, correlation, causation or span value ever
+  selects a row, authorizes an action, dedupes a command, gates a transition,
+  orders history or changes any output other than its own rendering. An
+  identifier that decides nothing cannot launder anything. The other four rules —
+  root fixed at admission, foreign traces as links, all-zero guards on both axes,
+  and no baggage — are hygiene around that one load-bearing property.
+
+- **D-v0.4.124 — W3C's own rule for an invalid traceparent is adopted:
+  restart, never repair.** The Recommendation of 23 November 2021 says a vendor
+  receiving an invalid `traceparent` "creates a new `traceparent` header and
+  deletes `tracestate`". U-E1 follows it: a `trace_id` that fails the 32-hex
+  pattern or is all zeros is never patched, re-derived, substituted or partially
+  accepted. The workflow projects with an unresolvable trace root, no span is
+  emitted for it, and doctor reports it. Repairing a malformed identity would be
+  inventing provenance, which D-v0.3.43 already refused in another form.
+
+- **D-v0.4.125 — span ids are derived, and the `random-trace-id` flag is
+  therefore never set.** `span_id` is the first 16 lowercase hex characters of a
+  domain-separated SHA-256, with an all-zero guard mirroring
+  `workspecs._guard_trace_id`, and one frozen tag per span kind. No RNG and no
+  clock is read, so the same ledger yields the same span ids forever. Trace
+  Context Level 2 (Candidate Recommendation Draft, 28 March 2024) requires that
+  when the `random-trace-id` flag is set, "at least the right-most 7 bytes of the
+  `trace-id` MUST be selected randomly". Our identifiers are deterministic by
+  construction, so the flag stays clear — asserting it would be a false claim
+  about our own data, and a later implementer who "improves" this would be adding
+  a lie, not a feature.
+
+- **D-v0.4.126 — retry is a sibling with a link, not a child.** Attempt 2 is
+  not work performed inside attempt 1; it is work performed because attempt 1
+  ended. Nesting would make attempt 1's duration include attempt 2's, which is
+  false, and would make a ten-attempt workflow a ten-deep tree, which is
+  unreadable. A sibling attempt span carrying a `retry_of` link states the causal
+  edge without lying about containment.
+
+- **D-v0.4.127 — checkpoint restoration is a link, because it is
+  cross-attempt.** `checkpoint_restored` may restore a checkpoint belonging to a
+  different `attempt_no` than the attempt restoring it. Recording it only as an
+  event on the restoring attempt would erase the single causal edge connecting
+  attempt N+1 back to attempt N's checkpoint — the exact edge an operator opens
+  a trace to find. A cross-attempt restore emits a `restored_from` link in
+  addition to its log record; a same-attempt restore emits only the record.
+
+- **D-v0.4.128 — every event is a log record; U-E1 mints no span events.** All
+  twenty-four workflow events, plus every projected base-journal row, become
+  OpenTelemetry LogRecords carrying `TraceId` and `SpanId`. OpenTelemetry
+  deprecated the span-event API and its guidance is "Prefer the Logs API for new
+  events and exceptions." Both shapes serialize into OTLP today and both carry
+  trace and span identity, so choosing log records costs nothing now and avoids
+  founding a brand-new contract on a deprecated surface. Following the logs data
+  model, a record with a non-empty `EventName` **is** an Event — there is no
+  fourth signal and none is implemented.
+
+- **D-v0.4.129 — a replay observes as nothing.** A duplicate command, a
+  redelivered receipt, a redelivered intent, a lock wait and a private-runtime
+  task-attempt retry each emit no span, no log record and no metric increment.
+  U-W3 already establishes that none of them appends an event or changes state.
+  Telemetry that manufactured a signal for them would claim more things happened
+  than happened, which is the specific way observability layers start lying.
+
+- **D-v0.4.130 — an abandoned attempt is not an error.** A `workflow_attempts`
+  row in state `abandoned` gets span status **Unset**, not Error. It was
+  abandoned by cancellation; nothing failed. Marking it Error would make every
+  cancelled workflow read as a failure in every downstream tool, which is the
+  same category mistake D-v0.3.22 and D-v0.3.44 refused for doctor checks.
+
+- **D-v0.4.131 — both times are exposed, and neither is dressed up.**
+  `workflow_events.created_at` is **copied from the caller's command** and is the
+  OpenTelemetry `Timestamp`; the base `events.ts` row that `workflow_store._journal`
+  writes in the same transaction comes from `utils.utc_now_iso()`, the codebase's
+  only wall-clock read, and is the `ObservedTimestamp`. Both are second-precision
+  RFC3339. They are converted to nanoseconds because the data model requires it,
+  and the contract states outright that the low nine digits are always zero
+  rather than implying a precision this system does not have.
+
+- **D-v0.4.132 — no monotonic duration exists, and none is invented.** This
+  codebase has no monotonic clock. Duration is `end − start` over caller-asserted
+  second-precision instants, clamped at zero. A span whose end precedes its start
+  carries `aos.clock.inconsistent = true` and duration 0; a negative duration is
+  unrepresentable. Exposing the skew is honest; hiding it behind a fabricated
+  monotonic reading would not be.
+
+- **D-v0.4.133 — metrics are cumulative from ledger genesis, which designs the
+  three hard problems out.** Every metric is a scan of an append-only ledger, so
+  a reset is impossible (there is no accumulator), a gap is impossible (every
+  point covers genesis-to-now), and a double count is impossible
+  (`UNIQUE(workflow_id, seq)` plus D-v0.4.129). Delta temporality was refused
+  because it requires a durable accumulator and therefore a reset model, and the
+  OpenTelemetry resets-and-gaps machinery is still Development-status — and their
+  own versioning policy says long-term dependencies should not be taken against
+  signals in Development.
+
+- **D-v0.4.134 — the metric inventory is five metrics and sixty-seven series,
+  computed rather than asserted.** `aos.workflow.count` (14 states),
+  `aos.workflow.event.count` (24 events), `aos.workflow.attempt.count` (4 attempt
+  states), `aos.workflow.checkpoint.count` (no dimensions) and
+  `aos.workflow.transition.duration` (24 events) sum to sixty-seven series at
+  most. Every dimension is drawn from a vocabulary already frozen in code, so the
+  ceiling cannot grow with the number of workflows, tasks, attempts, agents,
+  projects or operators — only a governed decision adding a vocabulary member can
+  move it.
+
+- **D-v0.4.135 — `reason_code` is never a metric dimension.** It is not one of
+  the fifty-seven frozen refusal reasons; it is a slug the runtime chooses,
+  bounded only by `^[a-z][a-z0-9_]{2,63}$`. As a dimension it would be unbounded
+  cardinality and, worse, a sixty-four-character channel through which an
+  external system could write arbitrary content into AOS telemetry. It stays a
+  span and log attribute, alongside `queue_route` and `actor`, which are
+  classified for the same reason and excluded from dimensions on the same rule.
+
+- **D-v0.4.136 — privacy is structural, not filtered.** The attribute grammar
+  admits exactly six value types: a member of a closed vocabulary already frozen
+  in code, an identity matching a frozen pattern, a SHA-256 digest, a bounded
+  integer, an RFC3339 instant, and a boolean. **There is no free-text value
+  type.** A prompt, a goal, an acceptance criterion, a `reason.message`, a
+  checkpoint payload or a model output cannot be expressed — not "is filtered
+  out", but cannot be expressed. `secretscan.redact_tree` still runs at the
+  export boundary as defence in depth, and log record `Body` is always empty.
+  There is no flag that reveals more, because a flag is exactly how this control
+  would be lost.
+
+- **D-v0.4.137 — no document column is opened, with one four-member
+  exception.** `report_document`, `workflow_intents.document`,
+  `workflow_receipts.document`, `workflow_facts.document` and
+  `workflow_checkpoints.document` are never parsed by U-E1. `work_spec_document`
+  is parsed to read exactly `trace.trace_id`, `trace.correlation_id`,
+  `trace.causation_id` and `data_classification`, and nothing else. Everything
+  else is referenced by its digest. This is what makes D-v0.4.136 checkable by a
+  reviewer rather than merely promised.
+
+- **D-v0.4.138 — no baggage, in either direction.** U-E1 defines, reads, writes
+  and propagates none, and treats no caller-supplied value as an authorization,
+  trust or access-control input. OpenTelemetry's own documentation states there
+  are no built-in integrity checks to ensure baggage items are yours, and that
+  baggage is unassociated with span, metric and log attributes unless explicitly
+  copied. It therefore offers no integrity and no automatic benefit to offset the
+  risk — and treating it as trusted would be precisely the laundering D-v0.4.123
+  exists to prevent.
+
+- **D-v0.4.139 — the U-E6 line is four clauses, because "derives a view from
+  history" would prove too much.** `workflow_store` already rebuilds every
+  snapshot by folding `workflow_events`, so folding cannot be the discriminator.
+  U-E1 may project over rows as stored, and must never: materialize an
+  intermediate state at a sequence no stored row asserts; open any document or
+  payload body beyond its digest and byte length, save D-v0.4.137's exception;
+  impose cross-process ordering or assert a runtime-side timeline AOS never
+  observed; or answer what would have happened. Flight recording, deterministic
+  replay, incident reconstruction, re-simulation, payload capture, time-travel
+  query and retention policy stay reserved to U-E6 by name.
+
+- **D-v0.4.140 — the runtime budget is measured, and the inherited margin is
+  reported rather than absorbed.** The full suite was timed module by module at
+  this baseline: 3215 tests, 1532.0 s serial, against a protected 1800 s job
+  timeout pinned in three places by the delivery gate — 85 % consumed, 268 s
+  left. The session pack's "about 18 minutes" is not reproduced and the
+  measurement governs. `tests/test_v04_observability.py` is therefore capped at
+  60 s with at most four subprocess cases, because `test_v04_workflow_cli` spends
+  198.7 s on 43 tests — 4.6 s each — proving that subprocess CLI cases are the
+  expensive class and that a pure projection has no excuse to use many. U-E1
+  neither caused the thin margin nor repairs it: raising the timeout would mean
+  editing the protected delivery gate, which is out of scope.
+
+---
+
 # DECISIONS — Agentic OS v0.4 U-W3 workflow runtime recovery (Wave 0)
 
 This section continues the `D-v0.4.*` series for the U-W3 Wave 0 architecture

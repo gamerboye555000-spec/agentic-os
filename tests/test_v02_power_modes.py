@@ -761,6 +761,12 @@ class RecoveryTests(PowerCase):
         (("workflow", "compensate"),
          ("workflow", "compensate", "WF-1", "SELF")),
         (("workflow", "export-intents"), ("workflow", "export-intents", "SELF")),
+        # U-E1's ONE writer: `observe export` writes a derived file capsule.
+        # The three read-only leaves (trace/metrics/verify) stay available in
+        # recovery — reading the trace of the workflow that broke is exactly
+        # what recovery is for — and are NOT listed here.
+        (("observe", "export"),
+         ("observe", "export", "WF-1", "--out", "SELF")),
         (("ingest", "dropfile"), ("ingest", "dropfile", "SELF")),
         (("done",), ("done", "T-0002", "--no-evidence", "--reason", "because")),
         (("pack", "build"), ("pack", "build", "T-0002")),
@@ -993,17 +999,17 @@ class DoctorIntegrationTests(PowerCase):
         self.assertNotIn('{"version"', line)
         self.assertNotIn(str(self.aos_dir), line)
 
-    def test_doctor_check_count_is_forty_one(self):
-        """(25) 20 → 21 → 25 → 30 → 31 → 34 → 37 → 41: the mandated power
+    def test_doctor_check_count_is_forty_three(self):
+        """(25) 20 → 21 → 25 → 30 → 31 → 34 → 37 → 41 → 43: the mandated power
         check joined the set at U-E2, then U-M2's four memory-claim checks,
         then U-M3's five memory-graph checks, then U-M5's one
         retrieval-benchmark registry check, then U-A1's three agent-registry
         checks, then U-A2's three built-in catalog checks, then U-A3's four
-        routing/handoff checks (the D-W8.1 pattern — the pin moves UP with a
-        mandated new check; fixture never installs the catalog, so all three
-        stay [PASS])."""
+        routing/handoff checks, then U-E1's two observability checks (the
+        D-W8.1 pattern — the pin moves UP with a mandated new check; fixture
+        never installs the catalog, so all three stay [PASS])."""
         out = self.aos("doctor")
-        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 41)
+        self.assertEqual(len([l for l in out.strip().splitlines() if l]), 43)
 
     def test_doctor_still_passes_cleanly_on_the_baseline_fixture(self):
         """(25) The new checks do not disturb the ones already there."""
