@@ -5815,6 +5815,300 @@ full suite green before moving on; test count never shrinks.
 - **D-W9.3 — Final suite count.** 162 tests green (P0 baseline 89 → 162;
   +73, no existing test removed or weakened).
 
+# DECISIONS — Agentic OS v0.4 U-E6 flight recorder, deterministic replay, and incident forensics (Wave 0)
+
+This section continues the `D-v0.4.*` series for the U-E6 Wave 0 architecture
+freeze: flight recording, deterministic replay, and incident forensics.
+Architecture only — no production code, tests, DDL, migrations, fixtures, CLI
+handlers, power entries, protocol schemas or README prose ship in this commit.
+Branch `v0.4-u-e6-flight-recorder-replay`, worktree
+`/home/daksh/Projects/agentic-os-u-e6`, baseline
+`55e72c8c298dfb3c1577d0425faa31c31019f8f2` (= HEAD = `origin/main` =
+`milestone/v0.4-u-e1-observability-foundation^{}`). Prepended per the established
+precedent (D-W0.4, reaffirmed in D-v0.2.7, D-v0.4.4, D-v0.4.103); everything
+below stays byte-identical, including D-v0.4.1 … D-v0.4.143, which the decisions
+here supersede only where they quote them and never reword.
+
+Unlike U-E1's A1, this freeze writes **no amendment into any landed contract
+file**. U-E6 is a new unit, not a later U-E1 wave, and the U-E6 session is
+authorized to write exactly two repository paths — `DECISIONS.md` and
+`agentic-os-v0.4-u-e6-flight-recorder-replay-contract.md`. Every supersession
+U-E6 needs is therefore declared inside its own contract, and the superseded
+documents are left byte-identical.
+
+## D-v0.4 decisions (U-E6 Wave 0)
+
+- **D-v0.4.144 — U-E6 authority derives from U-W3 §1.1, U-E1 §0.1 (D-v0.4.139),
+  and U-W2.2 §4.2; it supersedes nothing.**
+
+  Three landed clauses grant the whole unit: U-W3 §1.1 (transition-policy version
+  2, `workflow_attempts`, `workflow_checkpoints`, compensation, restoration, and
+  the retry/recovery boundary), U-E1 §0.1 / D-v0.4.139 (the observability
+  projection, its trace-root invariant, and the reservation of flight recording,
+  deterministic replay, incident reconstruction, re-simulation, payload capture,
+  time-travel query, and retention policy to U-E6 by name), and U-W2.2 §4.2 (the
+  store's judgment authority: existence, digest verification, history–snapshot
+  agreement, compare-and-swap win, and nothing else). U-E6 ships what those
+  clauses reserved and nothing else.
+
+- **D-v0.4.145 — Replay semantics are eight mutually exclusive definitions;
+  no implementation may conflate them.**
+
+  The eight terms are frozen in the U-E6 contract §1:
+  1. **integrity verification** — recomputes every digest, reports every
+     divergence/unreadable/truncated/clock_inconsistent; never asserts success/failure.
+  2. **workflow history folding** — pure reducer `decide` over `workflow_events` in
+     `seq` order; produces derived snapshot; never asserts runtime behavior.
+  3. **snapshot rebuild** — materializes snapshot at a specific `event_seq` or
+     `checkpoint_seq`; claims "ledger folds to this state", never "workflow was in
+     this state at wall-clock time".
+  4. **flight-record reconstruction** — assembles complete self-contained record
+     from all eight tables + `work_spec_document` digest + journal rows; outputs a
+     flight record bundle (`aos.flight-record/v1`).
+  5. **incident reconstruction** — correlates flight record, observability
+     projection, verification report, and optional operator context; cites evidence
+     by row identity (table, row_id, content_sha256); never infers causation.
+  6. **deterministic replay** — re-executes `decide` over flight record events in
+     isolation; produces replay trace with per-step `byte_identical_to_ledger`; never
+     mutates `aos.db`, never issues intents/receipts/facts.
+  7. **re-simulation** — deterministic replay with explicit declared substitutions
+     (work_spec replacement, retry.max_attempts override, policy version override,
+     synthetic receipts, event removal); every substitution recorded in output trace.
+  8. **counterfactual / time-travel query** — read-only query over ledger or bundle;
+     "what if" questions answered only via explicit re-simulation under declared
+     substitution; never mutates, never asserts historical authority for the
+     counterfactual branch.ournal; produces a flight record bundle
+     (`aos.flight-record/v1`); contains no secrets, no model outputs.
+  5. **incident reconstruction** — correlates flight record, observability,
+     verification, and operator question; cites evidence by row identity; never
+     infers causation the ledger does not support.
+  6. **deterministic replay** — re-executes `decide` over flight record events in
+     isolation; executes no side effects, issues no intents, delivers no receipts,
+     records no facts, mutates no ledger; produces replay trace with per-step
+     `byte_identical` boolean; never becomes execution.
+  7. **re-simulation** — deterministic replay with explicit, declared substitutions
+     (work_spec override, retry budget override, policy version override, synthetic
+     receipts, event removal); every substitution recorded in output.
+  8. **counterfactual / time-travel query** — read-only query over ledger or
+     bundle; "what would" is explicitly re-simulation under declared substitution;
+     never mutates, never asserts historical authority for counterfactual branch.
+
+  Non-goals (explicitly reserved or forbidden): cross-process timeline
+  reconstruction, model output reconstruction (D-v0.4.137), external runtime task
+  state reconstruction (D-v0.4.103), payload/body parsing beyond digests and byte
+  lengths (D-v0.4.137), any write path into `aos.db`, any network collector,
+  daemon, background watcher, or cloud telemetry service.
+
+- **D-v0.4.146 — U-E6 requires no new tables in `aos.db`; the flight record is a
+  derived export artifact (`aos.flight-record/v1`).**
+
+  Every byte in a flight record bundle is reconstructible from the eight existing
+  workflow tables + `work_spec_document` + relevant `journal` rows. Adding a
+  `flight_records` table would duplicate authoritative data, create a second write
+  path requiring consistency, and require its own retention/migration/integrity
+  story. Instead, U-E6 introduces: (1) a deterministic flight record bundle format,
+  (2) a replay engine, (3) a re-simulation harness, (4) an incident report format,
+  (4) minimal read-only CLI surfaces.
+
+- **D-v0.4.147 — Flight record bundles exclude all document bodies per
+  D-v0.4.137; only digests and byte lengths are included.**
+
+  Excluded from canonical payload: `workflow_intents.document`, `workflow_receipts.document`,
+  `workflow_facts.document`, `workflow_checkpoints.document`, `report_document`,
+  and `work_spec_document` (the full document body is never in the canonical payload).
+  Included in canonical payload: for each excluded document, only `content_sha256` /
+  `receipt_sha256` / `document_sha256` and `payload_bytes` / `content_sha256`.
+  The `work_spec_digest` (the `work_spec_sha256` from the workflow row) is included
+  in the canonical payload. Replay fetches the `work_spec_document` from the ledger
+  by digest at replay time (or from substitution set for re-simulation).
+
+- **D-v0.4.148 — Flight record bundles must pass `secretscan` with zero findings;
+  any hit refuses bundle creation with `secret_in_flight_record`.**
+
+  Creation pipeline: assemble bundle → run `secretscan.scan(canonical_json_bytes)` →
+  if `findings > 0`, refuse creation and list finding types (not values) → write
+  file only if scan passes. Journal payload members included per
+  `observability._JOURNAL_PAYLOAD_ATTRIBUTES` (closed vocabulary only).
+
+- **D-v0.4.149 — Deterministic replay runs `decide` over the flight record's event
+  sequence in isolation; never issues intents, delivers receipts, records facts,
+  or mutates `aos.db`; produces a replay trace with per-step `byte_identical`
+  boolean.**
+
+  Replay engine validates bundle integrity manifest, runs `decide` sequentially
+  over `workflow_events` in `seq` order, compares derived snapshot to stored
+  `resulting_revision`/`expected_revision` at each step. Returns `{steps: [...],
+  byte_identical: bool, divergence_at_seq: int | null}`. Runs in separate process
+  or isolated function with no database write access; CLI verb is `replay` (not
+  `submit`).
+
+- **D-v0.4.150 — Re-simulation accepts explicit, declared substitutions; every
+  substitution is recorded in the output trace.**
+
+  Substitution types: `work_spec_document` replacement (must pass secret scan),
+  `retry.max_attempts` integer override, `transition_policy_version` (1 or 2),
+  `synthetic_receipts` array injected at specific `seq` positions,
+  `removed_event_seq` integer. Empty substitution set equals deterministic replay.
+
+- **D-v0.4.151 — Incident reconstruction documents cite evidence by row identity
+  (table, row_id, content_sha256); they never infer causation the ledger does not
+  support.**
+
+  Format `aos.incident-report/v1` references flight record bundle by content
+  digest, includes observability projection, includes verification report,
+  contains operator-provided context (optional, free-text, never parsed by AOS),
+  contains structured evidence index. If ledger row is later purged, incident
+  document still records what it cited.
+
+- **D-v0.4.152 — CLI surfaces are exactly six command leaves with exact power
+  classifications; no daemon, no background job, no network endpoint.**
+
+  Exact command leaves and parser keys:
+  1. `aos flight-record create <WF-id> --out <file>` → `("flight-record", "create")`
+     - Power class: `DERIVED_WRITE` (writes filesystem, never ledger)
+     - Recovery: BLOCKED
+     - Deep preflight: runs
+     - Eco: deferred
+  2. `aos flight-record verify <file>` → `("flight-record", "verify")`
+     - Power class: `READ_ONLY`
+     - Recovery: ALLOWED
+     - Deep preflight: runs
+     - Eco: immediate
+  3. `aos replay <file>` → `("replay",)`
+     - Power class: `READ_ONLY`
+     - Recovery: ALLOWED
+     - Deep preflight: runs
+     - Eco: immediate
+  4. `aos replay <file> --resimulate <subst-file>` → `("replay",)` with flag `--resimulate`
+     - Power class: `READ_ONLY` (same command leaf as deterministic replay)
+     - Recovery: ALLOWED
+     - Deep preflight: runs
+     - Eco: immediate
+  5. `aos incident create <WF-id> --out <file>` → `("incident", "create")`
+     - Power class: `DERIVED_WRITE` (writes filesystem, never ledger)
+     - Recovery: BLOCKED
+     - Deep preflight: runs
+     - Eco: deferred
+  6. `aos incident export <WF-id> --out <dir>` → `("incident", "export")`
+     - Power class: `DERIVED_WRITE` (writes filesystem directory, never ledger)
+     - Recovery: BLOCKED
+     - Deep preflight: runs
+     - Eco: deferred
+
+  Grammar notes: `replay --resimulate` is a flag on the same command leaf `("replay",)`,
+  not a separate subcommand. `flight-record` and `incident` are two-level groups
+  yielding exactly four distinct two-level keys. No new power modes or power entries
+  beyond these six leaves.
+
+- **D-v0.4.153 — Canonical JSON serialization rules.**
+
+  `protocols.serialize_canonical` (sorted keys, no whitespace, UTF-8). Array order
+  by natural key: `workflow_events` by `seq`, `workflow_commands` by `id`,
+  `workflow_intents` by `id`, `workflow_receipts` by `id`, `workflow_facts` by
+  `id`, `workflow_attempts` by `attempt_no`, `workflow_checkpoints` by
+  `checkpoint_seq`, `journal_rows` by `row_id`. Object member order sorted
+  lexicographically. Integers as JSON numbers. Digests as lower-case hex.
+  Timestamps RFC3339 UTC with `Z` suffix. Top-level `protocol_version` string.
+
+- **D-v0.4.154 — Integrity model: row-level, table-level, bundle-level.**
+
+  Row-level: every stored row carries `content_sha256` (recomputed on every read).
+  Table-level: manifest = `sha256(concat(sorted(content_sha256)))` per table.
+  Bundle-level: content digest = `sha256(canonical_json_bytes)`. `verify`
+  recomputes all three. Replay recomputes every step from `decide`; divergence
+  from stored `resulting_revision`/`expected_revision` reported as
+  `divergence_at_seq`.
+
+- **D-v0.4.155 — Retention: ledger unchanged; flight record bundles and incident
+  reports are operator-managed files with no automatic lifecycle.**
+
+  U-W3 and U-E1 define no retention policy for workflow tables; U-E6 adds none.
+  Bundles and reports have no automatic creation, deletion, or TTL.
+  Replay/re-simulation traces are ephemeral stdout unless redirected.
+
+- **D-v0.4.156 — Backward compatibility: bundles carry `protocol_version` and
+  `schema_version`; unknown versions are refused; no migration required; no reducer
+  archive/loader exists.**
+
+  Future `v2` bundle format can coexist; `verify` and `replay` dispatch on version.
+  Ledger schema version recorded in bundle; old bundles remain replayable **only if
+  the current reducer supports their event vocabulary**. The current reducer handles
+  both policy v1 and v2 histories via the `policy_version` field in the snapshot.
+  If a bundle's `schema_version` implies a vocabulary the current reducer cannot
+  process (e.g., a future schema v8 with new event types), `replay` **refuses** with
+  `reducer_vocabulary_mismatch`. Schema version stays `"7"`; no migration required
+  for U-E6.
+
+- **D-v0.4.157 — Failure semantics: no operation mutates `aos.db`; divergence in
+  replay is reported not refused; secret scan failure refuses creation.**
+
+  Exit codes: workflow not found (2), secret scan hit (3, no file written), I/O
+  error (4), bundle integrity failure (1), unknown protocol_version (2), replay
+  divergence (0 with `divergence_at_seq`), reducer refusal on accepted event (0
+  with refusal reason), malformed substitution (2), invalid WorkSpec from
+  substitution (3), incident create workflow not found (2), directory not empty
+  (2). No operation ever mutates `aos.db`.
+
+- **D-v0.4.158 — Test strategy requires ten specific mutation/adversarial tests
+  plus property tests.**
+
+  Adversarial: (1) tampered bundle `content_sha256` → verify detects, replay
+  refuses; (2) secret in WorkSpec `goal` field → ledger admits (warn), create
+  refuses (scans canonical payload); (3) secret in journal row payload → create
+  refuses (tests scanner on closed vocabulary); (4) missing `workflow_events` row
+  → create includes gap in manifest (row count mismatch) or refuses; (5) replay
+  divergence → reports `divergence_at_seq`; (6) re-simulation work_spec
+  `retry.max_attempts` override → trace shows substitution and different budget;
+  (7) counterfactual removal of `dispatch_accepted` event → re-simulation shows
+  workflow never enters `running`; (8) unknown `protocol_version` → verify/replay
+  refuse; (9) `schema_version` mismatch → replay refuses (reducer vocabulary
+  mismatch); (10) corrupted `workflow_checkpoints.document_sha256` → verify
+  detects; replay (which doesn't use checkpoints) still verifies events.
+  Property: `replay(flight_record_create(WF))` always produces `byte_identical:
+  true` for a verified ledger; `flight_record_create` is idempotent on the
+  **canonical payload** (two consecutive creates for the same unchanged workflow
+  produce byte-identical canonical payloads; wrapper `created_at` differs, which
+  is allowed); `verify(bundle)` on a bundle produced by `create` always passes;
+  re-simulation with empty substitution set equals deterministic replay.
+
+- **D-v0.4.159 — Protocol artifacts `aos.flight-record/v1` and
+  `aos.incident-report/v1` are added to the registry; no existing protocol is
+  modified.**
+
+- **D-v0.4.160 — Determinism rule: the canonical payload is byte-identical across
+  repeated creates of the same unchanged workflow; the wrapper metadata is
+  explicitly excluded from the canonical payload.**
+
+  The file format separates a canonical payload (the integrity-manifested,
+  replayed JSON) from a wrapper containing `created_at` (RFC3339 instant of
+  bundle creation) and `secret_scan` result. `verify` and `replay` operate on
+  the canonical payload only. Two consecutive `flight-record create` invocations
+  for the same unchanged workflow produce byte-identical canonical payloads.
+  The wrapper `created_at` necessarily differs; this is permitted and does not
+  violate byte-identical reconstruction. No wall clock, RNG, locale, cwd,
+  environment, iteration order, or filesystem metadata affects the canonical
+  replay payload.
+
+- **D-v0.4.161 — Repository path boundary: exactly two files written in this
+  freeze (`DECISIONS.md` and this contract); implementation adds exactly twelve
+  new files.**
+
+  Freeze paths: `DECISIONS.md` (amended),
+  `agentic-os-v0.4-u-e6-flight-recorder-replay-contract.md` (this file).
+  Implementation paths (not in this commit):
+  `agentic_os/flight_recorder.py`,
+  `agentic_os/replay.py`,
+  `agentic_os/incident.py`,
+  `agentic_os/protocols/aos.flight-record.v1.json`,
+  `agentic_os/protocols/aos.incident-report.v1.json`,
+  `tests/test_v04_flight_recorder.py`,
+  `tests/test_v04_replay.py`,
+  `tests/test_v04_incident.py`,
+  `tests/test_v04_flight_recorder_cli.py`,
+  `tests/test_v04_replay_cli.py`,
+  `tests/test_v04_incident_cli.py`,
+  `TROUBLESHOOTING.md` (amended).
+
 # DECISIONS — Agentic OS Night-1 build
 
 This file records every simplification, interpretation, and deviation made while
