@@ -1,3 +1,111 @@
+# DECISIONS — Agentic OS v0.4 U-E6 flight recorder, deterministic replay, and incident forensics (governed replan A1)
+
+This section continues the `D-v0.4.*` series for the U-E6 **governed replan**,
+which resolves one contradiction the implementation wave proved inside the U-E6
+Wave 0 freeze itself. Architecture only — exactly two repository paths are
+written, `DECISIONS.md` and
+`agentic-os-v0.4-u-e6-flight-recorder-replay-contract.md`, and no implementation
+or test byte is touched in this session. Branch `v0.4-u-e6-flight-recorder-replay`,
+worktree `/home/daksh/Projects/agentic-os-u-e6`, baseline
+`6da12ed251011f8597afc9495aa7c2f8da568234` (= HEAD). Prepended per the same
+precedent the Wave 0 section cites (D-W0.4, D-v0.2.7, D-v0.4.4, D-v0.4.103) and
+the U-E1 replan made concrete (D-v0.4.141 … D-v0.4.143); everything below stays
+byte-identical, including the whole Wave 0 section D-v0.4.144 … D-v0.4.162 and
+D-v0.4.1 … D-v0.4.143.
+
+The Wave 0 section's §14 (D-v0.4.161) fixed the implementation boundary at
+exactly fourteen paths and forbade every other path. That remains true of every
+**landed** contract and decision. It is no longer true of U-E6's own freeze:
+D-v0.4.163 retires the fourteen-path clause because §5's own mandated leaves
+force two baseline test files to move, and D-v0.4.164 records the supersession
+boundary so a later reader is not left to infer which text still governs.
+
+## D-v0.4 decisions (U-E6, governed replan A1)
+
+- **D-v0.4.163 — the recovery guard and the CLI census are static pins, and
+  the six frozen leaves move both, so the U-E6 boundary expands from fourteen
+  to sixteen implementation paths.** Wave 0 verified that the
+  `power.COMMAND_POLICY` versus `power.iter_command_paths` classification
+  census is asserted *dynamically* in a dozen modules and therefore absorbs
+  U-E6's five new leaves unchanged — correct, and still true. It then
+  generalized that finding to two other censuses, which are **not** dynamic:
+  both are pinned with static literals, and both break mechanically the moment
+  §5's six leaves are wired into `cli.py` and `power.py` per §5's own power
+  classifications.
+
+  The first is the recovery guard. `tests/test_v02_power_modes.py`'s
+  `RecoveryTests.BLOCKED` tuple is asserted by
+  `test_every_blockable_command_is_covered_by_the_block_list` to cover **every**
+  live CLI leaf whose kind is not in `power.RECOVERY_ALLOWED_KINDS`, and the
+  same bidirectionality is re-asserted by
+  `tests/test_v04_workflow_cli.py:PowerTests.test_the_blocked_list_covers_the_new_leaves`
+  (which imports `RecoveryTests.BLOCKED`). §5 classifies `flight-record create`,
+  `incident create` and `incident export` as `DERIVED_WRITE`, which is
+  intentionally not recovery-allowed — so the guard requires all three to appear
+  in `BLOCKED`, and `test_v02_power_modes.py` is not on the frozen U-E6 §14
+  list.
+
+  The second is the CLI leaf census. `tests/test_v04_observability.py`'s
+  `test_e24_the_cli_leaf_census_moved_from_112_to_116` pins
+  `len(leaves) == 116` and `len(power.COMMAND_POLICY) == 116` with static
+  integer literals. U-E6 adds five parser leaves — `("flight-record", "create")`,
+  `("flight-record", "verify")`, `("replay",)`, `("incident", "create")`,
+  `("incident", "export")` (`replay --resimulate` is a flag on `("replay",)`,
+  not a leaf) — so the census moves to **121**, and `test_v04_observability.py`
+  is also not on the frozen U-E6 §14 list.
+
+  These two pins cannot be satisfied by §5's own deliverable without editing
+  their files, and the frozen §14 (D-v0.4.161) forbids editing them. The ruling,
+  mirroring D-v0.4.141's census correction: the boundary expands from fourteen
+  implementation paths to **sixteen**, and each added path carries exactly **one**
+  authorized correction class:
+  - `tests/test_v02_power_modes.py` — add exactly the three non-recovery-safe
+    leaves to `RecoveryTests.BLOCKED`, each with an argv following the existing
+    pattern: `(("flight-record", "create"), ("flight-record", "create", "WF-1",
+    "--out", "SELF"))`, `(("incident", "create"), ("incident", "create", "WF-1",
+    "--out", "SELF"))`, `(("incident", "export"), ("incident", "export", "WF-1",
+    "--out", "SELF"))`. Nothing else in the file may be edited; no existing
+    entry, bound or assertion changes. The paired
+    `test_recovery_blocks_every_authoritative_and_derived_mutation` iterates
+    `BLOCKED` and needs no separate edit.
+  - `tests/test_v04_observability.py` — in
+    `test_e24_the_cli_leaf_census_moved_from_112_to_116`: the count literals
+    `116` → `121`, the test method name where it spells the count
+    (`_moved_from_112_to_116` → `_moved_from_116_to_121`), and the co-located
+    census comment or docstring. Nothing else in the file may be edited, no
+    assertion is deleted and no bound is loosened.
+
+  `tests/test_v04_workflow_cli.py` needs **no** edit: its guard imports
+  `RecoveryTests.BLOCKED` from `test_v02_power_modes` and is satisfied
+  automatically once `BLOCKED` is extended, and its own
+  `test_recovery_blocks_ten_and_permits_three` `blocked` list is
+  workflow-prefixed only. This decision authorizes **no seventeenth path and no
+  expansion escape hatch**: the frozen §14 clause now fires on a seventeenth
+  implementation path, and on any edit to a census or guard file that is not a
+  member of the named correction class. The count moved once, under this
+  decision, and the trigger exists to stop it moving again. §5's classifications
+  are not re-litigated: the three file-writing leaves stay `DERIVED_WRITE` (and
+  therefore blocked in recovery), `flight-record verify` and `replay` stay
+  `READ_ONLY`.
+
+- **D-v0.4.164 — the replan supersedes only U-E6's own clauses, and the
+  corrections it authorizes are pending, not done.** The clauses retired are,
+  in the contract: §14's "No other paths", its "exactly these 14 paths"
+  enumeration and its closed twelve-path block, §15's "None at freeze"; and in
+  this file, the "fourteen authorized implementation paths" clause of
+  D-v0.4.161. Every other clause of the Wave 0 freeze stands, and **no landed
+  contract, decision or behavior is touched** — amending one's own freeze under
+  a governed decision is not the same act as amending a landed one, and the
+  distinction is kept rather than blurred. Two obligations are authorized here
+  and **outstanding in the implementation**: the three-entry `BLOCKED`
+  extension in `tests/test_v02_power_modes.py`, and the `116` → `121` census
+  correction in `tests/test_v04_observability.py`. No test ran in the replan
+  session and no implementation byte changed, so the build wave is **not** PASS
+  and is not recorded as one. An architecture that has been re-frozen is not an
+  implementation that has been re-verified.
+
+---
+
 # DECISIONS — Agentic OS v0.4 U-E1 observability foundation (governed replan A1)
 
 This section continues the `D-v0.4.*` series for the U-E1 **governed replan**,
