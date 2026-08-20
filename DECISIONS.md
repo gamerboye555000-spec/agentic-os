@@ -6090,8 +6090,8 @@ documents are left byte-identical.
   replay payload.
 
 - **D-v0.4.161 — Repository path boundary: exactly two files written in this
-  freeze (`DECISIONS.md` and this contract); implementation adds exactly twelve
-  new files.**
+  freeze (`DECISIONS.md` and this contract); implementation adds exactly fourteen
+  authorized implementation paths.**
 
   Freeze paths: `DECISIONS.md` (amended),
   `agentic-os-v0.4-u-e6-flight-recorder-replay-contract.md` (this file).
@@ -6107,7 +6107,22 @@ documents are left byte-identical.
   `tests/test_v04_flight_recorder_cli.py`,
   `tests/test_v04_replay_cli.py`,
   `tests/test_v04_incident_cli.py`,
-  `TROUBLESHOOTING.md` (amended).
+  `TROUBLESHOOTING.md` (amended),
+  `agentic_os/cli.py` (amended — CLI wiring carrier),
+  `agentic_os/power.py` (amended — power-classification carrier).
+
+- **D-v0.4.162 — `cli.py` and `power.py` were omitted from the frozen
+  implementation inventory; they are now explicitly authorized solely as CLI-wiring
+  and power-classification carrier paths.**
+
+  The frozen U-E6 §14 boundary listed exactly twelve implementation paths and
+  excluded `agentic_os/cli.py` and `agentic_os/power.py` while the six CLI
+  leaves in §5 necessarily require CLI wiring in `cli.py` and their `READ_ONLY` /
+  `DERIVED_WRITE` classifications necessarily require power entries in `power.py`.
+  This contradiction is resolved by authorizing those two files as the thirteenth
+  and fourteenth implementation paths, carrying only the six frozen leaves and their
+  existing power classifications — no new CLI leaf, power mode, or power entry.
+  No other U-E6 semantic decision changes.
 
 # DECISIONS — Agentic OS Night-1 build
 

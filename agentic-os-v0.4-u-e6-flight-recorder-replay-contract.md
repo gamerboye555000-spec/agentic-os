@@ -370,7 +370,7 @@ U-E6 writes **exactly these new paths** (architecture freeze — no implementati
 /home/daksh/Projects/agentic-os-u-e6/agentic-os-v0.4-u-e6-flight-recorder-replay-contract.md  (this file)
 ```
 
-**No other paths.** Implementation wave will add **exactly these 12 paths**:
+**No other paths.** Implementation wave will add **exactly these 14 paths**:
 
 ```
 /home/daksh/Projects/agentic-os-u-e6/agentic_os/flight_recorder.py           (new module)
@@ -385,6 +385,8 @@ U-E6 writes **exactly these new paths** (architecture freeze — no implementati
 /home/daksh/Projects/agentic-os-u-e6/tests/test_v04_replay_cli.py
 /home/daksh/Projects/agentic-os-u-e6/tests/test_v04_incident_cli.py
 /home/daksh/Projects/agentic-os-u-e6/TROUBLESHOOTING.md                      (amended)
+/home/daksh/Projects/agentic-os-u-e6/agentic_os/cli.py                         (amended — CLI wiring carrier)
+/home/daksh/Projects/agentic-os-u-e6/agentic_os/power.py                        (amended — power-classification carrier)
 ```
 
 ---
@@ -416,7 +418,8 @@ The following decisions will be recorded in `DECISIONS.md` under a new section "
 - **D-v0.4.158** — Test strategy requires ten specific mutation/adversarial tests plus property tests for idempotence (canonical payload), verification round-trip, and replay fidelity.
 - **D-v0.4.159** — Protocol artifacts `aos.flight-record/v1` and `aos.incident-report/v1` are added to the registry; no existing protocol is modified.
 - **D-v0.4.160** — Determinism rule: the **canonical payload** (the integrity-manifested JSON) is byte-identical across repeated creates of the same unchanged workflow. The wrapper (`created_at`, `secret_scan`) is explicitly excluded from the canonical payload and may differ.
-- **D-v0.4.161** — Repository path boundary: exactly two files written in this freeze (`DECISIONS.md` and this contract); implementation adds exactly twelve new files (three modules, two protocols, six test modules, one TROUBLESHOOTING amendment).
+- **D-v0.4.161** — Repository path boundary: exactly two files written in this freeze (`DECISIONS.md` and this contract); implementation adds exactly fourteen authorized implementation paths (three modules, `cli.py`, `power.py`, two protocols, six test modules, one TROUBLESHOOTING amendment).
+- **D-v0.4.162** — `cli.py` and `power.py` were omitted from the frozen implementation inventory; they are now explicitly authorized **solely** as CLI-wiring and power-classification carrier paths for the six CLI leaves and their `READ_ONLY` / `DERIVED_WRITE` classifications. This amendment adds no other implementation path and changes no other U-E6 semantic decision.
 
 ---
 
