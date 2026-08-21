@@ -3214,6 +3214,135 @@ def cmd_observe_export(args) -> int:
     return 0
 
 
+def cmd_flight_record_create(args) -> int:
+    import hashlib
+
+    from . import flight_recorder, protocols
+
+    # U-E6 §5: eco SKIPS the file-writing leaf. A flight record bundle is
+    # regenerable from the ledger at any time, which is exactly what makes it
+    # deferrable — the `observe export` precedent.
+    if power.mode_of(args) == power.ECO:
+        print(
+            "eco: skipped the flight record export (derived work). The "
+            "bundle is recomputed from the ledger, so nothing was lost. "
+            "Run it anytime: python aos.py power set standard"
+        )
+        return 0
+    with _ledger(args) as (_aos_dir, conn):
+        payload, wrapper = flight_recorder.create(conn, args.id)
+    flight_recorder.write_bundle(Path(args.out), payload, wrapper)
+    bundle_sha256 = hashlib.sha256(
+        protocols.serialize_canonical(payload)
+    ).hexdigest()
+    print(f"wrote flight record {args.id} -> {args.out}")
+    print(
+        f"bundle sha256 {bundle_sha256}  "
+        f"secret_scan findings {wrapper['secret_scan']['findings']}"
+    )
+    return 0
+
+
+def cmd_flight_record_verify(args) -> int:
+    from . import flight_recorder
+
+    # Reads only the bundle file: no workspace is required.
+    payload = flight_recorder.read_bundle(Path(args.file))
+    report = flight_recorder.verify(payload)
+    if report["ok"]:
+        print(f"OK  {report['workflow_id']}  {report['bundle_sha256']}")
+        return 0
+    for finding in report["findings"]:
+        print(f"{finding['kind']}  {finding['where']}  {finding['detail']}")
+    print(
+        f"flight record failed verification: "
+        f"{len(report['findings'])} finding(s)."
+    )
+    return 1
+
+
+def cmd_replay(args) -> int:
+    from . import flight_recorder, replay
+
+    payload = flight_recorder.read_bundle(Path(args.file))
+    substitutions = (
+        replay.read_substitutions(Path(args.resimulate))
+        if args.resimulate is not None else {}
+    )
+    with _ledger(args) as (_aos_dir, conn):
+        trace = replay.replay(payload, conn, substitutions)
+    for step in trace["steps"]:
+        line = (
+            f"{step['seq']:>2} {step['event']:<28} "
+            f"{step['from_state'] or '-':<12} -> "
+            f"{step['to_state'] or '-':<12}  rev {step['revision']:<3}  "
+            f"{'byte-identical' if step['byte_identical'] else 'DIVERGED'}"
+        )
+        if "attempt_budget" in step:
+            line += f"  attempt_budget {step['attempt_budget']}"
+        print(line)
+    for substitution in trace["substitutions"]:
+        print(f"substitution applied: {substitution}")
+    for declaration in trace.get("declared_substitutions", []):
+        print(f"declared substitution: {declaration}")
+    # Divergence and reducer refusal are REPORTED, not failed (§11): the trace
+    # carries them and the process exits 0.
+    if trace["refusal"] is not None:
+        print(
+            f"reducer refusal at {trace['refusal']['where']}: "
+            f"{trace['refusal']['reason']}"
+        )
+    if trace["divergence_at_seq"] is not None:
+        print(
+            f"divergence at event_seq {trace['divergence_at_seq']}: the "
+            "folded snapshot disagrees with the stored command revisions."
+        )
+    print(
+        f"byte_identical {trace['byte_identical']}  "
+        f"final_state {trace['final_state']}  "
+        f"final_revision {trace['final_revision']}"
+    )
+    return 0
+
+
+def cmd_incident_create(args) -> int:
+    from . import incident
+
+    if power.mode_of(args) == power.ECO:
+        print(
+            "eco: skipped the incident report (derived work). The report is "
+            "recomputed from the ledger, so nothing was lost. Run it "
+            "anytime: python aos.py power set standard"
+        )
+        return 0
+    with _ledger(args) as (_aos_dir, conn):
+        document = incident.create_report(conn, args.id, "")
+    incident.write_report(Path(args.out), document)
+    print(
+        f"wrote incident report {args.id} -> {args.out}  "
+        f"flight_record_sha256 {document['flight_record_sha256']}"
+    )
+    return 0
+
+
+def cmd_incident_export(args) -> int:
+    from . import incident
+
+    if power.mode_of(args) == power.ECO:
+        print(
+            "eco: skipped the incident export (derived work). The bundle is "
+            "recomputed from the ledger, so nothing was lost. Run it "
+            "anytime: python aos.py power set standard"
+        )
+        return 0
+    with _ledger(args) as (_aos_dir, conn):
+        written = incident.export(conn, args.id, "", Path(args.out))
+    for name, size in written:
+        print(f"written   {name:<18} {size} byte(s)")
+    print(f"{len(written)} file(s) into {args.out}")
+    return 0
+
+
 def _build_observe_parser(sub) -> None:
     """The one `observe` group: two levels, so power._PATH_DESTS resolves the
     classification key to exactly ("observe", <verb>).
@@ -3267,6 +3396,83 @@ def _build_observe_parser(sub) -> None:
     p_verify.add_argument("id", nargs="?", default=None, metavar="WF-n")
     p_verify.add_argument("--json", action="store_true")
     p_verify.set_defaults(func=cmd_observe_verify)
+
+
+def _build_flight_record_parser(sub) -> None:
+    """The one `flight-record` group: two levels, so power._PATH_DESTS resolves
+    the classification key to exactly ("flight-record", <verb>)."""
+    p_flight = sub.add_parser(
+        "flight-record",
+        help="U-E6 flight recorder: assemble, scan and verify deterministic "
+        "flight record bundles (aos.flight-record/v1)",
+    )
+    flight_sub = p_flight.add_subparsers(
+        dest="subcommand", metavar="SUBCOMMAND", required=True
+    )
+    p_create = flight_sub.add_parser(
+        "create",
+        help="assemble + secret-scan + write the flight record bundle for one "
+        "workflow into a file",
+    )
+    p_create.add_argument("id", metavar="WF-n")
+    p_create.add_argument("--out", required=True, metavar="FILE")
+    p_create.set_defaults(func=cmd_flight_record_create)
+
+    p_verify = flight_sub.add_parser(
+        "verify",
+        help="recompute every row hash, table manifest and bundle digest; "
+        "report every finding (exit 1 on any finding)",
+    )
+    p_verify.add_argument("file", metavar="BUNDLE")
+    p_verify.set_defaults(func=cmd_flight_record_verify)
+
+
+def _build_replay_parser(sub) -> None:
+    """The one `replay` leaf (§5): a single-level command; `--resimulate` is a
+    flag on the same leaf, never a separate subcommand."""
+    p_replay = sub.add_parser(
+        "replay",
+        help="U-E6 deterministic replay: fold a flight record bundle in "
+        "isolation — never issues intents, delivers receipts, records facts "
+        "or mutates aos.db",
+    )
+    p_replay.add_argument("file", metavar="BUNDLE")
+    p_replay.add_argument(
+        "--resimulate", metavar="SUBST-FILE", default=None,
+        help="re-simulation: read a declared JSON substitution set and replay "
+        "under it",
+    )
+    p_replay.set_defaults(func=cmd_replay)
+
+
+def _build_incident_parser(sub) -> None:
+    """The one `incident` group: two levels, so power._PATH_DESTS resolves the
+    classification key to exactly ("incident", <verb>)."""
+    p_incident = sub.add_parser(
+        "incident",
+        help="U-E6 incident forensics: reconstruct a structured incident "
+        "report (aos.incident-report/v1) that cites evidence by row identity "
+        "and never infers causation the ledger does not support",
+    )
+    incident_sub = p_incident.add_subparsers(
+        dest="subcommand", metavar="SUBCOMMAND", required=True
+    )
+    p_create = incident_sub.add_parser(
+        "create",
+        help="write the incident report for one workflow into a file",
+    )
+    p_create.add_argument("id", metavar="WF-n")
+    p_create.add_argument("--out", required=True, metavar="FILE")
+    p_create.set_defaults(func=cmd_incident_create)
+
+    p_export = incident_sub.add_parser(
+        "export",
+        help="write the four-file incident bundle (incident report, flight "
+        "record, observability, verification) into an EMPTY directory",
+    )
+    p_export.add_argument("id", metavar="WF-n")
+    p_export.add_argument("--out", required=True, metavar="DIR")
+    p_export.set_defaults(func=cmd_incident_export)
 
 
 def _build_workflow_parser(sub) -> None:
@@ -4205,6 +4411,14 @@ def build_parser() -> _Parser:
 
     # U-E1 observability (contract §9.1). One group, four leaves.
     _build_observe_parser(sub)
+
+    # U-E6 flight recorder, deterministic replay and incident forensics (§5).
+    # Five leaves: a two-level `flight-record` group (create/verify), the
+    # single-level `replay` leaf, and a two-level `incident` group
+    # (create/export). `replay --resimulate` is a flag on `("replay",)`.
+    _build_flight_record_parser(sub)
+    _build_replay_parser(sub)
+    _build_incident_parser(sub)
 
     p_ingest = sub.add_parser("ingest", help="ingest agent write-back artifacts")
     ingest_sub = p_ingest.add_subparsers(

@@ -767,6 +767,17 @@ class RecoveryTests(PowerCase):
         # what recovery is for — and are NOT listed here.
         (("observe", "export"),
          ("observe", "export", "WF-1", "--out", "SELF")),
+        # U-E6's three file-writing leaves (governed replan A1, D-v0.4.163):
+        # each writes only an operator-requested file, never a ledger row —
+        # derived_write, therefore blocked in recovery. `flight-record verify`
+        # and `replay` are read_only, stay available in recovery, and are NOT
+        # listed here.
+        (("flight-record", "create"),
+         ("flight-record", "create", "WF-1", "--out", "SELF")),
+        (("incident", "create"),
+         ("incident", "create", "WF-1", "--out", "SELF")),
+        (("incident", "export"),
+         ("incident", "export", "WF-1", "--out", "SELF")),
         (("ingest", "dropfile"), ("ingest", "dropfile", "SELF")),
         (("done",), ("done", "T-0002", "--no-evidence", "--reason", "because")),
         (("pack", "build"), ("pack", "build", "T-0002")),

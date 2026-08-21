@@ -2045,3 +2045,73 @@ stronger reading is wrong:
    modifiable PR head; or a separately administered GitHub App or external
    status provider. Nothing from those triggers is partially implemented
    today.
+
+## Flight recorder, replay and incident forensics (U-E6)
+
+### The model in one paragraph
+
+`flight-record create` assembles one workflow's flight record (the seven
+workflow tables plus the operator journal), secret-scans the ENTIRE canonical
+byte sequence, and writes a bundle file; `flight-record verify` recomputes
+every row hash, every table manifest, the journal row set and the bundle
+digest from the file alone (no workspace required). `replay` folds the
+bundle's event sequence through the pure reducer in isolation — it never
+issues intents, delivers receipts, records facts, or mutates `aos.db` — and
+cross-checks the folded revisions against the stored command revision pairs.
+`replay --resimulate FILE` replays under a declared JSON substitution set
+(retry budget, policy version, synthetic receipts, a declared counterfactual
+event removal). `incident create` writes an `aos.incident-report/v1` document
+that correlates the flight record, the observability projection and the
+verification report; `incident export` writes those four documents into an
+EMPTY directory. All three writing leaves are `derived_write`: deferred in eco
+mode and blocked in recovery mode; `flight-record verify` and `replay` are
+read-only and work in recovery.
+
+### Secret scan failure (`secret_in_flight_record`, exit 3)
+
+`flight-record create` refuses (exit 3) when the canonical payload would
+contain secret-shaped data. The flight record carries no free text by
+construction — document bodies are excluded — so a hit means a stored row
+value (a journal payload member, an actor, an id) is secret-shaped or the
+ledger was tampered. The message names the matched pattern only, never the
+value. Nothing is written. Inspect the ledger rows for secret-shaped values,
+rotate and remove the real credential, then re-run create.
+
+### Bundle verification failure (exit 1)
+
+`flight-record verify` recomputes every row's `content_sha256`, every table
+manifest, the journal row set (duplicate detection) and the bundle digest; any
+finding prints one line per finding and exits 1. `digest_divergent` means a
+row's digest no longer recomputes (tampered content). `manifest_divergent`
+means a table's row count or concatenated-hash no longer matches.
+`seq_gap`/`revision_gap` mean an event row was deleted from the ledger (the
+survivors still recompute, so the sequence density check is what catches it).
+Recreate the bundle from the ledger, or repair the ledger, then re-verify.
+
+### Replay divergence (`divergence at event_seq N`)
+
+Replay REPORTS divergence, never fails: when the folded snapshot disagrees
+with a stored command's `expected_revision`/`resulting_revision`, the trace
+carries `divergence_at_seq` and the process exits 0. A divergence that passes
+`flight-record verify` means the command revision pair was sealed against a
+different event sequence than the one in the bundle — re-verify the ledger and
+rebuild the bundle before trusting either.
+
+### Re-simulation substitution error (exit 2)
+
+`replay --resimulate FILE` shape-checks the substitution set first: unknown
+keys, non-object files, an out-of-range `retry_max_attempts`, a non-positive
+`removed_event_seq`, and malformed `work_spec_document`/`synthetic_receipts`
+all refuse with exit 2 before any fold runs. The declared keys are
+`work_spec_document`, `retry_max_attempts`, `transition_policy_version`,
+`synthetic_receipts`, `removed_event_seq`, `allow_digest_mismatch`.
+
+### WorkSpec digest mismatch (exit 3)
+
+Replay fetches the WorkSpec from the ledger by `work_spec_digest` (or from the
+`work_spec_document` substitution). A declared substitution whose digest does
+not match `work_spec_digest` refuses with exit 3 unless
+`allow_digest_mismatch: true` is also declared — the guard exists so a
+re-simulation cannot silently replay under a different WorkSpec. A ledger that
+cannot produce a WorkSpec matching its digest is corrupt; run `python aos.py
+workflow verify`.
