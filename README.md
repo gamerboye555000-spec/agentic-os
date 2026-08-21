@@ -959,6 +959,25 @@ identity.
 The frozen contract is
 `agentic-os-v0.4-u-e1-observability-foundation-contract.md`.
 
+**Flight records, replay and incident forensics (U-E6).** A flight record is a
+derived export artifact, never a source of truth: every byte of an
+`aos.flight-record/v1` bundle is reconstructible from recorded ledger rows, and
+the ledger remains the only authority. Deterministic replay is strictly
+read-only: it re-executes the pure workflow reducer over the recorded event
+sequence in isolation, executes no side effects, issues no intents, delivers no
+receipts, records no facts, mints no workflow id and writes nothing to
+`aos.db`, reporting step by step whether each derived snapshot is
+byte-identical to the ledger. Replay reconstructs only from recorded ledger
+evidence, using the supported current reducer and event vocabulary; a bundle
+whose protocol version, schema version or event vocabulary the current reducer
+cannot process is refused deterministically. Re-simulation is declared
+counterfactual analysis, not execution: every substitution is explicitly
+declared and labeled, and it never claims the original workflow would have done
+anything. Incident reconstruction cites recorded evidence by row identity and
+never infers causation or unobserved ordering the ledger does not support. The
+frozen contract is
+`agentic-os-v0.4-u-e6-flight-recorder-replay-contract.md`.
+
 ## Weekend commands
 
 Decisions, handoffs, and memory are first-class ledger rows (each mutation

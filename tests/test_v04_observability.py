@@ -2007,11 +2007,13 @@ class CliTests(ObservabilityCase):
             node = action.choices[name]
         return node
 
-    def test_e24_the_cli_leaf_census_moved_from_112_to_116(self):
+    def test_e24_the_cli_leaf_census_moved_from_116_to_121(self):
+        """E24. U-E6 added five leaves (flight-record create/verify, replay,
+        incident create/export; governed replan A1, D-v0.4.163)."""
         parser = cli.build_parser()
         leaves = power.iter_command_paths(parser)
-        self.assertEqual(len(leaves), 116)
-        self.assertEqual(len(power.COMMAND_POLICY), 116)
+        self.assertEqual(len(leaves), 121)
+        self.assertEqual(len(power.COMMAND_POLICY), 121)
         self.assertEqual(set(leaves), set(power.COMMAND_POLICY))
 
     def test_e25_the_power_classification_is_three_reads_and_one_write(self):

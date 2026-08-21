@@ -273,6 +273,18 @@ COMMAND_POLICY: dict[tuple[str, ...], CommandPolicy] = {
     ("observe", "metrics"):           _p(READ_ONLY),
     ("observe", "verify"):            _p(READ_ONLY),
     ("observe", "export"):            _p(DERIVED_WRITE),
+    # U-E6 flight recorder, deterministic replay and incident forensics (§5).
+    # The three file-writing leaves are derived_write (they write only
+    # operator-requested files, never a ledger row), therefore blocked in
+    # recovery and deferred in eco. `flight-record verify` and `replay` are
+    # read_only — replay NEVER mutates aos.db and has no external side effect —
+    # so they stay available in recovery: inspecting a bundle is exactly what
+    # recovery is for. `replay --resimulate` is a flag on the same leaf.
+    ("flight-record", "create"):      _p(DERIVED_WRITE),
+    ("flight-record", "verify"):      _p(READ_ONLY),
+    ("replay",):                      _p(READ_ONLY),
+    ("incident", "create"):           _p(DERIVED_WRITE),
+    ("incident", "export"):           _p(DERIVED_WRITE),
     ("ingest", "dropfile"): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("done",): _p(AUTHORITATIVE_WRITE, ledger=True),
     ("migrate", "apply"): _p(AUTHORITATIVE_WRITE, ledger=True),
