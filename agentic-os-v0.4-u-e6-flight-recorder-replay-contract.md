@@ -370,9 +370,10 @@ U-E6 writes **exactly these new paths** (architecture freeze — no implementati
 /home/daksh/Projects/agentic-os-u-e6/agentic-os-v0.4-u-e6-flight-recorder-replay-contract.md  (this file)
 ```
 
-**No other paths.** Implementation wave will add **exactly these 16 paths** —
-the fourteen frozen implementation paths below plus the two baseline
-correction paths authorized by governed replan A1 (D-v0.4.163). Each
+**No other paths.** Implementation wave will add **exactly these 17 paths** —
+the fourteen frozen implementation paths below, the two baseline
+correction paths authorized by governed replan A1 (D-v0.4.163), and the one
+documentation path authorized by governed replan A2 (D-v0.4.165). Each
 correction path carries exactly one authorized correction class and nothing
 else:
 
@@ -393,6 +394,7 @@ else:
 /home/daksh/Projects/agentic-os-u-e6/agentic_os/power.py                        (amended — power-classification carrier)
 /home/daksh/Projects/agentic-os-u-e6/tests/test_v02_power_modes.py             (amended — A1: add the three DERIVED_WRITE leaves to RecoveryTests.BLOCKED, each with one argv following the existing pattern; nothing else)
 /home/daksh/Projects/agentic-os-u-e6/tests/test_v04_observability.py            (amended — A1: in test_e24_the_cli_leaf_census_moved_from_112_to_116, the count literals 116→121, the method name spelling the count, and the co-located census comment; nothing else)
+/home/daksh/Projects/agentic-os-u-e6/README.md                                  (amended — A2: exactly the single §13.6 observability/replay paragraph; nothing else)
 ```
 
 ---
@@ -402,6 +404,8 @@ else:
 None at freeze. All design decisions are explicit above. If implementation discovers a contradiction, a governed replan (amendment A1) will be required per U-E1 precedent.
 
 **Amended by governed replan A1 (D-v0.4.163, D-v0.4.164):** the implementation wave discovered one contradiction inside this freeze. §5's six mandated CLI leaves carry §5's own power classifications, and wiring them forces two baseline test files to move: `tests/test_v02_power_modes.py` (its `RecoveryTests.BLOCKED` guard must cover the three `DERIVED_WRITE` leaves, which are not recovery-allowed) and `tests/test_v04_observability.py` (its `116`-leaf census moves to `121`). Both files were outside the frozen §14 boundary. The contradiction is resolved by the A1 expansion in §14: the boundary grows from fourteen to sixteen implementation paths, each added path carrying exactly one authorized correction class. `tests/test_v04_workflow_cli.py` needs no edit — its guard imports `RecoveryTests.BLOCKED` and absorbs the extension automatically. No other U-E6 semantic decision changes.
+
+**Amended by governed replan A2 (D-v0.4.165, D-v0.4.166):** the read-only U-E6 Gauntlet passed every implementation, security, determinism, replay, incident, CLI, power-mode, testing and troubleshooting check, and found exactly one architecture contradiction: §13.6 item 6 mandates `README.md` — one paragraph in the observability/replay section; the A1-amended §14 freezes the implementation boundary at exactly sixteen paths; `README.md` is not one of the sixteen; and D-v0.4.164 states that every other clause of the Wave 0 freeze stands, therefore §13.6 remains normative. The contradiction is resolved by the A2 expansion in §14: the boundary grows from sixteen to seventeen implementation paths, and the one added path — `README.md` — carries exactly one authorized correction class: the single §13.6 observability/replay paragraph already required by this contract. No unrelated README modification is authorized. §13.6 is preserved, not reinterpreted or retired. This amendment resolves only the §13.6 / §14 contradiction; every other U-E6 invariant, requirement, ownership boundary, protocol rule, security rule, replay rule, determinism rule, test requirement and acceptance requirement is unchanged. Implementation remains pending; `README.md` must not be edited during this architecture amendment; implementation may resume only after A2 is frozen; and acceptance must be rerun after the README amendment. No eighteenth implementation path, no wildcard, no escape hatch, no additional correction class.
 
 ---
 

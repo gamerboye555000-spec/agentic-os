@@ -1,3 +1,80 @@
+# DECISIONS — Agentic OS v0.4 U-E6 flight recorder, deterministic replay, and incident forensics (governed replan A2)
+
+This section continues the `D-v0.4.*` series for the U-E6 **governed replan
+A2**, which resolves exactly one contradiction the read-only U-E6 Gauntlet
+proved inside the A1-amended U-E6 freeze. Architecture only — exactly two
+repository paths are written, `DECISIONS.md` and
+`agentic-os-v0.4-u-e6-flight-recorder-replay-contract.md`, and no
+implementation, test, protocol or README byte is touched in this session.
+Branch `v0.4-u-e6-flight-recorder-replay`, worktree
+`/home/daksh/Projects/agentic-os-u-e6`, baseline
+`27b3c5820adef340882ad1cf6e2a35e723e7dc83` (= HEAD). Prepended per the same
+precedent the Wave 0 section cites (D-W0.4, D-v0.2.7, D-v0.4.4, D-v0.4.103)
+and the U-E6 A1 replan made concrete (D-v0.4.163 … D-v0.4.164); everything
+below stays byte-identical, including the whole A1 section D-v0.4.163 …
+D-v0.4.164, the Wave 0 section D-v0.4.144 … D-v0.4.162 and D-v0.4.1 …
+D-v0.4.143. The dirty implementation worktree is preserved exactly as-is:
+this session stages, commits, pushes, merges and tags nothing.
+
+The A1 replan fixed the U-E6 §14 boundary at exactly sixteen implementation
+paths, and D-v0.4.164 declared that every other clause of the Wave 0 freeze
+stands. That remains true of every **landed** contract and decision. It is no
+longer true of U-E6's own freeze: D-v0.4.165 retires the sixteen-path clause
+because §13.6's own mandated README paragraph forces one documentation file
+into the boundary, and D-v0.4.166 records the supersession boundary so a
+later reader is not left to infer which text still governs.
+
+## D-v0.4 decisions (U-E6, governed replan A2)
+
+- **D-v0.4.165 — §13.6 mandates a README paragraph and the frozen §14
+  boundary does not contain README.md, so the U-E6 boundary expands from
+  sixteen to seventeen implementation paths.** The read-only U-E6 Gauntlet
+  passed every implementation, security, determinism, replay, incident, CLI,
+  power-mode, testing and troubleshooting check, and found exactly one
+  architecture contradiction: §13.6 item 6 mandates `README.md` — one
+  paragraph in the observability/replay section; the A1-amended §14 freezes
+  the implementation boundary at exactly sixteen paths; `README.md` is not
+  one of the sixteen; and D-v0.4.164 states that every other clause of the
+  Wave 0 freeze stands, therefore §13.6 remains normative. The two clauses
+  cannot both be satisfied: §13.6's deliverable requires editing a file the
+  frozen §14 forbids. The ruling, mirroring D-v0.4.163's census correction:
+  the boundary expands from sixteen implementation paths to **seventeen**,
+  and the one added path carries exactly **one** authorized correction
+  class:
+  - `README.md` — add exactly the single paragraph §13.6 item 6 already
+    requires, in the observability/replay section. Nothing else in the file
+    may be edited; no unrelated README modification is authorized.
+
+  §13.6 is **preserved, not reinterpreted or retired**: the boundary is made
+  consistent with it, not the other way around. This decision authorizes
+  **no eighteenth path, no wildcard, no escape hatch and no additional
+  correction class**: the frozen §14 clause now fires on an eighteenth
+  implementation path, and on any README edit that is not the named §13.6
+  paragraph. The boundary moved once, under this decision, and the trigger
+  exists to stop it moving again.
+
+- **D-v0.4.166 — the A2 replan supersedes only the sixteen-path clauses, and
+  the README correction it authorizes is pending, not done.** The clauses
+  retired are, in the contract: §14's "exactly these 16 paths" enumeration
+  and its A1-amended preamble as written under D-v0.4.163; and in this file,
+  the "no seventeenth path" clause of D-v0.4.163. Every other clause of the
+  Wave 0 freeze and of the A1 replan stands — including §13.6, which is
+  preserved verbatim — and **no landed contract, decision or behavior is
+  touched**. This amendment resolves **only** the §13.6 / §14 contradiction;
+  every other U-E6 invariant, requirement, ownership boundary, protocol
+  rule, security rule, replay rule, determinism rule, test requirement and
+  acceptance requirement is unchanged. One obligation is authorized here and
+  **outstanding in the implementation**: the single §13.6
+  observability/replay paragraph in `README.md`. Implementation remains
+  pending; `README.md` must **not** be edited during this architecture
+  amendment; implementation may resume only after A2 is frozen; and
+  acceptance must be rerun after the README amendment. No test ran in the
+  replan session and no implementation byte changed, so the build wave is
+  **not** PASS and is not recorded as one. An architecture that has been
+  re-frozen is not an implementation that has been re-verified.
+
+---
+
 # DECISIONS — Agentic OS v0.4 U-E6 flight recorder, deterministic replay, and incident forensics (governed replan A1)
 
 This section continues the `D-v0.4.*` series for the U-E6 **governed replan**,
